@@ -1,0 +1,37 @@
+Netwarden Agent
+Copyright 2024-2025 Netwarden
+
+This product includes software developed by Netwarden (https://netwarden.com).
+
+This software is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License.
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+
+This product includes third-party open source software components.
+See go.mod and go.sum for the complete list of dependencies and their licenses.
+
+Notable third-party components include:
+
+- Go Standard Library (BSD 3-Clause License)
+  Copyright (c) 2009 The Go Authors
+  https://golang.org/LICENSE
+
+- Various Go packages listed in go.mod
+  Each package maintains its own license as specified in its repository.
+
+To view the license of a specific dependency, visit:
+  https://pkg.go.dev/<package-name>?tab=licenses
+
+================================================================================
+
+For questions about licensing, please contact: support@netwarden.com

@@ -1,0 +1,19 @@
+# SQLite database files
+metrics.db
+metrics.db-shm  
+metrics.db-wal
+
+# Development artifacts
+.DS_Store
+*.test
+*.tmp
+temp_*
+test_*
+
+# Build directories
+bin/
+build/
+releases/
+
+# Installation scripts (managed separately)
+install.sh
