@@ -16,6 +16,7 @@ import (
 
 	"netwarden/internal/agent"
 	"netwarden/internal/config"
+	sharedhttp "netwarden/internal/http"
 )
 
 const serviceName = "Netwarden"
@@ -55,6 +56,20 @@ func (s *netwardenService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 		return true, 1
 	}
 	s.config = cfg
+
+	// Configure HTTP client with TLS settings
+	if cfg.TLSSkipVerify || cfg.TLSCACert != "" {
+		tlsCfg := &sharedhttp.TLSConfig{
+			SkipVerify: cfg.TLSSkipVerify,
+			CACertPath: cfg.TLSCACert,
+		}
+		if err := sharedhttp.InitClient(tlsCfg); err != nil {
+			if elog != nil {
+				elog.Error(1, fmt.Sprintf("TLS configuration error: %v", err))
+			}
+			return true, 1
+		}
+	}
 
 	if elog != nil {
 		elog.Info(1, "Configuration loaded successfully, setting up logging...")

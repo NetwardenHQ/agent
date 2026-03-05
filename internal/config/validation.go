@@ -283,7 +283,7 @@ func (c *Config) SetDefaults() {
 		c.Process.ConfigFetchInterval = 5 * time.Minute
 	}
 	if c.Process.ConfigEndpoint == "" {
-		c.Process.ConfigEndpoint = "/agent-config/processes"
+		c.Process.ConfigEndpoint = "/agent/processes"
 	}
 }
 

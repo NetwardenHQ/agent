@@ -143,9 +143,15 @@ func (d *DockerCompatibleClient) ListContainers(ctx context.Context) ([]Containe
 
 	containers := make([]Container, len(apiContainers))
 	for i, ac := range apiContainers {
+		name := ac.ID
+		if len(ac.Names) > 0 {
+			name = cleanContainerName(ac.Names[0])
+		} else if len(ac.ID) > 12 {
+			name = ac.ID[:12]
+		}
 		containers[i] = Container{
 			ID:      ac.ID,
-			Name:    cleanContainerName(ac.Names[0]), // Remove leading /
+			Name:    name,
 			Image:   ac.Image,
 			Status:  ac.State,
 			Labels:  ac.Labels,

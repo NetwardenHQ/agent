@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"netwarden/internal/cache"
@@ -233,21 +234,20 @@ func (c *Collector) collectVMStatsConcurrently(ctx context.Context, vms []VM) []
 
 	resultsChan := make(chan statsResult, len(vms))
 	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
 
 	// Start workers
 	for _, vm := range vms {
+		wg.Add(1)
 		go func(vm VM) {
+			defer wg.Done()
+
 			// Acquire semaphore with context cancellation support
 			select {
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
 			case <-ctx.Done():
-				// Context cancelled before we could acquire semaphore
-				select {
-				case resultsChan <- statsResult{err: ctx.Err()}:
-				default:
-					// Channel might be full, but we're shutting down anyway
-				}
+				resultsChan <- statsResult{err: ctx.Err()}
 				return
 			}
 
@@ -272,35 +272,36 @@ func (c *Collector) collectVMStatsConcurrently(ctx context.Context, vms []VM) []
 			stats, err := c.hypervisor.GetVMStats(statsCtx, vm.ID)
 			if err != nil {
 				c.logger.Warn("failed to get VM stats", "vm", vm.Name, "error", err)
-				select {
-				case resultsChan <- statsResult{err: err}:
-				case <-ctx.Done():
-					// Context cancelled while trying to send result
-				}
+				resultsChan <- statsResult{err: err}
 				return
 			}
 
 			var metrics []metrics.Metric
 			c.collectVMStats(stats, labels, &metrics)
-			select {
-			case resultsChan <- statsResult{metrics: metrics}:
-			case <-ctx.Done():
-				// Context cancelled while trying to send result
-			}
+			resultsChan <- statsResult{metrics: metrics}
 		}(vm)
 	}
 
+	// Close results channel once all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
 	// Collect results with context cancellation support
 	var allMetrics []metrics.Metric
-	for i := 0; i < len(vms); i++ {
+collectLoop:
+	for {
 		select {
-		case result := <-resultsChan:
+		case result, ok := <-resultsChan:
+			if !ok {
+				break collectLoop
+			}
 			if result.err == nil {
 				allMetrics = append(allMetrics, result.metrics...)
 			}
 		case <-ctx.Done():
-			// Context cancelled, stop waiting for more results
-			break
+			break collectLoop
 		}
 	}
 

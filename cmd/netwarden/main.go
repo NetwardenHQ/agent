@@ -31,6 +31,7 @@ import (
 
 	"netwarden/internal/agent"
 	"netwarden/internal/config"
+	sharedhttp "netwarden/internal/http"
 )
 
 var (
@@ -158,14 +159,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Configure HTTP client with TLS settings (before any network calls)
+	if cfg.TLSSkipVerify || cfg.TLSCACert != "" {
+		tlsCfg := &sharedhttp.TLSConfig{
+			SkipVerify: cfg.TLSSkipVerify,
+			CACertPath: cfg.TLSCACert,
+		}
+		if err := sharedhttp.InitClient(tlsCfg); err != nil {
+			fmt.Fprintf(os.Stderr, "TLS configuration error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Setup structured logging - always log to file since we're always a daemon
 	logger := setupLoggingWithFile(cfg.LogLevel, "json", cfg.LogFile)
 
 	// Log startup information
-	logger.Info("starting Netwarden agent",
+	logFields := []any{
 		"version", version,
 		"config_file", *configFile,
-	)
+	}
+	if cfg.ServerURL != config.DefaultServerURL {
+		logFields = append(logFields, "server_url", cfg.ServerURL)
+	}
+	if cfg.TLSSkipVerify {
+		logFields = append(logFields, "tls_skip_verify", true)
+		logger.Warn("TLS certificate verification is disabled — connections are not secure")
+	}
+	if cfg.TLSCACert != "" {
+		logFields = append(logFields, "tls_ca_cert", cfg.TLSCACert)
+	}
+	logger.Info("starting Netwarden agent", logFields...)
 
 	// Run in console mode (default for non-Windows or when not running as service)
 	runConsoleMode(cfg, logger)

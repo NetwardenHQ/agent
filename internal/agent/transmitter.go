@@ -19,8 +19,8 @@ import (
 	"netwarden/internal/resilience"
 )
 
-// APIEndpoint is the hardcoded endpoint for metric submission
-const APIEndpoint = "https://api.netwarden.com/agent/data"
+// apiDataPath is the path for metric submission, appended to the server URL.
+const apiDataPath = "/agent/data"
 
 // HTTPTransmitter sends metrics to the Netwarden backend using standard HTTP.
 type HTTPTransmitter struct {
@@ -175,8 +175,8 @@ func (t *HTTPTransmitter) updateFailureTracking(err error) {
 func (t *HTTPTransmitter) sendRequest(ctx context.Context, jsonData []byte, retryCount int) error {
 	const maxRateLimitRetries = 3
 
-	// Create request using hardcoded API endpoint
-	req, err := http.NewRequestWithContext(ctx, "POST", APIEndpoint, bytes.NewReader(jsonData))
+	// Create request using configured server URL
+	req, err := http.NewRequestWithContext(ctx, "POST", t.config.ServerURL+apiDataPath, bytes.NewReader(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}

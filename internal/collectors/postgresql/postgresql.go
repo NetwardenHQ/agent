@@ -459,7 +459,7 @@ func (c *Collector) getDatabaseStats(ctx context.Context) (map[string]float64, e
 	stats := make(map[string]float64)
 
 	query := `
-		SELECT 
+		SELECT
 			xact_commit,
 			xact_rollback,
 			blks_hit,
@@ -468,24 +468,27 @@ func (c *Collector) getDatabaseStats(ctx context.Context) (map[string]float64, e
 			tup_fetched,
 			tup_inserted,
 			tup_updated,
-			tup_deleted,
-			n_live_tup,
-			n_dead_tup
-		FROM pg_stat_database 
+			tup_deleted
+		FROM pg_stat_database
 		WHERE datname = current_database()`
 
 	var xactCommit, xactRollback, blksHit, blksRead sql.NullInt64
 	var tupReturned, tupFetched, tupInserted, tupUpdated, tupDeleted sql.NullInt64
-	var nLiveTup, nDeadTup sql.NullInt64
 
 	err := c.db.QueryRowContext(ctx, query).Scan(
 		&xactCommit, &xactRollback, &blksHit, &blksRead,
 		&tupReturned, &tupFetched, &tupInserted, &tupUpdated, &tupDeleted,
-		&nLiveTup, &nDeadTup,
 	)
 
 	if err != nil {
 		return nil, err
+	}
+
+	// n_live_tup and n_dead_tup are per-table stats (pg_stat_user_tables), not per-database
+	deadTupQuery := `SELECT COALESCE(SUM(n_dead_tup), 0) FROM pg_stat_user_tables`
+	var nDeadTup sql.NullInt64
+	if err := c.db.QueryRowContext(ctx, deadTupQuery).Scan(&nDeadTup); err != nil {
+		c.logger.Debug("failed to query dead tuple count", "error", err)
 	}
 
 	if xactCommit.Valid {

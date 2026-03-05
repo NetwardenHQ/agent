@@ -51,6 +51,7 @@ type Agent struct {
 	logger   *slog.Logger
 	registry metrics.Registry
 	hostname string
+	version  string
 
 	// Control channels
 	stopChan chan struct{}
@@ -136,6 +137,7 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		logger:            logger,
 		registry:          reg,
 		hostname:          hostname,
+		version:           version,
 		stopChan:          make(chan struct{}),
 		transmitter:       transmitter,
 		deltaTracker:      deltaTracker,
@@ -282,7 +284,7 @@ func (a *Agent) registerCollectors() error {
 			a.config.Process,
 			a.hostname,
 			a.config.APIKey,
-			"", // ServerURL not needed anymore
+			a.config.ServerURL,
 			process.WithLogger(collectorLogger.With("type", "process")),
 		)
 		if err := a.registry.Register(processCollector); err != nil {
@@ -302,7 +304,7 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, "GET",
-		"https://api.netwarden.com/agent/config", nil)
+		a.config.ServerURL+"/agent/config", nil)
 	if err != nil {
 		return fmt.Errorf("creating config request: %w", err)
 	}
@@ -380,8 +382,50 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 	return nil
 }
 
+// testConnection performs a startup connectivity check against the server.
+// Logs the result but never blocks agent startup.
+func (a *Agent) testConnection(ctx context.Context) {
+	testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	url := a.config.ServerURL + "/agent/config"
+	req, err := http.NewRequestWithContext(testCtx, "GET", url, nil)
+	if err != nil {
+		a.logger.Warn("failed to create connection test request", "error", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.config.APIKey)
+	req.Header.Set("User-Agent", "Netwarden-Agent/"+a.version)
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.logger.Warn("server connection test failed",
+			"server_url", a.config.ServerURL,
+			"error", err,
+			"hint", "check server_url, network connectivity, and TLS settings")
+		return
+	}
+	resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == 401:
+		a.logger.Error("server reachable but authentication failed",
+			"server_url", a.config.ServerURL,
+			"hint", "check tenant_id and api_key in config")
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		a.logger.Info("connected to Netwarden server", "server_url", a.config.ServerURL)
+	default:
+		a.logger.Warn("server returned unexpected status",
+			"server_url", a.config.ServerURL,
+			"status", resp.StatusCode)
+	}
+}
+
 // Run starts the agent's main collection and transmission loop.
 func (a *Agent) Run(ctx context.Context) error {
+	// Test server connectivity on startup (non-blocking)
+	a.testConnection(ctx)
+
 	// Add jitter to initial config fetch to prevent thundering herd (0-20 seconds)
 	// This prevents all agents from hitting the API simultaneously during mass deployments
 	initialJitter := time.Duration(rand.Intn(20)) * time.Second

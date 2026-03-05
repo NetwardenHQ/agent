@@ -23,6 +23,11 @@ type Win32_Process struct {
 // getProcessStats gets statistics for a running process using WMI.
 // This replaces the PowerShell-based implementation which was causing 1-3 second delays per process.
 // WMI queries complete in 50-100ms, providing a 20x performance improvement.
+// sanitizeWQLString escapes single quotes to prevent WQL injection.
+func sanitizeWQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 func (c *Collector) getProcessStats(processName string) *ProcessStats {
 	// Normalize process name - WMI expects exact match
 	queryName := processName
@@ -30,9 +35,12 @@ func (c *Collector) getProcessStats(processName string) *ProcessStats {
 		queryName += ".exe"
 	}
 
+	// Sanitize to prevent WQL injection from API-provided process names
+	safeQueryName := sanitizeWQLString(queryName)
+
 	// Query WMI for the specific process
 	var processes []Win32_Process
-	query := fmt.Sprintf("SELECT Name, ProcessId, WorkingSetSize, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = '%s'", queryName)
+	query := fmt.Sprintf("SELECT Name, ProcessId, WorkingSetSize, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = '%s'", safeQueryName)
 
 	err := wmi.Query(query, &processes)
 	if err != nil {
@@ -41,7 +49,8 @@ func (c *Collector) getProcessStats(processName string) *ProcessStats {
 		// Try without .exe extension if query failed
 		if strings.HasSuffix(queryName, ".exe") {
 			queryName = strings.TrimSuffix(queryName, ".exe")
-			query = fmt.Sprintf("SELECT Name, ProcessId, WorkingSetSize, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = '%s'", queryName)
+			safeQueryName = sanitizeWQLString(queryName)
+			query = fmt.Sprintf("SELECT Name, ProcessId, WorkingSetSize, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = '%s'", safeQueryName)
 			err = wmi.Query(query, &processes)
 			if err != nil || len(processes) == 0 {
 				return nil

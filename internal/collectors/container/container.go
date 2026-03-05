@@ -170,7 +170,11 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 
 		// Create unique metric name to avoid database constraint conflicts
-		statusMetricName := fmt.Sprintf("container_status_%s", container.ID[:12])
+		idSuffix := container.ID
+		if len(idSuffix) > 12 {
+			idSuffix = idSuffix[:12]
+		}
+		statusMetricName := fmt.Sprintf("container_status_%s", idSuffix)
 		if metric, err := c.builder.GaugeWithLabels(statusMetricName, statusValue, labels); err == nil {
 			collectedMetrics = append(collectedMetrics, metric)
 		} else {

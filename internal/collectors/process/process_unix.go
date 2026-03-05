@@ -7,14 +7,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
 // getProcessStats gets statistics for a running process on Unix/Linux systems.
 func (c *Collector) getProcessStats(processName string) *ProcessStats {
+	// Sanitize process name — pgrep -f interprets the argument as a regex.
+	// Escape to prevent regex injection from API-provided process names.
+	safeName := regexp.QuoteMeta(processName)
+
 	// First, find the PID using pgrep
-	cmd := exec.Command("pgrep", "-f", processName)
+	cmd := exec.Command("pgrep", "-f", safeName)
 	output, err := cmd.Output()
 	if err != nil {
 		// Process not found

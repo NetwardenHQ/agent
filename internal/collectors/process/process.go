@@ -90,10 +90,10 @@ func WithLogger(logger *slog.Logger) CollectorOption {
 
 // NewCollector creates a new process collector.
 func NewCollector(cfg config.ProcessConfig, hostname string, apiKey string, serverURL string, opts ...CollectorOption) *Collector {
-	// Hardcode the API URL since we don't want users to configure it
 	if serverURL == "" {
 		serverURL = "https://api.netwarden.com"
 	}
+	serverURL = strings.TrimRight(serverURL, "/")
 
 	collector := &Collector{
 		config:    cfg,

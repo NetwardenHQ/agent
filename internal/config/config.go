@@ -24,11 +24,21 @@ import (
 	"time"
 )
 
+// DefaultServerURL is the SaaS endpoint used when no server_url is configured.
+const DefaultServerURL = "https://api.netwarden.com"
+
 // Config represents the agent configuration.
 type Config struct {
 	// Core settings (required)
 	TenantID string
 	APIKey   string
+
+	// Server URL for self-hosted deployments (default: https://api.netwarden.com)
+	ServerURL string
+
+	// TLS configuration for self-hosted deployments with self-signed certificates
+	TLSSkipVerify bool   // Skip TLS certificate verification (insecure, for self-signed certs)
+	TLSCACert     string // Path to custom CA certificate file (PEM format)
 
 	// Optional hostname override
 	Hostname string
@@ -78,6 +88,18 @@ func (c *Config) Validate() error {
 	// Validate API key format (should start with nw_sk_)
 	if !strings.HasPrefix(c.APIKey, "nw_sk_") {
 		return fmt.Errorf("api_key must start with 'nw_sk_'")
+	}
+
+	// Validate server URL
+	if c.ServerURL != "" && !strings.HasPrefix(c.ServerURL, "http://") && !strings.HasPrefix(c.ServerURL, "https://") {
+		return fmt.Errorf("server_url must start with http:// or https://")
+	}
+
+	// Validate TLS CA cert file exists if specified
+	if c.TLSCACert != "" {
+		if _, err := os.Stat(c.TLSCACert); os.IsNotExist(err) {
+			return fmt.Errorf("tls_ca_cert file not found: %s", c.TLSCACert)
+		}
 	}
 
 	// Validate log level
@@ -278,7 +300,15 @@ func LoadConfig(filename string) (*Config, error) {
 	defer file.Close()
 
 	// Create config with basic structure
+	// Set collector defaults BEFORE parsing so config file values take precedence
 	config := &Config{}
+	config.Collectors.CPU = true
+	config.Collectors.Memory = true
+	config.Collectors.System = true
+	config.Collectors.Disk = true
+	config.Collectors.Network = true
+	config.Collectors.Container = true
+	config.Collectors.VM = true
 
 	// Parse key-value pairs
 	scanner := bufio.NewScanner(file)
@@ -304,6 +334,12 @@ func LoadConfig(filename string) (*Config, error) {
 			config.TenantID = value
 		case "api_key":
 			config.APIKey = value
+		case "server_url", "server":
+			config.ServerURL = strings.TrimRight(value, "/")
+		case "tls_skip_verify":
+			config.TLSSkipVerify = value == "true" || value == "yes" || value == "1"
+		case "tls_ca_cert":
+			config.TLSCACert = value
 		case "hostname":
 			config.Hostname = value
 		case "log_level":
@@ -417,6 +453,9 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 
 	// Set default values for unset fields
+	if config.ServerURL == "" {
+		config.ServerURL = DefaultServerURL
+	}
 	if config.LogLevel == "" {
 		config.LogLevel = "info"
 	}
@@ -424,17 +463,7 @@ func LoadConfig(filename string) (*Config, error) {
 		config.Buffer.MaxSize = 100
 	}
 
-	// Enable collectors by default (except MySQL and PostgreSQL which require explicit opt-in)
-	// These defaults only apply if no explicit configuration was provided
-	config.Collectors.CPU = true
-	config.Collectors.Memory = true
-	config.Collectors.System = true
-	config.Collectors.Disk = true
-	config.Collectors.Network = true
-	config.Collectors.Container = true
-	config.Collectors.VM = true
-
-	// Network configuration defaults
+	// Sync sub-config flags with collector toggles (after parsing, so user values are respected)
 	config.Network.EnableNetwork = config.Collectors.Network
 
 	// Container configuration defaults
@@ -494,6 +523,9 @@ tenant_id: CHANGE_ME
 
 # Required: Your API key
 api_key: nw_sk_CHANGE_ME
+
+# Optional: Server URL for self-hosted deployments (default: https://api.netwarden.com)
+# server_url: http://your-server:3000
 
 # Optional: Custom hostname (overrides system hostname)
 # hostname: my-server
