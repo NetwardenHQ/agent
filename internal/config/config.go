@@ -502,7 +502,7 @@ func LoadConfig(filename string) (*Config, error) {
 		config.Process.ConfigFetchInterval = 300 * time.Second // 5 minutes
 	}
 	if config.Process.ConfigEndpoint == "" {
-		config.Process.ConfigEndpoint = "/processes"
+		config.Process.ConfigEndpoint = "/agent/processes"
 	}
 
 	// Validate the configuration before returning

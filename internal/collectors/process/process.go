@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"netwarden/internal/config"
+	sharedhttp "netwarden/internal/http"
 	"netwarden/internal/metrics"
 )
 
@@ -89,6 +90,7 @@ func WithLogger(logger *slog.Logger) CollectorOption {
 }
 
 // NewCollector creates a new process collector.
+// Uses the shared HTTP client for TLS configuration support (tls_skip_verify, tls_ca_cert).
 func NewCollector(cfg config.ProcessConfig, hostname string, apiKey string, serverURL string, opts ...CollectorOption) *Collector {
 	if serverURL == "" {
 		serverURL = "https://api.netwarden.com"
@@ -102,9 +104,7 @@ func NewCollector(cfg config.ProcessConfig, hostname string, apiKey string, serv
 		cache:     newProcessCache(),
 		apiKey:    apiKey,
 		serverURL: serverURL,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient: sharedhttp.GetClientWithTimeout(10 * time.Second),
 	}
 
 	for _, opt := range opts {
@@ -136,7 +136,7 @@ func (c *Collector) fetchProcessConfig(ctx context.Context) error {
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("User-Agent", "Netwarden-Agent/1.0.0")
+	req.Header.Set("User-Agent", "Netwarden-Agent/2.0.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
