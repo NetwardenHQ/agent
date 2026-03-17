@@ -310,7 +310,7 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 	}
 
 	req.Header.Set("Authorization", "Bearer "+a.config.APIKey)
-	req.Header.Set("User-Agent", "Netwarden-Agent/1.0.0")
+	req.Header.Set("User-Agent", fmt.Sprintf("Netwarden-Agent/%s", a.version))
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
