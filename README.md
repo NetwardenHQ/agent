@@ -11,7 +11,7 @@
 
 **Enterprise-grade infrastructure monitoring agent** - A lightweight, secure, and high-performance monitoring agent written in Go that collects system, container, database, and custom metrics for the Netwarden monitoring platform.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/netwardenhq/agent/releases)
+[![Version](https://img.shields.io/badge/version-3.0.0--beta-blue)](https://github.com/netwardenhq/agent/releases)
 [![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8)](https://golang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Code Signed](https://img.shields.io/badge/windows-code%20signed-blue?logo=windows)](https://github.com/netwardenhq/agent/releases)

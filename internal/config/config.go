@@ -18,7 +18,9 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -204,6 +206,20 @@ type CollectorToggles struct {
 	Network   bool
 	Container bool
 	VM        bool
+
+	// Security-posture collectors. These read materially more sensitive
+	// sources than the resource collectors — authentication logs, the sshd
+	// configuration, the listening socket table, the package database — so
+	// operators need to be able to switch each one off independently.
+	// Default on; set `enable_security_auth: false` (etc.) to disable.
+	SecurityAuth      bool
+	SecuritySSHConfig bool
+	SecurityPorts     bool
+	SecurityPackages  bool
+
+	// CIS benchmark evaluation. Gated twice over: this toggle, and the
+	// presence of a profile defined in the UI. Both must be on.
+	CIS bool
 }
 
 // NetworkConfig provides configuration for network monitoring
@@ -299,6 +315,14 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	defer file.Close()
 
+	// The config file holds the agent API key (nw_sk_*) and, where those
+	// collectors are configured, Proxmox / MySQL / PostgreSQL passwords in
+	// cleartext. Warn loudly if any of that is readable beyond its owner.
+	// Non-fatal by design: refusing to start would take monitoring down on
+	// an already-deployed fleet, and a running agent that complains every
+	// boot is more useful than one that silently accepts a leaked key.
+	checkConfigPermissions(file, filename)
+
 	// Create config with basic structure
 	// Set collector defaults BEFORE parsing so config file values take precedence
 	config := &Config{}
@@ -309,6 +333,11 @@ func LoadConfig(filename string) (*Config, error) {
 	config.Collectors.Network = true
 	config.Collectors.Container = true
 	config.Collectors.VM = true
+	config.Collectors.SecurityAuth = true
+	config.Collectors.SecuritySSHConfig = true
+	config.Collectors.SecurityPorts = true
+	config.Collectors.SecurityPackages = true
+	config.Collectors.CIS = true
 
 	// Parse key-value pairs
 	scanner := bufio.NewScanner(file)
@@ -346,6 +375,26 @@ func LoadConfig(filename string) (*Config, error) {
 			config.LogLevel = value
 		case "logfile", "log_file":
 			config.LogFile = value
+		case "enable_cis":
+			config.Collectors.CIS = isTruthy(value)
+		case "enable_security_auth":
+			config.Collectors.SecurityAuth = isTruthy(value)
+		case "enable_security_sshconfig":
+			config.Collectors.SecuritySSHConfig = isTruthy(value)
+		case "enable_security_ports":
+			config.Collectors.SecurityPorts = isTruthy(value)
+		case "enable_security_packages":
+			config.Collectors.SecurityPackages = isTruthy(value)
+		case "enable_security":
+			// Master switch: turns every security-posture collector on or
+			// off in one line. Individual enable_security_* keys still
+			// apply, so ordering in the file decides — last write wins,
+			// matching how the rest of this parser behaves.
+			on := isTruthy(value)
+			config.Collectors.SecurityAuth = on
+			config.Collectors.SecuritySSHConfig = on
+			config.Collectors.SecurityPorts = on
+			config.Collectors.SecurityPackages = on
 		case "enable_cpu":
 			config.Collectors.CPU = value == "true" || value == "yes" || value == "1"
 		case "enable_memory":
@@ -594,4 +643,51 @@ log_level: info
 `
 
 	return os.WriteFile(filename, []byte(content), 0600)
+}
+
+// insecureConfigModeMask matches any group or world permission bit. A
+// credential file should be 0600 (or 0400); anything looser exposes the API
+// key to every local account.
+const insecureConfigModeMask = 0o077
+
+// checkConfigPermissions warns when the config file is readable or writable
+// by anyone other than its owner. It inspects the already-open handle so the
+// check cannot race against a file swapped between open and stat.
+//
+// Windows is skipped: Unix mode bits are synthesized by the Go runtime there
+// and do not reflect the real ACL, so the check would be noise.
+func checkConfigPermissions(file *os.File, filename string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		slog.Debug("could not stat config file for permission check",
+			"path", filename, "error", err)
+		return
+	}
+
+	mode := info.Mode().Perm()
+	if mode&insecureConfigModeMask == 0 {
+		return
+	}
+
+	slog.Warn("config file has overly permissive permissions",
+		"path", filename,
+		"mode", fmt.Sprintf("%#o", mode),
+		"risk", "contains the agent API key and any configured database/hypervisor passwords in cleartext",
+		"fix", fmt.Sprintf("chmod 600 %s", filename))
+}
+
+// isTruthy interprets a config file boolean. Mirrors the inline comparison
+// used by the older enable_* keys ("true"/"yes"/"1"), with case-insensitive
+// matching so `enable_security: FALSE` behaves as written rather than
+// silently reading as true.
+func isTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "yes", "1", "on":
+		return true
+	}
+	return false
 }

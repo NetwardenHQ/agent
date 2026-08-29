@@ -6,10 +6,13 @@ package agent
 import (
 	"fmt"
 	"log/slog"
+
 	"netwarden/internal/collectors/vm"
 )
 
 // registerVMCollector registers the VM collector on Linux systems only.
+// Security-posture collectors are registered separately and on every platform
+// by registerSecurityCollectors (collectors_security.go).
 func (a *Agent) registerVMCollector(collectorLogger *slog.Logger) error {
 	if a.config.Collectors.VM {
 		vmCollector := vm.NewCollector(
@@ -22,5 +25,6 @@ func (a *Agent) registerVMCollector(collectorLogger *slog.Logger) error {
 		}
 		a.logger.Info("registered VM collector")
 	}
+
 	return nil
 }

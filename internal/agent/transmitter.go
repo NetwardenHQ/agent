@@ -22,6 +22,11 @@ import (
 // apiDataPath is the path for metric submission, appended to the server URL.
 const apiDataPath = "/agent/data"
 
+// maxSnapshotsPerPayload mirrors the server's `.max(16)` on the snapshots
+// array (platform/app/api/agent/data/route.ts). Exceeding it fails Zod
+// validation for the whole request, so the transmitter truncates instead.
+const maxSnapshotsPerPayload = 16
+
 // HTTPTransmitter sends metrics to the Netwarden backend using standard HTTP.
 type HTTPTransmitter struct {
 	config        *config.Config
@@ -53,11 +58,12 @@ func NewHTTPTransmitter(cfg *config.Config, hostname string, version string, log
 	}
 
 	t := &HTTPTransmitter{
-		config:     cfg,
-		logger:     logger,
-		version:    version,
-		hostname:   hostname,
-		httpClient: sharedhttp.GetClient(), // Use global client
+		config:        cfg,
+		logger:        logger,
+		version:       version,
+		hostname:      hostname,
+		httpClient:    sharedhttp.GetClient(), // Use global client
+		lastLatencyMs: -1,                     // sentinel: -1 = no measurement yet (omits the field from the first payload)
 	}
 
 	return t, nil
@@ -85,13 +91,18 @@ func (t *HTTPTransmitter) clearIdleConnectionsIfNeeded() {
 }
 
 // Send transmits metrics to the backend with retry logic and recovery mechanisms.
-func (t *HTTPTransmitter) Send(ctx context.Context, metrics []metrics.Metric) error {
-	if len(metrics) == 0 {
+//
+// snapshots carries structured security snapshots for this cycle and may be
+// nil. The agent attaches them to a single batch per cycle so the server
+// upserts each snapshot type once and runs its findings evaluator once,
+// rather than once per batch.
+func (t *HTTPTransmitter) Send(ctx context.Context, metricList []metrics.Metric, snapshots []metrics.Snapshot) error {
+	if len(metricList) == 0 && len(snapshots) == 0 {
 		t.logger.Debug("no metrics to send")
 		return nil
 	}
 
-	t.logger.Debug("attempting to send metrics", "count", len(metrics))
+	t.logger.Debug("attempting to send metrics", "count", len(metricList), "snapshots", len(snapshots))
 
 	// Check if we should back off due to recent failures
 	if t.shouldBackoff() {
@@ -103,7 +114,7 @@ func (t *HTTPTransmitter) Send(ctx context.Context, metrics []metrics.Metric) er
 	t.clearIdleConnectionsIfNeeded()
 
 	// Create payload
-	payload := t.createPayload(metrics)
+	payload := t.createPayload(metricList, snapshots)
 
 	// Marshal to JSON
 	jsonData, err := json.Marshal(payload)
@@ -120,9 +131,9 @@ func (t *HTTPTransmitter) Send(ctx context.Context, metrics []metrics.Metric) er
 	t.updateFailureTracking(err)
 
 	if err != nil {
-		t.logger.Warn("failed to send metrics", "error", err, "count", len(metrics))
+		t.logger.Warn("failed to send metrics", "error", err, "count", len(metricList))
 	} else {
-		t.logger.Debug("successfully sent metrics", "count", len(metrics))
+		t.logger.Debug("successfully sent metrics", "count", len(metricList))
 	}
 
 	return err
@@ -251,12 +262,12 @@ func (t *HTTPTransmitter) sendRequest(ctx context.Context, jsonData []byte, retr
 }
 
 // createPayload creates the JSON payload structure.
-func (t *HTTPTransmitter) createPayload(metrics []metrics.Metric) map[string]interface{} {
+func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots []metrics.Snapshot) map[string]interface{} {
 	// Convert metrics to simple format
-	metricsData := make([]map[string]interface{}, len(metrics))
+	metricsData := make([]map[string]interface{}, len(metricList))
 	var osInfo map[string]interface{}
 
-	for i, metric := range metrics {
+	for i, metric := range metricList {
 		// Use consistent hostname from transmitter
 		metricsData[i] = map[string]interface{}{
 			"host_id":     t.hostname,
@@ -304,6 +315,19 @@ func (t *HTTPTransmitter) createPayload(metrics []metrics.Metric) map[string]int
 	// Include latency information (including 0ms for sub-millisecond responses)
 	if t.lastLatencyMs >= 0 {
 		payload["agent_latency"] = t.lastLatencyMs
+	}
+
+	// Structured security snapshots. The server caps this array at 16
+	// entries and rejects the ENTIRE request if the cap is exceeded or a
+	// type is unrecognized, so truncate defensively rather than risk losing
+	// a cycle's metrics to a schema error.
+	if len(snapshots) > 0 {
+		if len(snapshots) > maxSnapshotsPerPayload {
+			t.logger.Warn("truncating snapshots to server limit",
+				"count", len(snapshots), "limit", maxSnapshotsPerPayload)
+			snapshots = snapshots[:maxSnapshotsPerPayload]
+		}
+		payload["snapshots"] = snapshots
 	}
 
 	return payload
