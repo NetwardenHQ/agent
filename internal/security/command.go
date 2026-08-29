@@ -87,10 +87,12 @@ func NewDefaultAllowlist() CommandAllowlist {
 		AllowEnvironment: false,
 	}
 
-	// Network monitoring
+	// Network monitoring. Args extended for the security_ports collector:
+	// -tulnpH (TCP+UDP listening, numeric, processes, headerless) and the
+	// TCP-only fallback -tlnpH.
 	allowlist.allowedCommands["ss"] = CommandPolicy{
 		ExecutablePath:   "/usr/bin/ss",
-		AllowedArgs:      []string{"^-tuln$", "^-s$"},
+		AllowedArgs:      []string{"^-tuln$", "^-s$", "^-tulnpH$", "^-tlnpH$", "^-tulnp$"},
 		MaxExecutionTime: 5 * time.Second,
 		AllowEnvironment: false,
 	}
@@ -107,6 +109,94 @@ func NewDefaultAllowlist() CommandAllowlist {
 		ExecutablePath:   "/usr/bin/yum",
 		AllowedArgs:      []string{"^check-update$", "^--quiet$"},
 		MaxExecutionTime: 15 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// Security collectors (failed-login monitoring).
+	// journalctl is used to read sshd auth events from systemd journal.
+	// Allowed args cover the precise invocation in the auth collector:
+	//   journalctl _SYSTEMD_UNIT=ssh.service|sshd.service \
+	//     --since '<RFC3339-ish>' --no-pager --output=short
+	allowlist.allowedCommands["journalctl"] = CommandPolicy{
+		ExecutablePath: "/usr/bin/journalctl",
+		AllowedArgs: []string{
+			`^_SYSTEMD_UNIT=(ssh|sshd)\.service$`,
+			`^--since$`,
+			// RFC3339-ish: "YYYY-MM-DD HH:MM:SS" — no shell metacharacters.
+			`^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$`,
+			`^--no-pager$`,
+			`^--output=short$`,
+		},
+		MaxExecutionTime: 10 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// last is a fallback data source we may use in future revisions to
+	// supplement journalctl/auth.log (currently unused by the agent but
+	// pre-allowlisted to keep ad-hoc additions out of code review later).
+	allowlist.allowedCommands["last"] = CommandPolicy{
+		ExecutablePath: "/usr/bin/last",
+		AllowedArgs: []string{
+			`^-F$`,            // full timestamps
+			`^-n$`,            // limit
+			`^-[0-9]{1,4}$`,   // -<count>
+			`^[0-9]{1,4}$`,    // count value
+			`^-f$`,            // alternate file
+			`^/var/log/wtmp$`, // canonical wtmp paths
+			`^/var/log/btmp$`,
+		},
+		MaxExecutionTime: 5 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// lastb reads /var/log/btmp directly and is useful as a journald-less
+	// failed-login fallback. Pre-allowlisted for the same reason as `last`.
+	allowlist.allowedCommands["lastb"] = CommandPolicy{
+		ExecutablePath: "/usr/sbin/lastb",
+		AllowedArgs: []string{
+			`^-F$`,
+			`^-n$`,
+			`^-[0-9]{1,4}$`,
+			`^[0-9]{1,4}$`,
+		},
+		MaxExecutionTime: 5 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// netstat: fallback for the security_ports collector when ss is missing
+	// (rare on modern Linux, but still common on stripped-down container
+	// images).
+	allowlist.allowedCommands["netstat"] = CommandPolicy{
+		ExecutablePath:   "/bin/netstat",
+		AllowedArgs:      []string{"^-tulnp$", "^-tuln$", "^-tlnp$"},
+		MaxExecutionTime: 5 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// dpkg-query: used by the security_packages collector to enumerate the
+	// installed-package inventory on Debian/Ubuntu systems. The queryformat
+	// arg uses ${...} field expansions and \t / \n escapes — escape them in
+	// the regex anchors.
+	allowlist.allowedCommands["dpkg-query"] = CommandPolicy{
+		ExecutablePath: "/usr/bin/dpkg-query",
+		AllowedArgs: []string{
+			`^-W$`,
+			`^-f=\$\{Package\}\\t\$\{Version\}\\t\$\{Architecture\}\\n$`,
+		},
+		MaxExecutionTime: 30 * time.Second,
+		AllowEnvironment: false,
+	}
+
+	// rpm: used by the security_packages collector to enumerate the
+	// installed-package inventory on RHEL/Rocky/AlmaLinux/Fedora/Oracle/etc.
+	allowlist.allowedCommands["rpm"] = CommandPolicy{
+		ExecutablePath: "/usr/bin/rpm",
+		AllowedArgs: []string{
+			`^-qa$`,
+			`^--queryformat$`,
+			`^%\{NAME\}\\t%\{VERSION\}-%\{RELEASE\}\\t%\{ARCH\}\\n$`,
+		},
+		MaxExecutionTime: 30 * time.Second,
 		AllowEnvironment: false,
 	}
 

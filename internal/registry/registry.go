@@ -163,6 +163,36 @@ func (r *Registry) CollectAll(ctx context.Context) ([]metrics.Metric, error) {
 	return allMetrics, nil
 }
 
+// Snapshots gathers structured snapshots from every collector implementing
+// metrics.SnapshotProvider. Collectors that produced nothing this cycle
+// return nil and are skipped.
+func (r *Registry) Snapshots() []metrics.Snapshot {
+	r.mutex.RLock()
+	collectors := make([]metrics.Collector, len(r.collectors))
+	copy(collectors, r.collectors)
+	r.mutex.RUnlock()
+
+	var out []metrics.Snapshot
+	for _, c := range collectors {
+		provider, ok := c.(metrics.SnapshotProvider)
+		if !ok {
+			continue
+		}
+		if !c.Enabled() {
+			continue
+		}
+		for _, snap := range provider.Snapshots() {
+			if snap.Type == "" || snap.Payload == nil {
+				r.logger.Warn("collector returned malformed snapshot, dropping",
+					"collector", c.Name(), "type", snap.Type)
+				continue
+			}
+			out = append(out, snap)
+		}
+	}
+	return out
+}
+
 // ListCollectors returns the names of all registered collectors.
 func (r *Registry) ListCollectors() []string {
 	r.mutex.RLock()

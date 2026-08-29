@@ -54,6 +54,46 @@ type Collector interface {
 	Close() error
 }
 
+// Snapshot is a structured, non-time-series observation shipped alongside
+// metrics in the /agent/data payload. Unlike a Metric (one float per point),
+// a snapshot carries a whole object — an sshd_config audit, the listening
+// socket table, the installed-package inventory — that the platform persists
+// verbatim into host_security_snapshots and feeds to its findings evaluator.
+//
+// Type MUST match one of the snapshot types the server accepts (see the
+// z.enum in platform/app/api/agent/data/route.ts and the SnapshotType union
+// in platform/lib/security/findings-types.ts). Unknown types are rejected by
+// the endpoint's schema validation, failing the whole request — so only emit
+// types the server knows.
+type Snapshot struct {
+	Type    string         `json:"type"`
+	Payload map[string]any `json:"payload"`
+}
+
+// Snapshot type identifiers. Keep in lockstep with the server-side
+// SnapshotType union; adding one here without adding it there breaks
+// ingestion for the entire payload, not just the snapshot.
+const (
+	SnapshotSSHConfig         = "ssh_config"
+	SnapshotListeningPorts    = "listening_ports"
+	SnapshotInstalledPackages = "installed_packages"
+	SnapshotCISResults        = "cis_results"
+)
+
+// SnapshotProvider is an optional interface for collectors that produce
+// structured snapshots in addition to metrics.
+//
+// Contract: Snapshots() is called by the registry immediately after
+// CollectAll() completes, and returns whatever the most recent Collect()
+// produced. Returning nil is normal and means "nothing new this cycle" —
+// collectors that run on a slower cadence than the reporting interval (the
+// package inventory, for instance) return nil on intervening cycles rather
+// than re-shipping an unchanged payload. Implementations must be safe for
+// concurrent use, since Collect() runs on the worker pool.
+type SnapshotProvider interface {
+	Snapshots() []Snapshot
+}
+
 // HealthChecker is an optional interface that collectors can implement
 // to provide health status information.
 type HealthChecker interface {
@@ -92,6 +132,11 @@ type Registry interface {
 
 	// GetCollector returns a collector by name, or nil if not found.
 	GetCollector(name string) Collector
+
+	// Snapshots gathers structured snapshots from every registered collector
+	// implementing SnapshotProvider. Call after CollectAll() — it returns
+	// what the last collection cycle produced, it does not itself collect.
+	Snapshots() []Snapshot
 
 	// HealthCheck checks the health of all collectors that implement HealthChecker.
 	HealthCheck(ctx context.Context) map[string]error

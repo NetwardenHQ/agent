@@ -98,12 +98,12 @@ func NewCollector(cfg config.ProcessConfig, hostname string, apiKey string, serv
 	serverURL = strings.TrimRight(serverURL, "/")
 
 	collector := &Collector{
-		config:    cfg,
-		hostname:  hostname,
-		logger:    slog.Default().With("component", "process_collector"),
-		cache:     newProcessCache(),
-		apiKey:    apiKey,
-		serverURL: serverURL,
+		config:     cfg,
+		hostname:   hostname,
+		logger:     slog.Default().With("component", "process_collector"),
+		cache:      newProcessCache(),
+		apiKey:     apiKey,
+		serverURL:  serverURL,
 		httpClient: sharedhttp.GetClientWithTimeout(10 * time.Second),
 	}
 

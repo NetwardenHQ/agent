@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"netwarden/internal/cache"
+	"netwarden/internal/collectors/cis"
 	"netwarden/internal/collectors/container"
 	"netwarden/internal/collectors/cpu"
 	"netwarden/internal/collectors/disk"
@@ -60,6 +61,11 @@ type Agent struct {
 	// Metrics transmission
 	transmitter MetricTransmitter
 
+	// cisCollector is held by concrete type (not through the registry) so the
+	// remote-config poll can push a new CIS profile into it. nil when CIS is
+	// disabled in netwarden.conf.
+	cisCollector *cis.Collector
+
 	// Phase 4 optimizations
 	deltaTracker *metrics.DeltaTracker
 	batchSize    int
@@ -82,7 +88,9 @@ type Agent struct {
 
 // MetricTransmitter defines the interface for transmitting metrics to the server.
 type MetricTransmitter interface {
-	Send(ctx context.Context, metrics []metrics.Metric) error
+	// Send transmits one batch. snapshots may be nil; when non-nil it is
+	// sent alongside the batch in the same request.
+	Send(ctx context.Context, metrics []metrics.Metric, snapshots []metrics.Snapshot) error
 	Close() error
 }
 
@@ -246,6 +254,11 @@ func (a *Agent) registerCollectors() error {
 		return err
 	}
 
+	// Security-posture collectors (per-collector platform support; see
+	// collectors_security.go). Each is individually disableable via
+	// enable_security_* in the config file.
+	a.registerSecurityCollectors(collectorLogger)
+
 	// MySQL collector (auto-detects running MySQL/MariaDB)
 	mysqlCollector := mysql.NewCollector(
 		a.config.Database,
@@ -336,6 +349,10 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 				MetricsEnabled   bool `json:"metrics_enabled"`
 				ProcessesEnabled bool `json:"processes_enabled"`
 			} `json:"features"`
+
+			// CISProfile is the benchmark profile the operator defined in the
+			// UI. Absent or null means CIS evaluation stays off for this host.
+			CISProfile *cis.Profile `json:"cis_profile"`
 		} `json:"data"`
 	}
 
@@ -345,6 +362,13 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 
 	if !apiResponse.Success {
 		return fmt.Errorf("API returned success=false")
+	}
+
+	// Apply the CIS profile before validating the interval: a server that
+	// returns a nonsensical interval should not also silently discard a
+	// profile change the operator just made.
+	if a.cisCollector != nil {
+		a.cisCollector.SetProfile(apiResponse.Data.CISProfile)
 	}
 
 	// Validate response has required fields
@@ -652,8 +676,14 @@ func (a *Agent) collectAndTransmit(ctx context.Context) error {
 		// Don't return error here - continue with metrics we did collect
 	}
 
-	// Only skip transmission if we have no metrics at all
-	if len(collectedMetrics) == 0 {
+	// Drain structured security snapshots produced by this cycle. Must run
+	// after CollectAll() — collectors stage their snapshot during Collect().
+	snapshots := a.registry.Snapshots()
+
+	// Only skip transmission if we have nothing at all to send. A cycle can
+	// legitimately produce a snapshot with no metrics surviving delta
+	// filtering, so snapshots alone are reason enough to transmit.
+	if len(collectedMetrics) == 0 && len(snapshots) == 0 {
 		if err != nil {
 			// No metrics AND errors - this is a complete failure
 			return fmt.Errorf("metric collection completely failed: %w", err)
@@ -663,7 +693,7 @@ func (a *Agent) collectAndTransmit(ctx context.Context) error {
 	}
 
 	// Transmit metrics in batches (even if some collectors failed)
-	if err := a.transmitMetrics(ctx, collectedMetrics); err != nil {
+	if err := a.transmitMetrics(ctx, collectedMetrics, snapshots); err != nil {
 		// Track failure
 		a.mu.Lock()
 		a.consecutiveFailures++
@@ -691,16 +721,21 @@ func (a *Agent) collectAndTransmit(ctx context.Context) error {
 }
 
 // transmitMetrics sends metrics to the server using Phase 4 optimizations.
-func (a *Agent) transmitMetrics(ctx context.Context, allMetrics []metrics.Metric) error {
-	a.logger.Debug("starting metric transmission", "total_metrics", len(allMetrics))
+//
+// Snapshots bypass delta filtering (they are not time series) and ride along
+// with the first batch only, so the server upserts each snapshot type once
+// per cycle and runs its findings evaluator once rather than once per batch.
+func (a *Agent) transmitMetrics(ctx context.Context, allMetrics []metrics.Metric, snapshots []metrics.Snapshot) error {
+	a.logger.Debug("starting metric transmission", "total_metrics", len(allMetrics), "snapshots", len(snapshots))
 
 	// Phase 4.1: Apply delta compression to filter out unchanged metrics
 	filteredMetrics := a.deltaTracker.FilterMetrics(allMetrics)
 
 	a.logger.Debug("delta filtering completed", "total_metrics", len(allMetrics), "filtered_metrics", len(filteredMetrics))
 
-	// Skip transmission if no metrics need to be sent
-	if len(filteredMetrics) == 0 {
+	// Skip transmission only if there is genuinely nothing to send. Snapshots
+	// must still go out even when every metric was delta-filtered away.
+	if len(filteredMetrics) == 0 && len(snapshots) == 0 {
 		a.logger.Debug("no metrics need to be sent after delta filtering")
 		return nil
 	}
@@ -708,10 +743,21 @@ func (a *Agent) transmitMetrics(ctx context.Context, allMetrics []metrics.Metric
 	// Use simple fixed-size batching
 	batches := a.createBatches(filteredMetrics, a.batchSize)
 
+	// A snapshot-only cycle still needs one request to carry it.
+	if len(batches) == 0 {
+		batches = [][]metrics.Metric{nil}
+	}
+
 	// Transmit each batch
 	for i, batch := range batches {
+		// Attach snapshots to the first batch only.
+		var batchSnapshots []metrics.Snapshot
+		if i == 0 {
+			batchSnapshots = snapshots
+		}
+
 		start := time.Now()
-		err := a.transmitter.Send(ctx, batch)
+		err := a.transmitter.Send(ctx, batch, batchSnapshots)
 		transmitDuration := time.Since(start)
 
 		if err != nil {
