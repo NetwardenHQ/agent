@@ -5,6 +5,13 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.1] - 2026-10-18
+
+### Fixed
+- SSH server posture on OPNsense and on FreeBSD hosts running the openssh-portable port: the
+  agent reads `/usr/local/etc/ssh/sshd_config` when `/usr/local/sbin/sshd` is installed,
+  rather than skipping the checks because the base `/etc/ssh/sshd_config` does not exist.
+
 ## [3.1.0] - 2026-10-18
 
 ### Added
