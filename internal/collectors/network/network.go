@@ -10,8 +10,8 @@ import (
 
 	gopsnet "github.com/shirou/gopsutil/v4/net"
 
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 const (

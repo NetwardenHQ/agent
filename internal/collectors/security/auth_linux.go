@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // authWindow is the size of the look-back window for failed-login counting.

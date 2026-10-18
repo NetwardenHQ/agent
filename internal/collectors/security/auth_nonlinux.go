@@ -5,7 +5,7 @@ package security
 import (
 	"context"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Enabled reports false on non-Linux platforms — failed-login monitoring

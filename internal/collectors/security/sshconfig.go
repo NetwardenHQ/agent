@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // sshConfigInterval is how often the SSH config is re-parsed. Configs change

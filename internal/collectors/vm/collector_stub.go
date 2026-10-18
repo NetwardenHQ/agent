@@ -6,8 +6,9 @@ package vm
 import (
 	"context"
 	"log/slog"
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Collector is a stub implementation for non-Linux platforms.

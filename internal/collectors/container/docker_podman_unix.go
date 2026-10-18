@@ -14,8 +14,10 @@ func isNamedPipeAvailable(pipePath string) bool {
 
 // createDialContext creates a platform-specific dial context function.
 func createDialContext(detectedPath string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var dialer net.Dialer
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Use unix socket for Linux/macOS
-		return net.Dial("unix", detectedPath)
+		// Unix socket on Linux/macOS. DialContext so a request's deadline
+		// or cancellation also bounds the connect.
+		return dialer.DialContext(ctx, "unix", detectedPath)
 	}
 }

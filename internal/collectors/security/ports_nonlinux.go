@@ -1,17 +1,16 @@
-//go:build !linux && !darwin && !windows
+//go:build !linux && !darwin && !windows && !freebsd
 
 package security
 
 import (
 	"context"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Enabled returns false on platforms with no listening-socket
-// implementation. Linux uses ss/netstat (ports_linux.go); macOS and Windows
-// use gopsutil (ports_gopsutil.go). Everything else — the BSDs, Solaris,
-// AIX — falls through to this stub.
+// implementation. Linux uses ss/netstat (ports_linux.go), FreeBSD sockstat,
+// and macOS and Windows gopsutil (ports_gopsutil.go).
 func (c *PortsCollector) Enabled() bool {
 	return false
 }

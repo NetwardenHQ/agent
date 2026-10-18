@@ -14,14 +14,24 @@ import (
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/load"
 
-	"netwarden/internal/cache"
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/cache"
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// updateInfo represents update check result.
-type updateInfo struct {
-	Count int
+// UpdateCounts is the cached result of the background update check the
+// agent runs; the system collector reports it on every cycle.
+type UpdateCounts struct {
+	Available int
+	Security  int
+	// SecurityUnknown is set when the security check could not run, so the
+	// count is not reported: an unreadable audit must not read as "none".
+	SecurityUnknown bool
+}
+
+// UpdatesCacheKey is the cache key under which the agent stores UpdateCounts.
+func UpdatesCacheKey(hostname string) string {
+	return "system:updates:" + hostname
 }
 
 // Collector implements metrics.Collector for system metrics.
@@ -96,9 +106,8 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 	}
 
-	// Collect update information from cache (populated by background goroutine in agent)
-	// This no longer blocks - we just read cached values if they exist
-	if runtime.GOOS == "linux" || runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+	// Update counts come from the agent's background check, via the cache.
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" || runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
 		if err := c.collectUpdateInfoFromCache(&collectedMetrics); err != nil {
 			c.logger.Debug("no cached update info available", "error", err)
 		}
@@ -150,41 +159,22 @@ func (c *Collector) collectLoadAverage(ctx context.Context, metrics *[]metrics.M
 	return nil
 }
 
-// collectUpdateInfoFromCache reads cached update information populated by the background goroutine.
-// This is non-blocking - if cache doesn't exist, we skip the metric (returns error).
+// collectUpdateInfoFromCache reports the update counts the agent's
+// background check cached. Before the first check has run there is nothing
+// to report and the metrics are absent.
 func (c *Collector) collectUpdateInfoFromCache(metrics *[]metrics.Metric) error {
-	cacheKey := fmt.Sprintf("system:updates:%s", c.hostname)
-
-	// Check cache for update info populated by background goroutine
-	cached, ok := cache.Get(cacheKey)
+	cached, ok := cache.Get(UpdatesCacheKey(c.hostname))
 	if !ok {
-		// Cache not populated yet - background check hasn't run
 		return fmt.Errorf("update cache not populated yet")
 	}
-
-	// Parse cached data (map format from agent goroutine)
-	updateData, ok := cached.(map[string]interface{})
+	counts, ok := cached.(UpdateCounts)
 	if !ok {
-		// Legacy cache format - try old updateInfo struct
-		if info, ok := cached.(*updateInfo); ok {
-			c.addGauge(metrics, "system_updates_available_count", float64(info.Count))
-			c.logger.Debug("using legacy cached update count", "count", info.Count)
-			return nil
-		}
-		return fmt.Errorf("invalid cache data format")
+		return fmt.Errorf("unexpected update cache type %T", cached)
 	}
-
-	// Extract counts from map
-	if count, ok := updateData["count"].(int); ok {
-		c.addGauge(metrics, "system_updates_available_count", float64(count))
-		c.logger.Debug("using cached update count from background check", "count", count)
+	c.addGauge(metrics, "system_updates_available_count", float64(counts.Available))
+	if !counts.SecurityUnknown {
+		c.addGauge(metrics, "system_security_updates_count", float64(counts.Security))
 	}
-
-	if securityCount, ok := updateData["security_count"].(int); ok {
-		c.addGauge(metrics, "system_security_updates_count", float64(securityCount))
-		c.logger.Debug("using cached security update count from background check", "count", securityCount)
-	}
-
 	return nil
 }
 
@@ -205,7 +195,7 @@ func (c *Collector) collectUserCount(ctx context.Context, metrics *[]metrics.Met
 			"component", "collector",
 			"type", "system",
 			"error", err)
-		// Don't fail collection, just return 0
+		// Reported as 0 rather than failing the whole collection.
 		c.addGauge(metrics, "connected_users_count", 0)
 		return nil
 	}
@@ -232,7 +222,7 @@ func (c *Collector) collectProcessCount(ctx context.Context, metrics *[]metrics.
 			"component", "collector",
 			"type", "system",
 			"error", err)
-		// Don't fail collection, just return 0
+		// Reported as 0 rather than failing the whole collection.
 		c.addGauge(metrics, "processes_running_count", 0)
 		return nil
 	}
@@ -263,16 +253,6 @@ func (c *Collector) addGauge(metrics *[]metrics.Metric, name string, value float
 	metric, err := c.builder.Gauge(name, value)
 	if err != nil {
 		c.logger.Warn("failed to create gauge metric", "name", name, "error", err)
-		return
-	}
-	*metrics = append(*metrics, metric)
-}
-
-// addGaugeWithLabels is a helper method to add gauge metrics with labels and error handling.
-func (c *Collector) addGaugeWithLabels(metrics *[]metrics.Metric, name string, value float64, labels map[string]string) {
-	metric, err := c.builder.GaugeWithLabels(name, value, labels)
-	if err != nil {
-		c.logger.Warn("failed to create gauge metric with labels", "name", name, "error", err)
 		return
 	}
 	*metrics = append(*metrics, metric)

@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func writeConfig(t *testing.T, mode os.FileMode) string {
 	return path
 }
 
-// A loose config file must not prevent the agent from starting — an existing
+// A loose config file must not prevent the agent from starting, or an existing
 // fleet would go dark on upgrade. The check warns; it does not fail.
 func TestLoadConfig_PermissiveModeStillLoads(t *testing.T) {
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o666, 0o604} {
@@ -59,5 +60,26 @@ func TestInsecureConfigModeMask(t *testing.T) {
 		if m&insecureConfigModeMask == 0 {
 			t.Errorf("mode %#o not flagged; group/world bits are set", m)
 		}
+	}
+}
+
+// The permission check reports through Config.Warnings so the caller can log
+// it once the log file is open; nothing is printed during LoadConfig.
+func TestLoadConfig_PermissionWarningsReturned(t *testing.T) {
+	loose, err := LoadConfig(writeConfig(t, 0o644))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loose.Warnings) != 1 || !strings.Contains(loose.Warnings[0], "chmod 600") {
+		t.Errorf("mode 0644: expected one chmod warning, got %q", loose.Warnings)
+	}
+
+	// The test file is owned by the euid running the test, which is allowed.
+	secure, err := LoadConfig(writeConfig(t, 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secure.Warnings) != 0 {
+		t.Errorf("mode 0600 owned by the agent's user: expected no warnings, got %q", secure.Warnings)
 	}
 }

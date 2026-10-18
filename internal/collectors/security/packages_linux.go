@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Enabled returns true on Linux. The Collect path itself decides whether the
@@ -24,15 +24,12 @@ func (c *PackagesCollector) Enabled() bool {
 //
 // Output is one snapshot metric (`security_installed_package_snapshot`,
 // value = total count, label `snapshot` = JSON array) plus the count gauge
-// and the distro identifier metric. Even an 800-package server only sends
-// O(few) metrics — never one-per-package — so the upload payload stays bounded.
+// and the distro identifier metric, never one metric per package.
 func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 	timestamp := time.Now()
 
-	// Throttle: re-enumerating dpkg/rpm and re-shipping the inventory every
-	// reporting interval is pure waste. On intervening cycles re-emit the
-	// cached gauges under a fresh timestamp so the series stays continuous,
-	// and return no snapshot.
+	// Between enumerations, re-emit the cached gauges under a fresh
+	// timestamp so the series stays continuous, and return no snapshot.
 	due, cached := c.shouldCollect(timestamp)
 	if !due {
 		c.logger.Debug("installed packages: throttled, re-emitting cached metrics")
@@ -74,7 +71,28 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 		})
 	}
 
-	collected := make([]metrics.Metric, 0, 3)
+	osCount := len(packages)
+
+	// Append host-installed language packages (pip, npm) tagged with their
+	// ecosystem, so the platform matches them against OSV rather than the
+	// distro advisory feeds. Disabled with enable_security_lang_packages: false.
+	langCount := 0
+	langTruncated := false
+	if c.langPackages {
+		lang, truncated := collectLanguagePackages(ctx, c.langRoots)
+		langTruncated = truncated
+		if truncated {
+			c.logger.Info("language package walk hit its limit; inventory is partial",
+				"count", len(lang))
+		}
+		langCount = len(lang)
+		packages = append(packages, lang...)
+		if langCount > 0 {
+			c.logger.Debug("language packages discovered", "count", langCount)
+		}
+	}
+
+	collected := make([]metrics.Metric, 0, 4)
 
 	addGauge := func(name string, value float64, labels map[string]string) {
 		m, err := c.builder.GaugeWithLabels(name, value, labels)
@@ -109,26 +127,32 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 	if source != "" {
 		countLabels["source"] = source
 	}
-	addGauge("security_installed_package_count", float64(len(packages)), countLabels)
+	addGauge("security_installed_package_count", float64(osCount), countLabels)
+	if c.langPackages {
+		addGauge("security_language_package_count", float64(langCount), map[string]string{})
+	}
 
-	// Structured snapshot: the inventory travels in the payload's top-level
-	// `snapshots` array. The platform persists it into
-	// host_security_snapshots, where cve-matcher.ts joins it against the
-	// distro advisory feeds. Shape must match InstalledPackagesSnapshot in
-	// platform/lib/security/findings-types.ts.
+	// The inventory travels in the payload's top-level `snapshots` array,
+	// where the platform joins it against the vulnerability feeds.
 	//
-	// Emitted only when we actually enumerated something. An empty inventory
-	// means the query failed or the distro is unsupported; publishing that
-	// would let the matcher conclude the host has no packages — and therefore
-	// no vulnerabilities — which is worse than having no snapshot at all.
+	// It is emitted only when something was enumerated. An empty inventory
+	// means the query failed or the distro is unsupported; publishing it
+	// would read as a host with no packages and therefore no vulnerabilities.
 	if len(packages) > 0 {
+		payload := map[string]any{
+			"packages":          packages,
+			"distro_id":         distro.ID,
+			"distro_version_id": distro.VersionID,
+		}
+		// The language walk is capped (see langpkg.go). When it stopped
+		// early, say so: a package absent from a partial inventory has not
+		// necessarily been removed.
+		if langTruncated {
+			payload["language_packages_truncated"] = true
+		}
 		c.store(collected, metrics.Snapshot{
-			Type: metrics.SnapshotInstalledPackages,
-			Payload: map[string]any{
-				"packages":          packages,
-				"distro_id":         distro.ID,
-				"distro_version_id": distro.VersionID,
-			},
+			Type:    metrics.SnapshotInstalledPackages,
+			Payload: payload,
 		})
 	} else {
 		// Cache the gauges so throttled cycles stay continuous, but leave
@@ -185,8 +209,7 @@ func readOSRelease(path string) (distroInfo, error) {
 }
 
 // collectDebianPackages runs `dpkg-query` once and parses tab-separated
-// `name<TAB>version<TAB>arch` lines. The whole inventory comes back in one
-// invocation — never one-call-per-package.
+// `name<TAB>version<TAB>arch` lines.
 func collectDebianPackages(ctx context.Context) ([]installedPackage, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -240,8 +263,7 @@ func parseDpkgOutput(output string) []installedPackage {
 }
 
 // collectRHELPackages runs `rpm -qa` with a custom queryformat that yields
-// `name<TAB>version-release<TAB>arch` lines. Single invocation for the full
-// inventory.
+// `name<TAB>version-release<TAB>arch` lines.
 func collectRHELPackages(ctx context.Context) ([]installedPackage, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

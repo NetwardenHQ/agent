@@ -8,46 +8,34 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
+)
+
+const (
+	// statsConcurrency is how many containers are queried for stats at once.
+	statsConcurrency = 5
+
+	// statsTimeout bounds one container's stats call.
+	statsTimeout = 5 * time.Second
 )
 
 // Collector implements metrics.Collector for container metrics.
 type Collector struct {
-	hostname    string
-	logger      *slog.Logger
-	builder     metrics.MetricBuilder
-	enabled     bool
-	config      config.ContainerConfig
-	monitor     *RuntimeMonitor
-	lastCollect time.Time
-	// Availability caching to prevent excessive runtime checks
-	availabilityMutex sync.RWMutex
-	cachedAvailable   bool
-	availableCacheExp time.Time
+	hostname string
+	logger   *slog.Logger
+	builder  metrics.MetricBuilder
+	enabled  bool
+	config   config.ContainerConfig
+	monitor  *RuntimeMonitor
+
+	// images holds the container-image inventory snapshot between Collect()
+	// and Snapshots(). See container_images.go.
+	images imageInventory
 }
 
 // NewCollector creates a new container metrics collector.
-func NewCollector(cfg interface{}, hostname string, opts ...Option) *Collector {
-	var containerConfig config.ContainerConfig
-
-	// Parse configuration
-	switch v := cfg.(type) {
-	case config.ContainerConfig:
-		containerConfig = v
-	case *config.ContainerConfig:
-		if v != nil {
-			containerConfig = *v
-		}
-	default:
-		// Default config if not provided
-		containerConfig = config.ContainerConfig{
-			EnableContainers: true, // Enable containers by default
-			ContainerRuntime: "auto",
-			StatsInterval:    30 * time.Second,
-		}
-	}
-
+func NewCollector(containerConfig config.ContainerConfig, hostname string, opts ...Option) *Collector {
 	c := &Collector{
 		hostname: hostname,
 		logger:   slog.Default(),
@@ -56,12 +44,10 @@ func NewCollector(cfg interface{}, hostname string, opts ...Option) *Collector {
 		builder:  metrics.NewBuilder().WithHostname(hostname),
 	}
 
-	// Apply options
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	// Initialize runtime detection and monitoring
 	detector := NewRuntimeDetector(c.logger)
 	runtime := detector.DetectRuntime(containerConfig)
 	c.monitor = NewRuntimeMonitor(runtime, detector, containerConfig, c.logger)
@@ -84,309 +70,151 @@ func (c *Collector) Name() string {
 	return "container"
 }
 
-// Enabled returns true if container collection is enabled and runtime is available.
-// Uses caching to prevent excessive availability checks.
+// Enabled reports whether container collection is on and a runtime is
+// reachable. The monitor throttles the reachability check itself.
 func (c *Collector) Enabled() bool {
-	if !c.enabled {
-		return false
-	}
-
-	// Check cached availability first (2-minute cache)
-	c.availabilityMutex.RLock()
-	if time.Now().Before(c.availableCacheExp) {
-		result := c.cachedAvailable
-		c.availabilityMutex.RUnlock()
-		return result
-	}
-	c.availabilityMutex.RUnlock()
-
-	// Need to check availability
-	c.availabilityMutex.Lock()
-	defer c.availabilityMutex.Unlock()
-
-	// Double-check pattern
-	if time.Now().Before(c.availableCacheExp) {
-		return c.cachedAvailable
-	}
-
-	// Check runtime availability
-	runtimeAvailable := c.monitor.IsAvailable(context.Background())
-
-	// Cache result (shorter cache for negative results)
-	if runtimeAvailable {
-		c.availableCacheExp = time.Now().Add(2 * time.Minute)
-	} else {
-		c.availableCacheExp = time.Now().Add(30 * time.Second)
-	}
-	c.cachedAvailable = runtimeAvailable
-
-	return runtimeAvailable
+	return c.enabled && c.monitor.IsAvailable()
 }
 
-// Collect gathers container metrics with proper timeout and error handling.
+// Collect gathers per-container status and resource metrics.
 func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
-	if !c.enabled {
+	if !c.Enabled() {
 		return nil, nil
 	}
 
-	// Check if runtime is available (with monitoring and failover)
-	if !c.monitor.IsAvailable(ctx) {
-		return nil, nil
-	}
-
-	var collectedMetrics []metrics.Metric
-	timestamp := time.Now()
-	c.builder = c.builder.WithTimestamp(timestamp)
-
-	// Get the current runtime client
+	c.builder = c.builder.WithTimestamp(time.Now())
 	runtime := c.monitor.GetClient()
 
-	// Get container list with caching
-	containers, err := c.getContainersWithCache(ctx, runtime)
-	if err != nil {
-		c.logger.Warn("failed to list containers", "error", err)
-		// Return basic metrics even on error
-		return c.buildBasicMetrics(0, 0), nil
-	}
-
-	// System-level metrics
-	// Note: Total count removed - ContainerWidget uses dashboard stats calculated from container_status metrics
-
-	// Count running containers and collect basic metrics
-	runningContainers := make([]Container, 0)
-	for _, container := range containers {
-		// Per-container basic metrics
-		labels := map[string]string{
-			"container":    container.Name,
-			"container_id": container.ID,
-			"image":        container.Image,
-			"runtime":      runtime.Name(),
-		}
-
-		statusValue := 0.0
-		if container.Status == "running" {
-			statusValue = 1.0
-			runningContainers = append(runningContainers, container)
-		}
-
-		// Create unique metric name to avoid database constraint conflicts
-		idSuffix := container.ID
-		if len(idSuffix) > 12 {
-			idSuffix = idSuffix[:12]
-		}
-		statusMetricName := fmt.Sprintf("container_status_%s", idSuffix)
-		if metric, err := c.builder.GaugeWithLabels(statusMetricName, statusValue, labels); err == nil {
-			collectedMetrics = append(collectedMetrics, metric)
-		} else {
-			c.logger.Error("failed to create container_status metric", "container", container.Name, "error", err)
-		}
-	}
-
-	// Collect detailed stats for running containers concurrently
-	statsMetrics := c.collectContainerStatsConcurrently(ctx, runtime, runningContainers)
-	collectedMetrics = append(collectedMetrics, statsMetrics...)
-
-	// Running containers count
-	if metric, err := c.builder.Gauge("container_running_count", float64(len(runningContainers))); err == nil {
-		collectedMetrics = append(collectedMetrics, metric)
-	}
-
-	return collectedMetrics, nil
-}
-
-// collectContainerStats converts container stats to metrics.
-func (c *Collector) collectContainerStats(stats *ContainerStats, labels map[string]string, metrics *[]metrics.Metric) {
-	// CPU metrics
-	if metric, err := c.builder.GaugeWithLabels("container_cpu_usage_percent", stats.CPUPercent, labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	// Memory metrics
-	if metric, err := c.builder.GaugeWithLabels("container_memory_usage_bytes", float64(stats.MemoryUsage), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	if metric, err := c.builder.GaugeWithLabels("container_memory_limit_bytes", float64(stats.MemoryLimit), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	// Memory usage percentage (if limit is available)
-	if stats.MemoryLimit > 0 {
-		memoryPercent := (float64(stats.MemoryUsage) / float64(stats.MemoryLimit)) * 100.0
-		if metric, err := c.builder.GaugeWithLabels("container_memory_usage_percent", memoryPercent, labels); err == nil {
-			*metrics = append(*metrics, metric)
-		}
-	}
-
-	// Network metrics
-	if metric, err := c.builder.GaugeWithLabels("container_network_rx_bytes", float64(stats.NetworkRxBytes), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	if metric, err := c.builder.GaugeWithLabels("container_network_tx_bytes", float64(stats.NetworkTxBytes), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	// Disk I/O metrics
-	if metric, err := c.builder.GaugeWithLabels("container_disk_read_bytes", float64(stats.DiskReadBytes), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-
-	if metric, err := c.builder.GaugeWithLabels("container_disk_write_bytes", float64(stats.DiskWriteBytes), labels); err == nil {
-		*metrics = append(*metrics, metric)
-	}
-}
-
-// getContainersWithCache retrieves containers using cache when possible.
-func (c *Collector) getContainersWithCache(ctx context.Context, runtime RuntimeClient) ([]Container, error) {
 	containers, err := runtime.ListContainers(ctx)
 	if err != nil {
-		return nil, err
+		// Report an error rather than a zero running count, which would
+		// claim every container is down.
+		return nil, fmt.Errorf("listing containers: %w", err)
 	}
-	return containers, nil
+
+	// Image inventory, built from the same list so it costs no extra
+	// runtime calls.
+	c.stageImages(containers)
+
+	var collected []metrics.Metric
+	running := make([]Container, 0, len(containers))
+	for _, ct := range containers {
+		status := 0.0
+		if ct.Status == "running" {
+			status = 1
+			running = append(running, ct)
+		}
+
+		// The container id in the metric name gives each container its own
+		// series.
+		if m, err := c.builder.GaugeWithLabels("container_status_"+shortID(ct.ID), status, c.labels(ct, runtime)); err == nil {
+			collected = append(collected, m)
+		}
+	}
+
+	collected = append(collected, c.collectStats(ctx, runtime, running)...)
+
+	if m, err := c.builder.Gauge("container_running_count", float64(len(running))); err == nil {
+		collected = append(collected, m)
+	}
+	return collected, nil
 }
 
-// collectContainerStatsConcurrently collects stats for running containers in parallel.
-func (c *Collector) collectContainerStatsConcurrently(ctx context.Context, runtime RuntimeClient, containers []Container) []metrics.Metric {
+// labels is the label set shared by every series of one container.
+func (c *Collector) labels(ct Container, runtime RuntimeClient) map[string]string {
+	return map[string]string{
+		"container":    ct.Name,
+		"container_id": ct.ID,
+		"image":        ct.Image,
+		"runtime":      runtime.Name(),
+	}
+}
+
+// shortID is the 12-character form of a container id, as the CLI shows it.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// collectStats queries the runtime for each running container's resource use,
+// a few at a time. A container whose stats call fails contributes nothing;
+// the others are unaffected.
+func (c *Collector) collectStats(ctx context.Context, runtime RuntimeClient, containers []Container) []metrics.Metric {
 	if len(containers) == 0 {
 		return nil
 	}
 
-	// Limit concurrency to avoid overwhelming the runtime
-	maxWorkers := 5
-	if len(containers) < maxWorkers {
-		maxWorkers = len(containers)
-	}
-
-	type statsResult struct {
-		metrics []metrics.Metric
-		err     error
-	}
-
-	resultsChan := make(chan statsResult, len(containers))
-	semaphore := make(chan struct{}, maxWorkers)
-
-	// Use WaitGroup to ensure all goroutines complete
+	results := make([][]metrics.Metric, len(containers))
+	sem := make(chan struct{}, statsConcurrency)
 	var wg sync.WaitGroup
-	wg.Add(len(containers))
 
-	// Start workers
-	for _, container := range containers {
-		go func(container Container) {
+	for i, ct := range containers {
+		wg.Add(1)
+		go func(i int, ct Container) {
 			defer wg.Done()
-			// Acquire semaphore with context cancellation support
+
 			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
 			case <-ctx.Done():
-				// Context cancelled before we could acquire semaphore
-				select {
-				case resultsChan <- statsResult{err: ctx.Err()}:
-				default:
-					// Channel might be full, but we're shutting down anyway
-				}
 				return
 			}
 
-			// Create context with timeout for stats collection
-			statsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			statsCtx, cancel := context.WithTimeout(ctx, statsTimeout)
 			defer cancel()
 
-			labels := map[string]string{
-				"container":    container.Name,
-				"container_id": container.ID,
-				"image":        container.Image,
-				"runtime":      runtime.Name(),
-			}
-
-			stats, err := runtime.GetContainerStats(statsCtx, container.ID)
+			stats, err := runtime.GetContainerStats(statsCtx, ct.ID)
 			if err != nil {
-				c.logger.Warn("failed to get container stats", "container", container.Name, "error", err)
-				select {
-				case resultsChan <- statsResult{err: err}:
-				case <-ctx.Done():
-					// Context cancelled while trying to send result
-				}
+				c.logger.Warn("failed to get container stats", "container", ct.Name, "error", err)
 				return
 			}
-
-			var metrics []metrics.Metric
-			c.collectContainerStats(stats, labels, &metrics)
-			select {
-			case resultsChan <- statsResult{metrics: metrics}:
-			case <-ctx.Done():
-				// Context cancelled while trying to send result
-			}
-		}(container)
+			results[i] = c.statsMetrics(stats, c.labels(ct, runtime))
+		}(i, ct)
 	}
+	wg.Wait()
 
-	// Close results channel after all goroutines complete
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
+	var out []metrics.Metric
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out
+}
 
-	// Collect results with context cancellation support
-	var allMetrics []metrics.Metric
-collectLoop:
-	for {
-		select {
-		case result, ok := <-resultsChan:
-			if !ok {
-				// Channel closed, all goroutines completed
-				break collectLoop
-			}
-			if result.err == nil {
-				allMetrics = append(allMetrics, result.metrics...)
-			}
-		case <-ctx.Done():
-			// Context cancelled - wait briefly for goroutines to finish
-			// Use a timeout to prevent hanging forever
-			waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			waitDone := make(chan struct{})
-			go func() {
-				wg.Wait()
-				close(waitDone)
-			}()
-
-			select {
-			case <-waitDone:
-				// All goroutines finished cleanly
-			case <-waitCtx.Done():
-				// Timeout - goroutines taking too long, but they'll clean up eventually
-				c.logger.Warn("timeout waiting for container stats goroutines to complete")
-			}
-			return allMetrics
+// statsMetrics turns one container's stats into series.
+func (c *Collector) statsMetrics(stats *ContainerStats, labels map[string]string) []metrics.Metric {
+	out := make([]metrics.Metric, 0, 8)
+	add := func(name string, value float64) {
+		if m, err := c.builder.GaugeWithLabels(name, value, labels); err == nil {
+			out = append(out, m)
 		}
 	}
 
-	return allMetrics
-}
-
-// buildBasicMetrics creates minimal metrics when container listing fails.
-func (c *Collector) buildBasicMetrics(totalCount, runningCount int) []metrics.Metric {
-	var metrics []metrics.Metric
-
-	// Note: container_total_count removed - dashboard calculates total from container_status metrics
-
-	if metric, err := c.builder.Gauge("container_running_count", float64(runningCount)); err == nil {
-		metrics = append(metrics, metric)
+	// Only what the runtime actually reported (see ContainerStats).
+	if stats.CPUKnown {
+		// 100 = one core, as in `docker stats` / `podman stats`.
+		add("container_cpu_usage_percent", stats.CPUPercent)
 	}
-
-	return metrics
-}
-
-// GetRuntimeName returns the name of the currently active runtime.
-func (c *Collector) GetRuntimeName() string {
-	if c.monitor != nil {
-		return c.monitor.GetClient().Name()
+	if stats.MemoryKnown {
+		add("container_memory_usage_bytes", float64(stats.MemoryUsage))
+		if stats.MemoryLimit > 0 {
+			add("container_memory_limit_bytes", float64(stats.MemoryLimit))
+			add("container_memory_usage_percent", float64(stats.MemoryUsage)/float64(stats.MemoryLimit)*100)
+		}
 	}
-	return "none"
+	if stats.NetworkKnown {
+		add("container_network_rx_bytes", float64(stats.NetworkRxBytes))
+		add("container_network_tx_bytes", float64(stats.NetworkTxBytes))
+	}
+	if stats.DiskKnown {
+		add("container_disk_read_bytes", float64(stats.DiskReadBytes))
+		add("container_disk_write_bytes", float64(stats.DiskWriteBytes))
+	}
+	return out
 }
 
-// Close performs cleanup and closes any connections.
+// Close releases the runtime connection.
 func (c *Collector) Close() error {
 	if c.monitor != nil {
 		return c.monitor.Close()
@@ -394,5 +222,5 @@ func (c *Collector) Close() error {
 	return nil
 }
 
-// Verify interface compliance at compile time
+// Verify interface compliance at compile time.
 var _ metrics.Collector = (*Collector)(nil)

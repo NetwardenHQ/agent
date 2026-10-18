@@ -1,23 +1,20 @@
-//go:build darwin || windows
+//go:build darwin || windows || freebsd
 
 package security
 
 import (
 	"context"
-	"fmt"
 	"strings"
-	"syscall"
 	"time"
 
-	gopsnet "github.com/shirou/gopsutil/v4/net"
-	"github.com/shirou/gopsutil/v4/process"
-
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// Enabled returns true — listening-socket enumeration is available on macOS
-// and Windows through gopsutil, which reads lsof on Darwin and the
-// GetExtendedTcpTable/GetExtendedUdpTable APIs on Windows.
+// Enabled returns true: listening-socket enumeration is available on macOS,
+// FreeBSD and Windows. collectListeningSockets reads sockstat(1) on FreeBSD
+// (ports_source_freebsd.go) and gopsutil elsewhere (ports_source_gopsutil.go),
+// which uses lsof on Darwin and GetExtendedTcpTable/GetExtendedUdpTable on
+// Windows.
 func (c *PortsCollector) Enabled() bool {
 	return true
 }
@@ -33,16 +30,15 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 	timestamp := time.Now()
 	c.builder = c.builder.WithTimestamp(timestamp)
 
-	sockets, err := collectListeningSocketsGopsutil(ctx)
+	sockets, err := collectListeningSockets(ctx)
 	if err != nil {
 		c.logger.Warn("failed to enumerate listening sockets", "error", err)
 		return nil, nil
 	}
 	if len(sockets) == 0 {
-		// Same reasoning as the Linux path: an empty result is far more
-		// likely to be a permissions or tooling problem than a host with
-		// nothing listening, and "0 exposed ports" is a dangerous thing to
-		// report wrongly. Emit nothing rather than a false all-clear.
+		// An empty result is far more likely a permissions or tooling
+		// problem than a host with nothing listening. Emit nothing rather
+		// than a false all-clear.
 		c.logger.Warn("listening-socket enumeration returned nothing; skipping cycle")
 		return nil, nil
 	}
@@ -60,7 +56,7 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 	}
 
 	baseLabels := func() map[string]string {
-		return map[string]string{"source": "gopsutil"}
+		return map[string]string{"source": portsSource}
 	}
 
 	addGauge("security_open_ports_count", float64(totalCount), baseLabels())
@@ -93,61 +89,6 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 	return collected, nil
 }
 
-// collectListeningSocketsGopsutil returns the listening sockets reported by
-// gopsutil, normalized into the same listeningSocket shape the Linux parsers
-// produce so the platform contract is identical across operating systems.
-func collectListeningSocketsGopsutil(ctx context.Context) ([]listeningSocket, error) {
-	conns, err := gopsnet.ConnectionsWithContext(ctx, "inet")
-	if err != nil {
-		return nil, fmt.Errorf("failed to enumerate connections: %w", err)
-	}
-
-	// Process names are resolved lazily and cached: a host can have many
-	// sockets owned by the same PID, and each lookup is a syscall (or an
-	// lsof-backed read on Darwin).
-	nameCache := make(map[int32]string)
-
-	sockets := make([]listeningSocket, 0, len(conns))
-	for _, conn := range conns {
-		proto, ok := protoFromSockType(conn.Type)
-		if !ok {
-			continue
-		}
-
-		// TCP sockets must be in LISTEN state. UDP is connectionless and
-		// carries no meaningful state, so every UDP row is a bound port.
-		if proto == protoTCP && !strings.EqualFold(conn.Status, "LISTEN") {
-			continue
-		}
-		if conn.Laddr.Port == 0 || conn.Laddr.Port > 65535 {
-			continue
-		}
-
-		sockets = append(sockets, listeningSocket{
-			Proto:       proto,
-			Port:        int(conn.Laddr.Port),
-			BindAddr:    normalizeBindAddr(conn.Laddr.IP),
-			ProcessName: processName(ctx, conn.Pid, nameCache),
-			PID:         int(conn.Pid),
-		})
-	}
-
-	return sockets, nil
-}
-
-// protoFromSockType maps a socket type to the canonical protocol string.
-// gopsutil sets SOCK_STREAM/SOCK_DGRAM consistently on both Darwin and
-// Windows.
-func protoFromSockType(sockType uint32) (string, bool) {
-	switch sockType {
-	case syscall.SOCK_STREAM:
-		return protoTCP, true
-	case syscall.SOCK_DGRAM:
-		return protoUDP, true
-	}
-	return "", false
-}
-
 // normalizeBindAddr converts platform-specific wildcard spellings to the ones
 // isPublicBindAddr recognizes. Windows reports the IPv4 wildcard as "0.0.0.0"
 // and the IPv6 wildcard as "::", but lsof on Darwin renders both as "*", and
@@ -158,26 +99,4 @@ func normalizeBindAddr(ip string) string {
 		return "0.0.0.0"
 	}
 	return ip
-}
-
-// processName resolves a PID to a process name, caching results. A failure is
-// normal — the process may have exited, or the agent may lack the rights to
-// inspect it — and yields an empty name, matching the Linux behaviour where
-// non-root agents see redacted process info.
-func processName(ctx context.Context, pid int32, cache map[int32]string) string {
-	if pid <= 0 {
-		return ""
-	}
-	if name, ok := cache[pid]; ok {
-		return name
-	}
-
-	name := ""
-	if proc, err := process.NewProcessWithContext(ctx, pid); err == nil {
-		if n, err := proc.NameWithContext(ctx); err == nil {
-			name = n
-		}
-	}
-	cache[pid] = name
-	return name
 }

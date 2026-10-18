@@ -8,27 +8,27 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // PackagesCollector enumerates installed packages (dpkg or rpm) and emits a
 // single snapshot metric carrying the per-package payload as a JSON-encoded
-// label value, plus a count gauge and distro identifying metric. Cadence:
-// every 6 hours — package state rarely changes, and the platform CVE matcher
-// reads the most recent snapshot.
+// label value, plus a count gauge and a distro identifier metric. It runs
+// every 6 hours because package state rarely changes and the platform CVE
+// matcher reads the most recent snapshot.
 type PackagesCollector struct {
 	hostname string
 	logger   *slog.Logger
 	builder  metrics.MetricBuilder
 
-	// One-time log lines (e.g., "unsupported distro") so we don't spam the
-	// agent log on every collection cycle.
+	// One-time log lines (e.g. "unsupported distro"), so they are not
+	// repeated every collection cycle.
 	unsupportedOnce sync.Once
 
-	// Cadence + snapshot handoff. Enumerating dpkg/rpm and shipping the
-	// resulting inventory is by far the heaviest thing this agent does
-	// (~50KB of JSON on a modest server, ~150KB on a fat one), and package
-	// state changes on the order of days. lastCollected gates the real work
+	// Cadence and snapshot handoff. Enumerating dpkg/rpm and shipping the
+	// inventory is the heaviest thing this agent does (~50KB of JSON on a
+	// modest server, ~150KB on a large one), and package state changes on
+	// the order of days. lastCollected gates the real work
 	// to PackagesCollectionInterval; lastMetrics is re-emitted with fresh
 	// timestamps on intervening cycles so the count/distro gauges stay
 	// continuous instead of leaving holes in the time series.
@@ -36,6 +36,13 @@ type PackagesCollector struct {
 	lastCollected time.Time
 	lastMetrics   []metrics.Metric
 	pending       *metrics.Snapshot
+
+	// Language-package discovery (Linux only), on by default and controlled
+	// by enable_security_lang_packages. langRoots are operator-configured
+	// directories to scan for node_modules and site-packages in addition to
+	// the auto-discovered Python locations.
+	langPackages bool
+	langRoots    []string
 }
 
 // NewPackagesCollector creates a new installed-package inventory collector.
@@ -55,6 +62,17 @@ func NewPackagesCollector(hostname string, opts ...PackagesOption) *PackagesColl
 
 // PackagesOption configures the packages collector.
 type PackagesOption func(*PackagesCollector)
+
+// WithLangPackages enables host-installed language-package discovery
+// and sets any extra roots to scan (for node_modules and
+// non-system site-packages). Auto-discovered Python system locations are
+// always included when enabled.
+func WithLangPackages(enabled bool, roots []string) PackagesOption {
+	return func(c *PackagesCollector) {
+		c.langPackages = enabled
+		c.langRoots = roots
+	}
+}
 
 // WithPackagesLogger sets the logger for the packages collector.
 func WithPackagesLogger(logger *slog.Logger) PackagesOption {
@@ -77,32 +95,24 @@ func (c *PackagesCollector) Close() error {
 }
 
 // PackagesCollectionInterval is the recommended scheduling cadence for this
-// collector. The agent's registry currently uses a single global interval,
-// so this constant exists as documentation and for future per-collector
-// scheduling.
+// collector. The collector throttles itself to it, since the registry runs
+// every collector on a single global interval.
 const PackagesCollectionInterval = 6 * time.Hour
 
-// installedPackage describes a single installed package. Field tags are
-// shared with the platform-side payload contract — keep them stable.
-// `name + version + distro_id + distro_version_id` is the CVE join key.
-// Package ecosystems. This is the namespace a package belongs to, which is a
-// different question from Source (the tool that reported it): dpkg is a tool,
-// deb is a format. The distinction matters downstream because it decides which
-// vulnerability feed applies.
-//
-// Operating-system ecosystems route to the distro advisory feeds (Ubuntu USN,
-// Debian DSA, RedHat OVAL) via the platform's cve-matcher. The language
-// ecosystems are reserved for host-installed language packages and route to
-// OSV via the module matcher instead; their identifiers match the OsvEcosystem
-// union in platform/lib/security/cve-feeds/osv.ts so no translation layer is
-// needed. Nothing emits them yet.
+// Package ecosystems. An ecosystem is the namespace a package belongs to,
+// distinct from Source, the tool that reported it (dpkg is a tool, deb is a
+// format). It decides which vulnerability feed applies: operating-system
+// ecosystems map to the distro advisory feeds (Ubuntu USN, Debian DSA, Red Hat
+// OVAL), language ecosystems to OSV, whose ecosystem identifiers they match.
+// The Linux language walk (langpkg_unix.go) emits npm and pypi; the rest are
+// reserved.
 const (
 	// Operating-system package ecosystems.
 	EcosystemDeb = "deb"
 	EcosystemRPM = "rpm"
 	EcosystemAPK = "apk"
 
-	// Language package ecosystems (reserved; not yet emitted).
+	// Language package ecosystems (npm and pypi emitted; others reserved).
 	EcosystemNPM      = "npm"
 	EcosystemPyPI     = "pypi"
 	EcosystemRubyGems = "rubygems"
@@ -113,6 +123,9 @@ const (
 	EcosystemComposer = "composer"
 )
 
+// installedPackage describes a single installed package. The JSON tags are
+// part of the agent API and must stay stable. name, version, distro_id and
+// distro_version_id together form the CVE join key.
 type installedPackage struct {
 	Name      string `json:"name"`
 	Version   string `json:"version"`
@@ -121,16 +134,15 @@ type installedPackage struct {
 	Ecosystem string `json:"ecosystem"` // package namespace: see the Ecosystem* constants
 }
 
-// distroInfo carries the bits of /etc/os-release that the platform-side CVE
-// matcher needs to pick the right vulnerability feed.
+// distroInfo carries the /etc/os-release fields the platform CVE matcher
+// needs to pick the right vulnerability feed.
 type distroInfo struct {
 	ID        string // ID=, e.g. "ubuntu"
 	IDLike    string // ID_LIKE=, e.g. "debian"
 	VersionID string // VERSION_ID=, e.g. "22.04"
 }
 
-// pkgFamily classifies a distro into the package-manager family we should
-// query.
+// pkgFamily classifies a distro into the package-manager family to query.
 type pkgFamily int
 
 const (
@@ -168,8 +180,8 @@ func classifyDistro(d distroInfo) pkgFamily {
 	return pkgFamilyUnknown
 }
 
-// splitSpaces splits on whitespace. Tiny helper to avoid importing strings
-// in this cross-platform shell file (Linux file already imports strings).
+// splitSpaces splits on whitespace without importing strings into this
+// cross-platform file.
 func splitSpaces(s string) []string {
 	var out []string
 	start := -1
@@ -191,8 +203,8 @@ func splitSpaces(s string) []string {
 	return out
 }
 
-// lower is a tiny ASCII lower-caser to avoid pulling strings into the
-// cross-platform shell (Linux file already imports strings).
+// lower lower-cases ASCII without importing strings into this
+// cross-platform file.
 func lower(s string) string {
 	b := []byte(s)
 	for i := range b {
@@ -207,10 +219,9 @@ func lower(s string) string {
 var _ metrics.Collector = (*PackagesCollector)(nil)
 
 // Snapshots returns the installed-package inventory produced by the most
-// recent real enumeration, then clears it. Intervening (throttled) cycles
-// return nil — the server already holds the inventory in
-// host_security_snapshots, and re-shipping an unchanged 50KB payload every
-// 60s would dominate the agent's upload volume for no added signal.
+// recent real enumeration, then clears it. Throttled cycles return nil: the
+// platform already holds the inventory, and re-shipping an unchanged 50KB
+// payload every cycle would dominate the agent's upload volume.
 func (c *PackagesCollector) Snapshots() []metrics.Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()

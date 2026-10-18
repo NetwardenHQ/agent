@@ -11,22 +11,25 @@ import (
 	"strings"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// Enabled returns true on Linux — port auditing is unconditionally available.
+// Enabled returns true: port auditing is always available on Linux.
 func (c *PortsCollector) Enabled() bool {
 	return true
 }
 
 // Collect enumerates listening TCP/UDP sockets and emits the aggregate gauges
-// described in the security-wedge spec, plus a snapshot metric whose value is
+// plus a snapshot metric whose value is
 // the total listening-socket count and whose `snapshot` label carries the
 // JSON-encoded array of per-socket records.
 func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
-	c.logger.Debug("collecting listening sockets")
-
 	timestamp := time.Now()
+	if cached := c.cachedGauges(timestamp); cached != nil {
+		return cached, nil
+	}
+
+	c.logger.Debug("collecting listening sockets")
 	c.builder = c.builder.WithTimestamp(timestamp)
 
 	sockets, source, err := collectListeningSockets(ctx)
@@ -62,14 +65,11 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 	}
 	addGauge("security_management_ports_public", float64(managementOpen), managementLabels)
 
-	// Structured snapshot: the full socket table travels in the payload's
-	// top-level `snapshots` array, NOT stuffed into a metric label. The
-	// platform persists it into host_security_snapshots and runs
-	// evaluateListeningPorts() against it. Shape must match
-	// ListeningPortsSnapshot in platform/lib/security/findings-types.ts.
+	// The full socket table travels in the payload's top-level `snapshots`
+	// array rather than in a metric label.
 	//
-	// `ports` is always a non-nil slice: json.Marshal renders a nil slice as
-	// `null`, and the server's evaluator iterates it directly.
+	// `ports` is always non-nil: json.Marshal renders a nil slice as `null`,
+	// and the platform iterates it directly.
 	portEntries := sockets
 	if portEntries == nil {
 		portEntries = []listeningSocket{}
@@ -92,6 +92,7 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 		"management_public", managementOpen,
 		"source", source)
 
+	c.rememberGauges(timestamp, collected)
 	return collected, nil
 }
 
@@ -99,13 +100,11 @@ func (c *PortsCollector) Collect(ctx context.Context) ([]metrics.Metric, error) 
 // or `netstat -tulnp` when needed. The second return value identifies which
 // command produced the output (useful as a metric label and for debugging).
 //
-// A command that exits cleanly but whose output parses to zero sockets is
-// treated as a FAILURE and we fall through to the next source. This is
-// deliberate: reporting "0 listening ports" is indistinguishable from "this
-// host is not exposed", which is exactly the false negative a security
-// product must never emit. Any monitored host has at least one listening
-// socket in practice; if every source genuinely yields nothing we return an
-// error and the caller emits no metrics at all rather than a misleading zero.
+// A command that exits cleanly but parses to zero sockets counts as a failure
+// and the next source is tried, because "0 listening ports" would read as "this
+// host is not exposed". In practice every host has at least one listening
+// socket; if no source yields any, an error is returned and the caller emits
+// no metrics rather than a misleading zero.
 func collectListeningSockets(ctx context.Context) ([]listeningSocket, string, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -122,7 +121,7 @@ func collectListeningSockets(ctx context.Context) ([]listeningSocket, string, er
 		}
 
 		// Fallback within ss: TCP-only. With a single family requested, ss
-		// OMITS the Netid column and the row starts at State — hence the
+		// omits the Netid column and the row starts at State, hence the
 		// explicit protocol argument.
 		if out, err := exec.CommandContext(cmdCtx, path, "-tlnpH").Output(); err == nil && len(out) > 0 {
 			if sockets := parseSSOutput(string(out), protoTCP); len(sockets) > 0 {
@@ -131,7 +130,7 @@ func collectListeningSockets(ctx context.Context) ([]listeningSocket, string, er
 		}
 	}
 
-	// Last-resort fallback: netstat. Keep argument set conservative.
+	// Last resort: netstat, with a conservative argument set.
 	if path, err := exec.LookPath("netstat"); err == nil {
 		if out, err := exec.CommandContext(cmdCtx, path, "-tulnp").Output(); err == nil && len(out) > 0 {
 			if sockets := parseNetstatOutput(string(out)); len(sockets) > 0 {
@@ -144,8 +143,8 @@ func collectListeningSockets(ctx context.Context) ([]listeningSocket, string, er
 }
 
 // ssStates is the set of connection-state tokens `ss` can print in its State
-// column. Used purely for layout detection — to tell a State-first row from a
-// Netid-first row — not for filtering.
+// column. It is used only to tell a State-first row from a Netid-first row,
+// not for filtering.
 var ssStates = map[string]struct{}{
 	"LISTEN": {}, "UNCONN": {}, "ESTAB": {}, "SYN-SENT": {}, "SYN-RECV": {},
 	"FIN-WAIT-1": {}, "FIN-WAIT-2": {}, "TIME-WAIT": {}, "CLOSE-WAIT": {},
@@ -154,8 +153,8 @@ var ssStates = map[string]struct{}{
 
 // normalizeProto maps a `ss`/`netstat` protocol token to the canonical
 // "tcp"/"udp" values the platform contract expects. The v6 variants
-// (tcp6/udp6, printed by netstat) collapse onto their base protocol — the
-// address family is already evident from the bind address.
+// (tcp6/udp6, printed by netstat) collapse onto their base protocol, since
+// the bind address already shows the address family.
 func normalizeProto(tok string) (string, bool) {
 	switch strings.ToLower(tok) {
 	case "tcp", "tcp4", "tcp6":
@@ -166,17 +165,17 @@ func normalizeProto(tok string) (string, bool) {
 	return "", false
 }
 
-// parseSSOutput parses the headerless output of `ss`. Two column layouts exist
-// and the difference is load-bearing:
+// parseSSOutput parses the headerless output of `ss`, which has two column
+// layouts.
 //
-// Netid-first — emitted when MORE THAN ONE socket family is requested
-// (`ss -tulnpH`, i.e. -t and -u together):
+// Netid-first, when more than one socket family is requested (`ss -tulnpH`,
+// i.e. -t and -u together):
 //
 //	tcp  LISTEN  0  4096  0.0.0.0:22  0.0.0.0:*  users:(("sshd",pid=1234,fd=3))
 //	 0     1     2   3        4            5                  6
 //
-// State-first — emitted when a SINGLE family is requested (`ss -tlnpH`). ss
-// drops the Netid column entirely because the protocol is implied by the flag:
+// State-first, when a single family is requested (`ss -tlnpH`). ss drops the
+// Netid column because the flag implies the protocol:
 //
 //	LISTEN  0  4096  0.0.0.0:22  0.0.0.0:*  users:(("sshd",pid=1234,fd=3))
 //	   0    1   2         3           4                  5
@@ -185,7 +184,7 @@ func normalizeProto(tok string) (string, bool) {
 // itself does not carry one. It is ignored for Netid-first rows.
 //
 // On a non-root agent the trailing users:(...) field is typically absent, so
-// process_name and pid will be empty/zero — that's intentional.
+// process_name and pid are empty and zero.
 func parseSSOutput(output string, defaultProto string) []listeningSocket {
 	var sockets []listeningSocket
 
@@ -241,7 +240,7 @@ func parseSSOutput(output string, defaultProto string) []listeningSocket {
 		}
 
 		// Process info, when present, is everything from the users column on,
-		// rejoined — `users:(("name",pid=...,fd=...))` can contain spaces.
+		// rejoined because `users:(("name",pid=...,fd=...))` can contain spaces.
 		processName, pid := "", 0
 		if len(fields) > usersCol {
 			processName, pid = parseSSUsersField(strings.Join(fields[usersCol:], " "))
@@ -260,12 +259,12 @@ func parseSSOutput(output string, defaultProto string) []listeningSocket {
 }
 
 // parseSSUsersField parses a single ss `users:(...)` field into the first
-// process name + pid. Real-world examples:
+// process name and pid. Examples:
 //
 //	users:(("sshd",pid=1234,fd=3))
 //	users:(("postgres",pid=987,fd=5),("postgres",pid=988,fd=6))
 //
-// On non-root agents the field will simply be missing (we never call this).
+// On non-root agents the field is missing and this is not called.
 func parseSSUsersField(s string) (string, int) {
 	idx := strings.Index(s, "users:((")
 	if idx < 0 {

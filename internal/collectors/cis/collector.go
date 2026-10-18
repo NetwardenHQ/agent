@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // DefaultInterval is how often CIS evaluation runs.
@@ -60,15 +60,6 @@ func WithInterval(d time.Duration) Option {
 	return func(c *Collector) {
 		if d > 0 {
 			c.interval = d
-		}
-	}
-}
-
-// withProber injects a prober, for tests.
-func withProber(f func() Evaluator) Option {
-	return func(c *Collector) {
-		if f != nil {
-			c.newProber = f
 		}
 	}
 }

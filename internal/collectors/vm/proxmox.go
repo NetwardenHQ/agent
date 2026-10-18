@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/config"
+	"github.com/NetwardenHQ/agent/internal/config"
 )
 
 // ProxmoxClient implements HypervisorClient for Proxmox VE.
@@ -28,7 +28,16 @@ type ProxmoxClient struct {
 	authHeader string
 	authMutex  sync.RWMutex
 	authExpiry time.Time
+
+	// Reachability is checked on every cycle (Enabled, then Collect) and
+	// costs a network round trip, so the answer is cached.
+	availMu      sync.Mutex
+	available    bool
+	availChecked time.Time
 }
+
+// availabilityTTL is how long a reachability verdict is reused.
+const availabilityTTL = time.Minute
 
 // ProxmoxVM represents a VM from Proxmox API.
 type ProxmoxVM struct {
@@ -53,12 +62,18 @@ type ProxmoxVMConfig struct {
 	Arch   string `json:"arch"`
 }
 
-// ProxmoxVMStats represents VM statistics from Proxmox.
+// ProxmoxVMStats is the status/current answer for a guest. FreeMem is only
+// present when the guest runs the QEMU agent; MaxDisk/Disk are the
+// configured and (for containers) used disk sizes.
 type ProxmoxVMStats struct {
 	CPU       float64 `json:"cpu"`
+	CPUs      float64 `json:"cpus"`
 	CPUTime   int64   `json:"cputime"`
 	Mem       int64   `json:"mem"`
 	MaxMem    int64   `json:"maxmem"`
+	FreeMem   int64   `json:"freemem"`
+	MaxDisk   int64   `json:"maxdisk"`
+	Disk      int64   `json:"disk"`
 	NetIn     int64   `json:"netin"`
 	NetOut    int64   `json:"netout"`
 	DiskRead  int64   `json:"diskread"`
@@ -67,14 +82,15 @@ type ProxmoxVMStats struct {
 }
 
 // ProxmoxAPIResponse represents the standard Proxmox API response format.
+// Errors is a free-form object whose shape varies by endpoint; it is kept
+// raw and only ever logged.
 type ProxmoxAPIResponse struct {
 	Data   json.RawMessage `json:"data"`
-	Errors interface{}     `json:"errors,omitempty"`
+	Errors json.RawMessage `json:"errors,omitempty"`
 }
 
 // NewProxmoxClient creates a new Proxmox hypervisor client.
 func NewProxmoxClient(config config.VMConfig, logger *slog.Logger) *ProxmoxClient {
-	// Create HTTP client with optional TLS skip
 	transport := &http.Transport{}
 	if config.ProxmoxSkipTLSVerify {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
@@ -98,24 +114,39 @@ func (p *ProxmoxClient) Name() string {
 	return "proxmox"
 }
 
-// IsAvailable checks if Proxmox API is accessible.
+// IsAvailable reports whether the Proxmox API answers, re-checking at most
+// once per availabilityTTL.
 func (p *ProxmoxClient) IsAvailable() bool {
 	if p.config.ProxmoxAPI == "" {
 		return false
 	}
 
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if time.Since(p.availChecked) < availabilityTTL {
+		return p.available
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Try to get version endpoint (doesn't require auth)
-	resp, err := p.makeRequest(ctx, "GET", "/version", nil, false)
+	// PVE answers 401 to an unauthenticated /version (only /access/ticket
+	// is open), so the probe carries the credentials: it then tests
+	// reachability and authentication together, which is what Collect needs.
+	resp, err := p.makeRequest(ctx, "GET", "/version", nil, true)
 	if err != nil {
 		p.logger.Debug("proxmox API not available", "error", err)
+		p.available, p.availChecked = false, time.Now()
 		return false
 	}
-	defer resp.Body.Close()
+	resp.Body.Close()
 
-	return resp.StatusCode == http.StatusOK
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		p.logger.Warn("proxmox API rejected the configured credentials",
+			"status", resp.StatusCode, "api", p.config.ProxmoxAPI)
+	}
+	p.available, p.availChecked = resp.StatusCode == http.StatusOK, time.Now()
+	return p.available
 }
 
 // authenticate handles Proxmox authentication using either API tokens or tickets.
@@ -123,14 +154,12 @@ func (p *ProxmoxClient) authenticate(ctx context.Context) error {
 	p.authMutex.Lock()
 	defer p.authMutex.Unlock()
 
-	// Check if we have a valid token-based auth
 	if p.config.ProxmoxTokenID != "" && p.config.ProxmoxTokenSecret != "" {
 		p.authHeader = fmt.Sprintf("PVEAPIToken=%s=%s", p.config.ProxmoxTokenID, p.config.ProxmoxTokenSecret)
 		p.authExpiry = time.Now().Add(24 * time.Hour) // API tokens don't expire
 		return nil
 	}
 
-	// Use ticket-based authentication
 	if p.config.ProxmoxUsername != "" && p.config.ProxmoxPassword != "" {
 		return p.authenticateWithTicket(ctx)
 	}
@@ -177,16 +206,22 @@ func (p *ProxmoxClient) authenticateWithTicket(ctx context.Context) error {
 
 // makeRequest creates and executes HTTP requests to the Proxmox API.
 func (p *ProxmoxClient) makeRequest(ctx context.Context, method, path string, body io.Reader, needsAuth bool) (*http.Response, error) {
-	// Authenticate if needed
+	// Authenticate if needed. The header is copied under the lock: another
+	// request may be re-authenticating and rewriting it.
+	authHeader := ""
 	if needsAuth {
 		p.authMutex.RLock()
 		authValid := p.authHeader != "" && time.Now().Before(p.authExpiry)
+		authHeader = p.authHeader
 		p.authMutex.RUnlock()
 
 		if !authValid {
 			if err := p.authenticate(ctx); err != nil {
 				return nil, fmt.Errorf("authentication failed: %w", err)
 			}
+			p.authMutex.RLock()
+			authHeader = p.authHeader
+			p.authMutex.RUnlock()
 		}
 	}
 
@@ -196,12 +231,11 @@ func (p *ProxmoxClient) makeRequest(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 
-	// Set headers
-	if needsAuth && p.authHeader != "" {
-		if strings.HasPrefix(p.authHeader, "PVEAPIToken=") {
-			req.Header.Set("Authorization", p.authHeader)
+	if authHeader != "" {
+		if strings.HasPrefix(authHeader, "PVEAPIToken=") {
+			req.Header.Set("Authorization", authHeader)
 		} else {
-			req.Header.Set("Cookie", p.authHeader)
+			req.Header.Set("Cookie", authHeader)
 		}
 	}
 
@@ -209,12 +243,21 @@ func (p *ProxmoxClient) makeRequest(ctx context.Context, method, path string, bo
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 
-	return p.httpClient.Do(req)
+	resp, err := p.httpClient.Do(req)
+	if err == nil && needsAuth && resp.StatusCode == http.StatusUnauthorized {
+		// A ticket can be revoked or expire early; force a fresh login on
+		// the next request instead of reusing it until authExpiry.
+		p.authMutex.Lock()
+		if p.authHeader == authHeader {
+			p.authExpiry = time.Time{}
+		}
+		p.authMutex.Unlock()
+	}
+	return resp, err
 }
 
 // ListVMs returns all VMs from Proxmox cluster.
 func (p *ProxmoxClient) ListVMs(ctx context.Context) ([]VM, error) {
-	// Get cluster resources to list all VMs across nodes
 	resp, err := p.makeRequest(ctx, "GET", "/cluster/resources?type=vm", nil, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list VMs: %w", err)
@@ -238,12 +281,10 @@ func (p *ProxmoxClient) ListVMs(ctx context.Context) ([]VM, error) {
 	vms := make([]VM, 0, len(proxmoxVMs))
 
 	for _, pvm := range proxmoxVMs {
-		// Skip templates
 		if pvm.Template == 1 {
 			continue
 		}
 
-		// Filter by node if specified
 		if p.config.ProxmoxNode != "" && pvm.Node != p.config.ProxmoxNode {
 			continue
 		}
@@ -255,7 +296,7 @@ func (p *ProxmoxClient) ListVMs(ctx context.Context) ([]VM, error) {
 			Node:       pvm.Node,
 			VMID:       pvm.VMID,
 			Status:     pvm.Status,
-			OSType:     "", // Will be filled from config if needed
+			OSType:     "",
 			CPUCount:   pvm.MaxCPU,
 			MemoryMB:   pvm.MaxMem / (1024 * 1024),         // Convert bytes to MB
 			DiskGB:     pvm.MaxDisk / (1024 * 1024 * 1024), // Convert bytes to GB
@@ -263,7 +304,6 @@ func (p *ProxmoxClient) ListVMs(ctx context.Context) ([]VM, error) {
 			Created:    time.Time{}, // Not available in cluster resources
 		}
 
-		// Add Proxmox-specific labels
 		vm.Labels["node"] = pvm.Node
 		vm.Labels["vmid"] = fmt.Sprintf("%d", pvm.VMID)
 		vm.Labels["type"] = pvm.Type
@@ -275,30 +315,17 @@ func (p *ProxmoxClient) ListVMs(ctx context.Context) ([]VM, error) {
 	return vms, nil
 }
 
-// GetVMStats retrieves detailed statistics for a specific VM.
-func (p *ProxmoxClient) GetVMStats(ctx context.Context, vmID string) (*VMStats, error) {
-	// Find the VM to get its node
-	vms, err := p.ListVMs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find VM node: %w", err)
+// GetVMStats retrieves the current status of one VM from its node. The VM
+// from ListVMs already names the node and VMID, so this is a single call.
+func (p *ProxmoxClient) GetVMStats(ctx context.Context, vm VM) (*VMStats, error) {
+	if vm.Node == "" || vm.VMID == 0 {
+		return nil, fmt.Errorf("VM %s has no node/VMID", vm.ID)
 	}
-
-	var node string
-	var vmidInt int
-	for _, vm := range vms {
-		if vm.ID == vmID {
-			node = vm.Node
-			vmidInt = vm.VMID
-			break
-		}
+	kind := "qemu"
+	if vm.Labels["type"] == "lxc" {
+		kind = "lxc"
 	}
-
-	if node == "" {
-		return nil, fmt.Errorf("VM not found: %s", vmID)
-	}
-
-	// Get VM statistics from the specific node
-	path := fmt.Sprintf("/nodes/%s/qemu/%d/status/current", node, vmidInt)
+	path := fmt.Sprintf("/nodes/%s/%s/%d/status/current", url.PathEscape(vm.Node), kind, vm.VMID)
 	resp, err := p.makeRequest(ctx, "GET", path, nil, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get VM stats: %w", err)
@@ -319,23 +346,45 @@ func (p *ProxmoxClient) GetVMStats(ctx context.Context, vmID string) (*VMStats, 
 		return nil, fmt.Errorf("failed to parse stats data: %w", err)
 	}
 
-	// Convert Proxmox stats to our format
+	// Proxmox reports cpu as a 0–1 fraction of the VM's cores.
 	stats := &VMStats{
-		VMID:              vmID,
-		CPUUsagePercent:   proxmoxStats.CPU * 100,     // Proxmox returns 0.0-1.0, we want 0-100
-		CPUTime:           proxmoxStats.CPUTime * 1e9, // Convert seconds to nanoseconds
-		MemoryUsageMB:     proxmoxStats.Mem / (1024 * 1024),
-		MemoryAvailableMB: (proxmoxStats.MaxMem - proxmoxStats.Mem) / (1024 * 1024),
-		NetworkRxBytes:    proxmoxStats.NetIn,
-		NetworkTxBytes:    proxmoxStats.NetOut,
-		DiskReadBytes:     proxmoxStats.DiskRead,
-		DiskWriteBytes:    proxmoxStats.DiskWrite,
-		Uptime:            proxmoxStats.Uptime,
+		VMID:            vm.ID,
+		CPUUsagePercent: proxmoxStats.CPU * 100,
+		CPUUsageKnown:   true,
+		CPUTime:         proxmoxStats.CPUTime * 1e9, // Convert seconds to nanoseconds
+		MemoryUsageMB:   proxmoxStats.Mem / (1024 * 1024),
+		MemoryKnown:     true,
+		NetworkRxBytes:  proxmoxStats.NetIn,
+		NetworkTxBytes:  proxmoxStats.NetOut,
+		DiskReadBytes:   proxmoxStats.DiskRead,
+		DiskWriteBytes:  proxmoxStats.DiskWrite,
+		Uptime:          proxmoxStats.Uptime,
 	}
 
-	// Calculate memory usage percentage
 	if proxmoxStats.MaxMem > 0 {
+		// A guest can sit above maxmem (QEMU overhead, ballooning); that
+		// is no headroom, not negative headroom.
+		if proxmoxStats.MaxMem > proxmoxStats.Mem {
+			stats.MemoryAvailableMB = (proxmoxStats.MaxMem - proxmoxStats.Mem) / (1024 * 1024)
+		}
 		stats.MemoryUsagePercent = float64(proxmoxStats.Mem) / float64(proxmoxStats.MaxMem) * 100.0
+		stats.MemoryLimitKnown = true
+	}
+	stats.VCPUCurrent = int(proxmoxStats.CPUs)
+
+	// The guest's own view arrives only with the QEMU agent (freemem); an
+	// LXC container reports it natively.
+	if proxmoxStats.FreeMem > 0 && proxmoxStats.MaxMem >= proxmoxStats.FreeMem {
+		used := proxmoxStats.MaxMem - proxmoxStats.FreeMem
+		stats.GuestMemoryTotalMB = proxmoxStats.MaxMem / (1024 * 1024)
+		stats.GuestMemoryUsedMB = used / (1024 * 1024)
+		stats.GuestMemoryUsagePercent = float64(used) / float64(proxmoxStats.MaxMem) * 100
+		stats.GuestMemoryKnown = true
+	}
+	if proxmoxStats.MaxDisk > 0 {
+		stats.DiskCapacityBytes = proxmoxStats.MaxDisk
+		stats.DiskAllocationBytes = proxmoxStats.Disk
+		stats.DiskAllocationKnown = proxmoxStats.Disk > 0 // QEMU reports 0 here; only LXC knows
 	}
 
 	return stats, nil
@@ -343,6 +392,5 @@ func (p *ProxmoxClient) GetVMStats(ctx context.Context, vmID string) (*VMStats, 
 
 // Close closes any connections to Proxmox.
 func (p *ProxmoxClient) Close() error {
-	// HTTP client doesn't need explicit closing
 	return nil
 }

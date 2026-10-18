@@ -2,15 +2,15 @@ package security
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 func TestBuildSSHConfigSnapshot_PortIsNumeric(t *testing.T) {
-	// The agent parses Port out of a text config file, but the server
-	// contract declares `port?: number`. Sending the string would fail Zod
-	// validation and take the whole request with it.
+	// Port is parsed from text but must be sent as a JSON number.
 	snap := buildSSHConfigSnapshot(sshConfigFindings{Port: "2222"})
 
 	raw, err := json.Marshal(snap.Payload)
@@ -42,8 +42,7 @@ func TestBuildSSHConfigSnapshot_OmitsUnparseablePort(t *testing.T) {
 }
 
 func TestBuildSSHConfigSnapshot_BooleansAlwaysPresent(t *testing.T) {
-	// These five are non-optional in SshConfigSnapshot; omitting any of them
-	// fails server-side validation even though Go's zero value is valid.
+	// The platform requires these five fields even when false.
 	snap := buildSSHConfigSnapshot(sshConfigFindings{})
 	for _, key := range []string{
 		"permit_root_login", "password_auth", "protocol_v1",
@@ -102,12 +101,39 @@ func TestSplitAlgoList(t *testing.T) {
 }
 
 func TestBuildSSHConfigSnapshot_AlgoListsOmittedWhenAbsent(t *testing.T) {
-	// Absent directives must be omitted, not sent as [] — an empty array
-	// would read as "this host negotiates no ciphers at all".
+	// Absent directives are omitted rather than sent as [], which would
+	// read as "this host negotiates no ciphers".
 	snap := buildSSHConfigSnapshot(sshConfigFindings{Port: "22"})
 	for _, key := range []string{"kex_algorithms", "ciphers", "macs"} {
 		if v, present := snap.Payload[key]; present {
 			t.Errorf("%q present as %v when the directive was absent", key, v)
 		}
+	}
+}
+
+// sshd resolves a relative Include against the ssh config directory, not the
+// directory of the file holding the directive (sshd_config(5): "Files without
+// absolute paths are assumed to be in /etc/ssh").
+func TestParseSSHDConfig_RelativeIncludeFromNestedFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("sshd_config", "Include sub/inner.conf\n")
+	write("sub/inner.conf", "Include conf.d/x.conf\n")
+	write("conf.d/x.conf", "PasswordAuthentication no\n")
+
+	f, err := NewSSHConfigCollector("h").parseSSHDConfig(filepath.Join(dir, "sshd_config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.PasswordAuth {
+		t.Error("nested relative Include was resolved against the including file's directory")
 	}
 }

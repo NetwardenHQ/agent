@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"netwarden/internal/collectors/vm"
+	"github.com/NetwardenHQ/agent/internal/collectors/vm"
 )
 
 // registerVMCollector registers the VM collector on Linux systems only.

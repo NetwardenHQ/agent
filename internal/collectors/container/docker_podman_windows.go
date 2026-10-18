@@ -25,13 +25,15 @@ func isNamedPipeAvailable(pipePath string) bool {
 
 // createDialContext creates a platform-specific dial context function.
 func createDialContext(detectedPath string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var dialer net.Dialer
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Both dials honor ctx, so a request's deadline also bounds the
+		// connect.
 		if strings.Contains(detectedPath, "pipe") {
 			// Use winio for Windows named pipe connections
-			return winio.DialPipe(detectedPath, nil)
-		} else {
-			// Use unix socket for compatibility (shouldn't happen on Windows)
-			return net.Dial("unix", detectedPath)
+			return winio.DialPipeContext(ctx, detectedPath)
 		}
+		// Use unix socket for compatibility (shouldn't happen on Windows)
+		return dialer.DialContext(ctx, "unix", detectedPath)
 	}
 }

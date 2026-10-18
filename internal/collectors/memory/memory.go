@@ -9,7 +9,7 @@ import (
 
 	"github.com/shirou/gopsutil/v4/mem"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Collector implements metrics.Collector for memory metrics.
@@ -20,8 +20,7 @@ type Collector struct {
 }
 
 // NewCollector creates a new memory metrics collector.
-// cfg parameter is ignored - uses sensible defaults
-func NewCollector(cfg interface{}, hostname string, opts ...Option) *Collector {
+func NewCollector(hostname string, opts ...Option) *Collector {
 	c := &Collector{
 		hostname: hostname,
 		logger:   slog.Default(),

@@ -2,11 +2,11 @@
 package container
 
 import (
-	"context"
 	"log/slog"
+	"sync"
 	"time"
 
-	"netwarden/internal/config"
+	"github.com/NetwardenHQ/agent/internal/config"
 )
 
 // RuntimeDetector handles automatic detection of available container runtimes.
@@ -41,7 +41,13 @@ func (r *RuntimeDetector) DetectRuntime(cfg config.ContainerConfig) RuntimeClien
 				return NewDockerCompatibleClient(cfg.ContainerSocket)
 			},
 		},
-		// Future: Add containerd when implemented
+		{
+			// Podman without an API socket (`podman.socket` ships disabled
+			// on Debian and Ubuntu). Tried last because the socket API is
+			// cheaper than forking a process per collection.
+			name:   "podman-cli",
+			create: func() RuntimeClient { return newPodmanCLIClientIfSupported() },
+		},
 	}
 
 	for _, runtime := range runtimes {
@@ -74,16 +80,18 @@ func (r *RuntimeDetector) createSpecificRuntime(runtimeType, socketPath string) 
 		}
 		return client
 
-	// Future: Add containerd case
-
 	default:
 		r.logger.Warn("unsupported container runtime", "runtime", runtimeType)
 		return &NoOpClient{}
 	}
 }
 
-// RuntimeMonitor periodically checks if the runtime is still available.
+// RuntimeMonitor re-checks the runtime on a throttle and, in auto mode,
+// switches to another runtime when the current one disappears. Safe for
+// concurrent use: Enabled() and Snapshots() ask it from the agent goroutine
+// while Collect() runs on a collection goroutine.
 type RuntimeMonitor struct {
+	mu            sync.Mutex
 	client        RuntimeClient
 	logger        *slog.Logger
 	detector      *RuntimeDetector
@@ -106,16 +114,16 @@ func NewRuntimeMonitor(client RuntimeClient, detector *RuntimeDetector, config c
 	}
 }
 
-// IsAvailable checks if the runtime is currently available.
-// Includes periodic health checks and automatic failover.
-func (rm *RuntimeMonitor) IsAvailable(ctx context.Context) bool {
-	now := time.Now()
+// IsAvailable reports whether the runtime is currently available, re-checking
+// at most once per checkInterval and failing over in auto mode.
+func (rm *RuntimeMonitor) IsAvailable() bool {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 
-	// Don't check too frequently to avoid overhead
+	now := time.Now()
 	if now.Sub(rm.lastCheck) < rm.checkInterval {
 		return rm.available
 	}
-
 	rm.lastCheck = now
 
 	// Quick availability check with timeout
@@ -149,11 +157,15 @@ func (rm *RuntimeMonitor) IsAvailable(ctx context.Context) bool {
 
 // GetClient returns the current runtime client.
 func (rm *RuntimeMonitor) GetClient() RuntimeClient {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	return rm.client
 }
 
 // Close shuts down the monitor and its client.
 func (rm *RuntimeMonitor) Close() error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	if rm.client != nil {
 		return rm.client.Close()
 	}

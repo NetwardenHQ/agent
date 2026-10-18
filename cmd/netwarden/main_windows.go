@@ -14,9 +14,9 @@ import (
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 
-	"netwarden/internal/agent"
-	"netwarden/internal/config"
-	sharedhttp "netwarden/internal/http"
+	"github.com/NetwardenHQ/agent/internal/agent"
+	"github.com/NetwardenHQ/agent/internal/config"
+	sharedhttp "github.com/NetwardenHQ/agent/internal/http"
 )
 
 const serviceName = "Netwarden"
@@ -78,6 +78,7 @@ func (s *netwardenService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	// Setup logging after config is loaded
 	logger := setupLoggingWithFile(cfg.LogLevel, "json", cfg.LogFile)
 	s.logger = logger
+	logConfigWarnings(cfg, logger)
 
 	s.logger.Info("Netwarden Windows service starting",
 		"config_file", s.configFile,
@@ -118,7 +119,7 @@ func (s *netwardenService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 	s.logger.Info("Netwarden Windows service started and running")
 	if elog != nil {
-		elog.Info(1, "Service is now running and accepting control requests")
+		elog.Info(1, "service running and accepting control requests")
 	}
 
 	// Main service loop - handle control requests
@@ -196,54 +197,47 @@ func (s *netwardenService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	}
 }
 
-// runService runs the application as a Windows service.
-func runService(configFile string, isDebug bool) error {
-	var err error
-
-	if isDebug {
-		// Run in debug mode (console with service-like behavior)
-		elog := debug.New(serviceName)
-		defer elog.Close()
-
-		fmt.Printf("Running Netwarden in Windows service debug mode\n")
-
-		run := svc.Run
-		run = debug.Run
-
-		service := &netwardenService{
-			configFile: configFile,
-		}
-
-		err = run(serviceName, service)
-	} else {
-		// Run as actual Windows service
-		elog, err := eventlog.Open(serviceName)
-		if err != nil {
-			return fmt.Errorf("failed to open event log: %v", err)
-		}
-		defer elog.Close()
-
-		elog.Info(1, "starting Netwarden Windows service")
-
-		service := &netwardenService{
-			configFile: configFile,
-		}
-
-		err = svc.Run(serviceName, service)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to run service: %v", err)
-	}
-
-	return nil
-}
-
-// checkServiceMode determines if we're running as a Windows service.
-func checkServiceMode() (bool, error) {
+// runPlatformService runs the agent as a Windows service when the service
+// control manager started it, or when --service-debug asks for the service
+// code path in a console. It reports handled=false when the agent should run
+// in the foreground.
+func runPlatformService(configFile string, serviceDebug bool) (handled bool, err error) {
 	isService, err := svc.IsWindowsService()
 	if err != nil {
-		return false, fmt.Errorf("failed to check if running as Windows service: %v", err)
+		return true, fmt.Errorf("failed to check if running as Windows service: %w", err)
 	}
-	return isService, nil
+	if !isService && !serviceDebug {
+		return false, nil
+	}
+
+	service := &netwardenService{configFile: configFile}
+
+	if serviceDebug {
+		elog := debug.New(serviceName)
+		defer elog.Close()
+		fmt.Println("Running Netwarden in Windows service debug mode")
+		if err := debug.Run(serviceName, service); err != nil {
+			return true, fmt.Errorf("failed to run service: %w", err)
+		}
+		return true, nil
+	}
+
+	elog, err := eventlog.Open(serviceName)
+	if err != nil {
+		return true, fmt.Errorf("failed to open event log: %w", err)
+	}
+	defer elog.Close()
+	elog.Info(1, "starting Netwarden Windows service")
+
+	if err := svc.Run(serviceName, service); err != nil {
+		return true, fmt.Errorf("failed to run service: %w", err)
+	}
+	return true, nil
 }
+
+// catchHangup is a no-op on Windows, which has no SIGHUP.
+func catchHangup() {}
+
+// watchLogReopen is a no-op on Windows: there is no SIGHUP, and the Windows
+// agent's log is not rotated by renaming it underneath the process.
+func watchLogReopen(*logFile, *slog.Logger) {}

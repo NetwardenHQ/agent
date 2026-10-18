@@ -26,10 +26,6 @@ func (c *Collector) detectMySQL() bool {
 	}
 
 	c.logger.Info("MySQL/MariaDB process detected on Windows", "process", processName)
-
-	// On Windows, MySQL typically uses TCP connection, not Unix socket
-	// Set up for TCP connection to localhost:3306
-	c.isWindows = true
 	return true
 }
 

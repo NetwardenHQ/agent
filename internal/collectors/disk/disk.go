@@ -12,7 +12,7 @@ import (
 
 	"github.com/shirou/gopsutil/v4/disk"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Collector implements metrics.Collector for disk metrics.
@@ -77,8 +77,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		return nil, fmt.Errorf("failed to get disk partitions: %w", err)
 	}
 
-	// On Windows, ensure we have at least C:\ drive
-	// Sometimes gopsutil might not return all drives properly
+	// gopsutil does not always return every drive on Windows; fall back to C:\.
 	if runtime.GOOS == "windows" && len(partitions) == 0 {
 		// Manually add C: as a fallback (match what gopsutil returns)
 		partitions = append(partitions, disk.PartitionStat{
@@ -107,6 +106,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 	}
 
+	var zfs zfsState // `zfs list`, read at most once per collection; see zfs.go
 	for _, partition := range partitions {
 		// Skip certain Windows system partitions
 		if runtime.GOOS == "windows" {
@@ -163,11 +163,35 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 			}
 		}
 
-		// Get usage stats for each partition
-		usage, err := disk.Usage(partition.Mountpoint)
-		if err != nil {
-			c.logger.Warn("failed to get disk usage", "partition", partition.Device, "error", err)
+		if skipPlatformPartition(partition) {
+			c.logger.Debug("skipping partition", "device", partition.Device, "mountpoint", partition.Mountpoint, "fstype", partition.Fstype)
 			continue
+		}
+
+		var usage *disk.UsageStat
+		if partition.Fstype == "zfs" {
+			// One series per pool at its usable capacity, plus one per
+			// dataset with its own quota; see zfs.go.
+			u, skip, zerr := zfsUsage(ctx, partition, &zfs)
+			if skip {
+				c.logger.Debug("zfs dataset folded into its pool", "device", partition.Device, "mountpoint", partition.Mountpoint)
+				continue
+			}
+			if u == nil {
+				c.logger.Warn("failed to get disk usage", "partition", partition.Device, "error", zerr)
+				continue
+			}
+			if zerr != nil {
+				c.logger.Warn("zfs pool usage unavailable, reporting dataset usage", "device", partition.Device, "error", zerr)
+			}
+			usage = u
+		} else {
+			u, err := disk.Usage(partition.Mountpoint)
+			if err != nil {
+				c.logger.Warn("failed to get disk usage", "partition", partition.Device, "error", err)
+				continue
+			}
+			usage = u
 		}
 
 		// Skip if total size is 0 (e.g., special filesystems)
@@ -181,8 +205,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 			"fstype":     partition.Fstype,
 		}
 
-		// Create composite metric name with mountpoint
-		// This ensures each partition has unique metrics in the database
+		// The mountpoint suffix gives each partition its own series.
 		metricSuffix := ":" + partition.Mountpoint
 
 		// Disk usage percentage

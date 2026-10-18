@@ -1,17 +1,16 @@
 //go:build windows
-// +build windows
 
 package process
 
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/yusufpapurcu/wmi"
 )
 
-// Win32_Process represents a Windows process from WMI
-// Using WMI instead of PowerShell for 20x performance improvement
+// Win32_Process is the subset of the WMI Win32_Process class the collector reads.
 type Win32_Process struct {
 	Name           string
 	ProcessId      uint32
@@ -20,25 +19,24 @@ type Win32_Process struct {
 	UserModeTime   uint64 // CPU time in 100-nanosecond intervals
 }
 
-// getProcessStats gets statistics for a running process using WMI.
-// This replaces the PowerShell-based implementation which was causing 1-3 second delays per process.
-// WMI queries complete in 50-100ms, providing a 20x performance improvement.
 // sanitizeWQLString escapes single quotes to prevent WQL injection.
 func sanitizeWQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// getProcessStats returns the stats of the first process WMI reports under
+// processName (with or without .exe), or nil if none is running. A WMI query
+// takes tens of milliseconds, against seconds for a PowerShell call.
 func (c *Collector) getProcessStats(processName string) *ProcessStats {
-	// Normalize process name - WMI expects exact match
+	// WMI matches the image name exactly.
 	queryName := processName
 	if !strings.HasSuffix(queryName, ".exe") {
 		queryName += ".exe"
 	}
 
-	// Sanitize to prevent WQL injection from API-provided process names
+	// The name comes from the API, so it is escaped before going into WQL.
 	safeQueryName := sanitizeWQLString(queryName)
 
-	// Query WMI for the specific process
 	var processes []Win32_Process
 	query := fmt.Sprintf("SELECT Name, ProcessId, WorkingSetSize, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = '%s'", safeQueryName)
 
@@ -46,7 +44,7 @@ func (c *Collector) getProcessStats(processName string) *ProcessStats {
 	if err != nil {
 		c.logger.Debug("WMI query failed for process", "process", queryName, "error", err)
 
-		// Try without .exe extension if query failed
+		// Retry without the .exe suffix.
 		if strings.HasSuffix(queryName, ".exe") {
 			queryName = strings.TrimSuffix(queryName, ".exe")
 			safeQueryName = sanitizeWQLString(queryName)
@@ -60,38 +58,29 @@ func (c *Collector) getProcessStats(processName string) *ProcessStats {
 		}
 	}
 
-	// Check if we found any processes
 	if len(processes) == 0 {
 		c.logger.Debug("process not found via WMI", "process", queryName)
 		return nil
 	}
 
-	// Use first matching process (if multiple instances, pick first one)
+	// With several instances running, the first one is reported.
 	proc := processes[0]
 
-	// Calculate total CPU time in seconds
-	// Times are in 100-nanosecond intervals (10,000,000 intervals = 1 second)
-	// This represents cumulative CPU time since process start
-	cpuSeconds := float64(proc.KernelModeTime+proc.UserModeTime) / 10000000.0
-
-	// Convert memory from bytes to MB
+	// WMI reports CPU time in 100-nanosecond units and memory in bytes.
+	cpuTime := time.Duration(proc.KernelModeTime+proc.UserModeTime) * 100 * time.Nanosecond
 	memoryMB := float64(proc.WorkingSetSize) / 1048576.0
 
 	c.logger.Debug("process stats retrieved via WMI",
 		"process", queryName,
 		"pid", proc.ProcessId,
-		"cpu_seconds", cpuSeconds,
+		"cpu_time", cpuTime,
 		"memory_mb", memoryMB)
 
 	return &ProcessStats{
-		PID:        int(proc.ProcessId),
-		CPUPercent: cpuSeconds, // Total CPU time (cumulative seconds)
-		MemoryMB:   memoryMB,
+		PID:         int(proc.ProcessId),
+		CPUTime:     cpuTime,
+		MemoryMB:    memoryMB,
+		CPUKnown:    true, // WMI returns every field or the query fails
+		MemoryKnown: true,
 	}
-}
-
-// readProcStats is not used on Windows (all stats are collected in getProcessStats via WMI)
-func (c *Collector) readProcStats(pid int, stats *ProcessStats) error {
-	// All stats are collected in getProcessStats on Windows
-	return nil
 }

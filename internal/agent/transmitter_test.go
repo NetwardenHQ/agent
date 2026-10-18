@@ -4,14 +4,13 @@ import (
 	"encoding/json"
 	"testing"
 
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// serverSnapshotTypes mirrors the z.enum in
-// platform/app/api/agent/data/route.ts. The server rejects the ENTIRE request
-// when an unknown type appears, so a drift here costs a whole cycle of
-// metrics, not just the snapshot.
+// serverSnapshotTypes mirrors the snapshot types the server accepts. The
+// server rejects the entire request when an unknown type appears, so a drift
+// here costs a whole cycle of metrics, not just the snapshot.
 var serverSnapshotTypes = map[string]bool{
 	"ssh_config":         true,
 	"listening_ports":    true,
@@ -20,20 +19,36 @@ var serverSnapshotTypes = map[string]bool{
 
 func newTestTransmitter(t *testing.T) *HTTPTransmitter {
 	t.Helper()
-	return &HTTPTransmitter{
-		config:        &config.Config{TenantID: "abcdefghij"},
-		logger:        testLogger(),
-		version:       "2.1.0",
-		hostname:      "test-host",
-		lastLatencyMs: -1,
+	tr := &HTTPTransmitter{
+		config:   &config.Config{TenantID: "abcdefghij"},
+		logger:   testLogger(),
+		version:  "2.1.0",
+		hostname: "test-host",
 	}
+	tr.lastLatencyMs.Store(-1)
+	return tr
+}
+
+// wire marshals a payload and returns its top-level JSON keys, which is what
+// the server actually sees.
+func wire(t *testing.T, p payload) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("payload does not marshal: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("payload does not round-trip: %v", err)
+	}
+	return m
 }
 
 func TestCreatePayload_OmitsSnapshotsWhenEmpty(t *testing.T) {
 	tr := newTestTransmitter(t)
-	payload := tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil)
+	m := wire(t, tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil))
 
-	if _, present := payload["snapshots"]; present {
+	if _, present := m["snapshots"]; present {
 		t.Error("snapshots key must be omitted when there are none; the server " +
 			"treats an empty array differently from an absent field")
 	}
@@ -117,13 +132,9 @@ func TestCreatePayload_TruncatesToServerLimit(t *testing.T) {
 		}
 	}
 
-	payload := tr.createPayload(nil, snaps)
-	got, ok := payload["snapshots"].([]metrics.Snapshot)
-	if !ok {
-		t.Fatalf("snapshots has unexpected type %T", payload["snapshots"])
-	}
+	got := tr.createPayload(nil, snaps).Snapshots
 	if len(got) != maxSnapshotsPerPayload {
-		t.Errorf("expected truncation to %d, got %d — the server rejects the whole "+
+		t.Errorf("expected truncation to %d, got %d; the server rejects the whole "+
 			"request above its cap", maxSnapshotsPerPayload, len(got))
 	}
 }
@@ -137,7 +148,7 @@ func TestCreatePayload_SnapshotOnlyCycle(t *testing.T) {
 		Payload: map[string]any{"permit_root_login": false},
 	}})
 
-	if _, ok := payload["snapshots"]; !ok {
+	if _, ok := wire(t, payload)["snapshots"]; !ok {
 		t.Fatal("snapshot dropped on a metric-free cycle")
 	}
 	raw, err := json.Marshal(payload)
@@ -153,16 +164,13 @@ func TestCreatePayload_LatencySentinel(t *testing.T) {
 	tr := newTestTransmitter(t)
 
 	// -1 means "never measured" and must not be reported as a real 0ms.
-	if _, present := tr.createPayload(nil, []metrics.Snapshot{{
-		Type: metrics.SnapshotSSHConfig, Payload: map[string]any{"a": 1},
-	}})["agent_latency"]; present {
+	snap := []metrics.Snapshot{{Type: metrics.SnapshotSSHConfig, Payload: map[string]any{"a": 1}}}
+	if _, present := wire(t, tr.createPayload(nil, snap))["agent_latency"]; present {
 		t.Error("agent_latency must be omitted before the first measurement")
 	}
 
-	tr.lastLatencyMs = 0
-	if _, present := tr.createPayload(nil, []metrics.Snapshot{{
-		Type: metrics.SnapshotSSHConfig, Payload: map[string]any{"a": 1},
-	}})["agent_latency"]; !present {
+	tr.lastLatencyMs.Store(0)
+	if _, present := wire(t, tr.createPayload(nil, snap))["agent_latency"]; !present {
 		t.Error("a genuine 0ms measurement must be reported")
 	}
 }

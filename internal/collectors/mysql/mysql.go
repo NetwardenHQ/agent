@@ -6,15 +6,17 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // MySQL driver
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+	"github.com/go-sql-driver/mysql" // MySQL driver; also registers "mysql"
+
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // mysqlCache provides caching for MySQL stats to reduce query load.
@@ -64,7 +66,6 @@ type Collector struct {
 	// Distribution-aware socket paths
 	socketPaths    []string
 	detectedSocket string
-	isWindows      bool // True if running on Windows (use TCP instead of socket)
 }
 
 // CollectorOption configures the MySQL collector.
@@ -147,37 +148,48 @@ func (c *Collector) connect() error {
 }
 
 // buildDSN constructs the MySQL data source name.
+//
+// The driver's own FormatDSN does the escaping, so credentials containing
+// "@", "/" or ")" cannot break or redirect the DSN. A remote TCP host gets
+// tls=preferred (TLS when the server offers it); the local socket and
+// loopback stay plain.
 func (c *Collector) buildDSN() string {
-	// Default to TCP connection (simpler, works everywhere, consistent behavior)
-	// Only use socket if user explicitly configured mysql_socket path
+	// TCP unless mysql_socket names a socket explicitly.
 	useSocket := c.config.MySQLSocket != "" && c.config.MySQLSocket != "auto"
 
+	cfg := mysql.NewConfig()
+	// Credentials are sent only as a pair; otherwise the connection is
+	// attempted anonymously.
 	if c.config.MySQLUser != "" && c.config.MySQLPassword != "" {
-		// Use credentials if provided
-		if useSocket {
-			return fmt.Sprintf("%s:%s@unix(%s)/",
-				c.config.MySQLUser, c.config.MySQLPassword, c.config.MySQLSocket)
-		} else {
-			// Default: TCP connection to localhost:3306
-			host := c.config.MySQLHost
-			if host == "" {
-				host = "localhost:3306"
-			}
-			return fmt.Sprintf("%s:%s@tcp(%s)/",
-				c.config.MySQLUser, c.config.MySQLPassword, host)
-		}
+		cfg.User = c.config.MySQLUser
+		cfg.Passwd = c.config.MySQLPassword
+	}
+	if useSocket {
+		cfg.Net, cfg.Addr = "unix", c.config.MySQLSocket
 	} else {
-		// Try anonymous connection (usually won't work but worth trying)
-		if useSocket {
-			return fmt.Sprintf("@unix(%s)/", c.config.MySQLSocket)
-		} else {
-			host := c.config.MySQLHost
-			if host == "" {
-				host = "localhost:3306"
-			}
-			return fmt.Sprintf("@tcp(%s)/", host)
+		cfg.Net, cfg.Addr = "tcp", c.config.MySQLHost
+		if cfg.Addr == "" {
+			cfg.Addr = "localhost:3306"
+		}
+		if !isLoopbackHost(cfg.Addr) {
+			cfg.TLSConfig = "preferred"
 		}
 	}
+	return cfg.FormatDSN()
+}
+
+// isLoopbackHost reports whether a host[:port] is this machine.
+func isLoopbackHost(hostPort string) bool {
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Name returns the collector name.
@@ -342,7 +354,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 			}
 		}
 	} else {
-		// No connection, just report that MySQL is running
+		// No connection: report only that MySQL is running.
 		collected = append(collected, metrics.Metric{
 			Name:      "mysql_connection_failed",
 			Value:     1,
@@ -445,12 +457,12 @@ func (c *Collector) HealthCheck(ctx context.Context) error {
 	hasProcess := c.checkProcess()
 
 	if !hasSocket && !hasProcess {
-		// MySQL is not installed or running - this is not an error, just log info
+		// MySQL is not installed or not running, which is not an error.
 		c.logger.Info("No MySQL service detected")
 		return nil
 	}
 
-	// MySQL appears to be installed, now check if we can connect
+	// MySQL appears to be installed; check whether it accepts a connection.
 	if c.db != nil {
 		// Try a simple query to verify database connectivity
 		var result int

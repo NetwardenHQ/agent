@@ -1,4 +1,4 @@
-// Copyright 2024-2025 Netwarden
+// Copyright 2024-2026 Netwarden
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main provides the Netwarden agent entry point with graceful shutdown,
-// proper logging, and production-ready error handling.
+// Package main is the Netwarden agent entry point.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
-	"netwarden/internal/agent"
-	"netwarden/internal/config"
-	sharedhttp "netwarden/internal/http"
+	"github.com/NetwardenHQ/agent/internal/agent"
+	"github.com/NetwardenHQ/agent/internal/config"
+	sharedhttp "github.com/NetwardenHQ/agent/internal/http"
 )
 
 var (
@@ -55,26 +56,35 @@ func getDefaultConfigPath() string {
 		return filepath.Join(execDir, "netwarden.conf")
 	}
 
-	// On Unix systems, use the traditional /etc location
+	// FreeBSD keeps third-party configuration under /usr/local/etc (hier(7)),
+	// which is where the FreeBSD package installs it.
+	if runtime.GOOS == "freebsd" {
+		return "/usr/local/etc/netwarden/netwarden.conf"
+	}
+
+	// On other Unix systems, use the traditional /etc location
 	return "/etc/netwarden/netwarden.conf"
 }
 
 func main() {
+	// Before anything can block: an unhandled SIGHUP would kill the agent.
+	catchHangup()
+
 	// Get default config path based on OS
 	defaultConfigPath := getDefaultConfigPath()
 
-	// Parse command line flags
 	var (
-		configFile   = flag.String("config", defaultConfigPath, "Path to configuration file")
-		configShort  = flag.String("c", defaultConfigPath, "Path to configuration file (shortcut)")
+		configFile   string
 		showVersion  = flag.Bool("version", false, "Show version information and exit")
 		createConfig = flag.Bool("create-config", false, "Create example configuration file and exit")
 		serviceDebug = flag.Bool("service-debug", false, "Run in Windows service debug mode (Windows only)")
 	)
+	flag.StringVar(&configFile, "config", defaultConfigPath, "Path to configuration file")
+	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to configuration file (shortcut)")
 
 	// Custom usage function to display flags with -- prefix (GNU-style)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Netwarden Agent - Enterprise-grade infrastructure monitoring\n\n")
+		fmt.Fprintf(os.Stderr, "Netwarden Agent - infrastructure and security monitoring\n\n")
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  --config PATH, -c PATH\n")
@@ -91,12 +101,6 @@ func main() {
 
 	flag.Parse()
 
-	// Use short flag if provided
-	if flag.Lookup("c").Value.String() != defaultConfigPath {
-		*configFile = *configShort
-	}
-
-	// Handle version flag
 	if *showVersion {
 		fmt.Printf("Netwarden Agent\n")
 		fmt.Printf("Version:    %s\n", version)
@@ -107,54 +111,39 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Handle config creation flag
 	if *createConfig {
-		// Create config in default location
-		configPath := defaultConfigPath
-		if err := config.CreateConfigFile(configPath); err != nil {
+		if err := config.CreateConfigFile(configFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create configuration file: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Created configuration file: %s\n", configPath)
+		fmt.Printf("Created configuration file: %s\n", configFile)
 		fmt.Println("Please edit the file with your credentials and restart the agent:")
-		fmt.Printf("  1. Set your tenant_id (10-character string)\n")
-		fmt.Printf("  2. Set your api_key (nw_sk_...)\n")
-		fmt.Printf("  3. Start the agent: netwarden\n")
+		fmt.Println("  1. Set your tenant_id (10-character string)")
+		fmt.Println("  2. Set your api_key (nw_sk_...)")
+		fmt.Println("  3. Start the agent: netwarden")
 		os.Exit(0)
 	}
 
-	// On Windows, check if we should run as a service BEFORE loading config
-	// This is critical to avoid the 30-second timeout for Windows services
-	if runtime.GOOS == "windows" {
-		// Check if running as Windows service or in debug mode
-		isService, err := checkServiceMode()
+	// A Windows service must answer the service control manager before it
+	// loads anything, so that check comes before the config is read. On every
+	// other platform this is a no-op.
+	if handled, err := runPlatformService(configFile, *serviceDebug); handled {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to check service mode: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Windows service failed: %v\n", err)
 			os.Exit(1)
 		}
-
-		if isService || *serviceDebug {
-			// Run as Windows service - pass config file path for loading inside service
-			if err := runService(*configFile, *serviceDebug); err != nil {
-				fmt.Fprintf(os.Stderr, "Windows service failed: %v\n", err)
-				os.Exit(1)
-			}
-			return
-		}
+		return
 	}
 
-	// Load configuration (only for console mode)
-	cfg, err := config.LoadConfig(*configFile)
+	cfg, err := config.LoadConfig(configFile)
 	if err != nil {
-		// Check if config file doesn't exist by looking at the error
-		if strings.Contains(err.Error(), "no such file or directory") {
-			fmt.Fprintf(os.Stderr, "Error: Configuration file not found at %s\n", *configFile)
+		if errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "Error: Configuration file not found at %s\n", configFile)
 			fmt.Println("To create a configuration file, run:")
 			fmt.Println("  netwarden --create-config")
 			fmt.Println("Then edit the file to provide your tenant_id and api_key.")
 			os.Exit(1)
 		}
-
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
 	}
@@ -171,62 +160,54 @@ func main() {
 		}
 	}
 
-	// Setup structured logging - always log to file since we're always a daemon
+	// The agent runs as a daemon, so it always logs to a file.
 	logger := setupLoggingWithFile(cfg.LogLevel, "json", cfg.LogFile)
+	logConfigWarnings(cfg, logger)
 
 	// Log startup information
 	logFields := []any{
 		"version", version,
-		"config_file", *configFile,
+		"config_file", configFile,
 	}
 	if cfg.ServerURL != config.DefaultServerURL {
 		logFields = append(logFields, "server_url", cfg.ServerURL)
 	}
 	if cfg.TLSSkipVerify {
 		logFields = append(logFields, "tls_skip_verify", true)
-		logger.Warn("TLS certificate verification is disabled — connections are not secure")
+		logger.Warn("TLS certificate verification is disabled; connections are not secure")
 	}
 	if cfg.TLSCACert != "" {
 		logFields = append(logFields, "tls_ca_cert", cfg.TLSCACert)
 	}
 	logger.Info("starting Netwarden agent", logFields...)
 
-	// Run in console mode (default for non-Windows or when not running as service)
 	runConsoleMode(cfg, logger)
 }
 
-// runConsoleMode runs the agent in console mode with signal handling.
+// runConsoleMode runs the agent in the foreground until SIGINT/SIGTERM.
 func runConsoleMode(cfg *config.Config, logger *slog.Logger) {
-	logger.Info("running Netwarden in console mode")
-
-	// Create main context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Create and start the agent
 	netwardenAgent, err := agent.New(cfg, logger, version)
 	if err != nil {
 		logger.Error("failed to create agent", "error", err)
 		os.Exit(1)
 	}
 
-	// Start agent in goroutine
 	agentErrors := make(chan error, 1)
 	go func() {
 		agentErrors <- netwardenAgent.Run(ctx)
 	}()
 
-	// Wait for shutdown signal or agent error
 	select {
 	case sig := <-sigChan:
 		logger.Info("received shutdown signal", "signal", sig)
-		cancel() // Cancel context to signal shutdown
+		cancel()
 
-		// Give the agent time to shutdown gracefully
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
 
@@ -235,19 +216,17 @@ func runConsoleMode(cfg *config.Config, logger *slog.Logger) {
 			os.Exit(1)
 		}
 
-		logger.Info("agent shutdown completed")
-
 	case err := <-agentErrors:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("agent failed", "error", err)
 			os.Exit(1)
 		}
-		logger.Info("agent exited normally")
+		logger.Info("agent exited")
 	}
 }
 
 // setupLogging configures structured logging based on configuration.
-func setupLogging(level, format string, output *os.File) *slog.Logger {
+func setupLogging(level, format string, output io.Writer) *slog.Logger {
 	var logLevel slog.Level
 	switch level {
 	case "debug":
@@ -264,8 +243,7 @@ func setupLogging(level, format string, output *os.File) *slog.Logger {
 
 	opts := &slog.HandlerOptions{
 		Level: logLevel,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			// Add timestamp formatting if needed
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(a.Value.Time().Format(time.RFC3339))
 			}
@@ -295,17 +273,33 @@ func setupLoggingWithFile(level, format, configLogFile string) *slog.Logger {
 		logFile = getLogFilePath()
 	}
 
-	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := openLogFile(logFile)
 	if err != nil {
 		// If we can't open the preferred log file, fall back to stderr
 		fmt.Fprintf(os.Stderr, "Warning: Could not open log file %s: %v. Logging to stderr.\n", logFile, err)
-		return setupLogging(level, format, os.Stderr)
+		logger := setupLogging(level, format, os.Stderr)
+		watchLogReopen(nil, logger)
+		return logger
 	}
 
-	return setupLogging(level, format, file)
+	logger := setupLogging(level, format, file)
+	watchLogReopen(file, logger)
+	return logger
+}
+
+// logConfigWarnings logs what LoadConfig found but could not log itself,
+// because the log file was not open yet.
+func logConfigWarnings(cfg *config.Config, logger *slog.Logger) {
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
+	}
 }
 
 // getLogFilePath returns the appropriate log file path based on OS.
+//
+// There is deliberately no fallback to a world-writable directory such as
+// /tmp: if /var/log/netwarden is unusable the open fails and the agent logs
+// to stderr, which its supervisor captures.
 func getLogFilePath() string {
 	if runtime.GOOS == "windows" {
 		// On Windows, use the same directory as the executable
@@ -319,68 +313,9 @@ func getLogFilePath() string {
 		return filepath.Join(execDir, "netwarden.log")
 	}
 
-	// On Unix systems, prefer /var/log/netwarden/netwarden.log if we have permissions
+	// On Unix systems, log to /var/log/netwarden/netwarden.log. A failure to
+	// create the directory surfaces when the file is opened.
 	logDir := "/var/log/netwarden"
-	preferredPath := filepath.Join(logDir, "netwarden.log")
-
-	// Try to create the log directory if it doesn't exist
-	if err := os.MkdirAll(logDir, 0755); err == nil {
-		// Test if we can write to the directory
-		testFile := filepath.Join(logDir, ".netwarden_test")
-		if file, err := os.OpenFile(testFile, os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-			defer func() {
-				file.Close()
-				os.Remove(testFile) // Clean up test file
-			}()
-			return preferredPath
-		}
-	}
-
-	// Fall back to /tmp/netwarden.log
-	return "/tmp/netwarden.log"
-}
-
-// runDaemon forks the process to run in the background.
-func runDaemon() error {
-	// Get the current executable path
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %v", err)
-	}
-
-	// Prepare arguments (exclude the -d flag, add daemon marker)
-	args := []string{}
-	for i, arg := range os.Args[1:] {
-		if arg == "-d" {
-			continue
-		}
-		// Skip if previous arg was -d
-		if i > 0 && os.Args[i] == "-d" {
-			continue
-		}
-		args = append(args, arg)
-	}
-
-	// Add a special internal flag to mark this as a daemon child
-	args = append(args, "--daemon-child")
-
-	// Create process attributes for background execution
-	procAttr := &os.ProcAttr{
-		Env:   os.Environ(),
-		Files: []*os.File{nil, nil, nil}, // Close stdin, stdout, stderr
-	}
-
-	// Start the background process
-	proc, err := os.StartProcess(executable, append([]string{executable}, args...), procAttr)
-	if err != nil {
-		return fmt.Errorf("failed to start background process: %v", err)
-	}
-
-	fmt.Printf("Netwarden agent started in daemon mode (PID: %d)\n", proc.Pid)
-	fmt.Printf("Logs will be written to: %s\n", getLogFilePath())
-
-	// Release the process so it can run independently
-	proc.Release()
-
-	return nil
+	_ = os.MkdirAll(logDir, 0o755)
+	return filepath.Join(logDir, "netwarden.log")
 }

@@ -1,4 +1,4 @@
-// Copyright 2024-2025 Netwarden
+// Copyright 2024-2026 Netwarden
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package agent provides the main Netwarden agent implementation
-// that coordinates metric collection, processing, and transmission.
+// Package agent coordinates metric collection, filtering and transmission.
 package agent
 
 import (
@@ -22,31 +21,56 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
-	"netwarden/internal/cache"
-	"netwarden/internal/collectors/cis"
-	"netwarden/internal/collectors/container"
-	"netwarden/internal/collectors/cpu"
-	"netwarden/internal/collectors/disk"
-	"netwarden/internal/collectors/memory"
-	"netwarden/internal/collectors/mysql"
-	"netwarden/internal/collectors/network"
-	"netwarden/internal/collectors/postgresql"
-	"netwarden/internal/collectors/process"
-	"netwarden/internal/collectors/system"
-	"netwarden/internal/config"
-	sharedhttp "netwarden/internal/http"
-	"netwarden/internal/metrics"
-	"netwarden/internal/registry"
+	"github.com/NetwardenHQ/agent/internal/cache"
+	"github.com/NetwardenHQ/agent/internal/collectors/cis"
+	"github.com/NetwardenHQ/agent/internal/collectors/container"
+	"github.com/NetwardenHQ/agent/internal/collectors/cpu"
+	"github.com/NetwardenHQ/agent/internal/collectors/disk"
+	"github.com/NetwardenHQ/agent/internal/collectors/k8s"
+	"github.com/NetwardenHQ/agent/internal/collectors/memory"
+	"github.com/NetwardenHQ/agent/internal/collectors/mysql"
+	"github.com/NetwardenHQ/agent/internal/collectors/network"
+	"github.com/NetwardenHQ/agent/internal/collectors/opnsense"
+	"github.com/NetwardenHQ/agent/internal/collectors/postgresql"
+	"github.com/NetwardenHQ/agent/internal/collectors/process"
+	"github.com/NetwardenHQ/agent/internal/collectors/system"
+	"github.com/NetwardenHQ/agent/internal/config"
+	sharedhttp "github.com/NetwardenHQ/agent/internal/http"
+	"github.com/NetwardenHQ/agent/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/registry"
+	"github.com/NetwardenHQ/agent/internal/selfupdate"
+	"github.com/NetwardenHQ/agent/internal/spool"
 )
 
-// Agent represents the main Netwarden agent.
+const (
+	// defaultReportingInterval applies until the server says otherwise.
+	defaultReportingInterval = 60 * time.Second
+
+	// minReportingInterval and maxReportingInterval bound what the server may
+	// ask for; anything outside is treated as a bad response.
+	minReportingInterval = 10 * time.Second
+	maxReportingInterval = 1 * time.Hour
+
+	// batchSize is the most metrics sent in one request.
+	batchSize = 500
+
+	// startupJitterMax spreads a fleet's first requests after a mass restart.
+	startupJitterMax = 20 * time.Second
+
+	// updateCheckInterval is how often the OS package manager is asked about
+	// pending updates. It shells out, so it runs off the collection path.
+	updateCheckInterval = 6 * time.Hour
+)
+
+// Agent is the Netwarden agent: a set of collectors, a delta filter and a
+// transmitter, driven by one collection loop.
 type Agent struct {
 	config   *config.Config
 	logger   *slog.Logger
@@ -54,39 +78,49 @@ type Agent struct {
 	hostname string
 	version  string
 
-	// Control channels
-	stopChan chan struct{}
-	stopOnce sync.Once
-
-	// Metrics transmission
-	transmitter MetricTransmitter
+	transmitter  MetricTransmitter
+	deltaTracker *metrics.DeltaTracker
+	httpClient   *http.Client // for the remote-config fetch
 
 	// cisCollector is held by concrete type (not through the registry) so the
 	// remote-config poll can push a new CIS profile into it. nil when CIS is
 	// disabled in netwarden.conf.
 	cisCollector *cis.Collector
 
-	// Phase 4 optimizations
-	deltaTracker *metrics.DeltaTracker
-	batchSize    int
+	// k8sCollector is likewise held concretely so the config poll can push the
+	// namespace scope the operator configured in the UI.
+	k8sCollector *k8s.Collector
 
-	// Cache cleanup
+	// opnsenseCollector is held concretely so device_identity can read the
+	// interface roles and capabilities from it.
+	opnsenseCollector *opnsense.Collector
+
+	// spool forwards local producers' event and exposure files. It is nil when
+	// no spool directory is configured, and its methods are no-ops on nil.
+	spool *spool.Reader
+
+	// identityEnabled turns on the per-cycle device_identity snapshot and the
+	// spool. False only for hand-built agents in tests.
+	identityEnabled bool
+	state           *stateFile
+	lastIdentityErr string
+
+	// updater is closed on shutdown so a scheduled update is abandoned
+	// rather than started mid-shutdown. Nil when self-update is not wired.
+	updater *selfupdate.Updater
+
+	stopChan chan struct{}
+	stopOnce sync.Once
+
 	cacheCleanupStop chan struct{}
 
-	// Connection tracking
-	lastTransmissionFailed bool
-	consecutiveFailures    int
-	mu                     sync.RWMutex
-
-	// Dynamic reporting interval from backend
-	reportingInterval time.Duration
-	httpClient        *http.Client // For config fetching
-
-	// Background update checks
-	updateCheckStop chan struct{}
+	mu                  sync.Mutex
+	reportingInterval   time.Duration // set by the server; see FetchRemoteConfig
+	consecutiveFailures int           // transmission failures since the last success
 }
 
-// MetricTransmitter defines the interface for transmitting metrics to the server.
+// MetricTransmitter sends one batch of metrics, plus any snapshots for the
+// cycle, to the server.
 type MetricTransmitter interface {
 	// Send transmits one batch. snapshots may be nil; when non-nil it is
 	// sent alongside the batch in the same request.
@@ -94,7 +128,7 @@ type MetricTransmitter interface {
 	Close() error
 }
 
-// New creates a new Netwarden agent instance.
+// New creates an agent from a loaded configuration.
 func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("configuration cannot be nil")
@@ -103,10 +137,8 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		logger = slog.Default()
 	}
 
-	// Get hostname from config or system
-	var hostname string
-	if cfg.Hostname != "" {
-		hostname = cfg.Hostname
+	hostname := cfg.Hostname
+	if hostname != "" {
 		logger.Info("using custom hostname from config", "hostname", hostname)
 	} else {
 		var err error
@@ -117,139 +149,156 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		}
 	}
 
-	// Create registry
-	reg := registry.NewRegistry(logger.With("component", "registry"))
-
-	// Create transmitter with hostname and version
 	transmitter, err := NewHTTPTransmitter(cfg, hostname, version, logger.With("component", "transmitter"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transmitter: %w", err)
 	}
 
-	// Initialize Phase 4 optimizations
-	deltaTracker := metrics.NewDeltaTracker(metrics.DeltaConfig{
-		Threshold: 1.0,             // 1% change threshold
-		MaxAge:    5 * time.Minute, // Force send after 5 minutes
-		Enabled:   true,
-		Logger:    logger.With("component", "delta"),
-	})
-
-	// Use simple fixed batch size instead of adaptive batching
-	batchSize := 500
-
-	// Start global cache cleanup to prevent memory leaks
-	cacheCleanupStop := cache.StartGlobalCleanup(5 * time.Minute)
-
-	agent := &Agent{
-		config:            cfg,
-		logger:            logger,
-		registry:          reg,
-		hostname:          hostname,
-		version:           version,
-		stopChan:          make(chan struct{}),
-		transmitter:       transmitter,
-		deltaTracker:      deltaTracker,
-		batchSize:         batchSize,
-		cacheCleanupStop:  cacheCleanupStop,
-		reportingInterval: 60 * time.Second,       // Default to 60 seconds
-		httpClient:        sharedhttp.GetClient(), // Use shared HTTP client
-		updateCheckStop:   make(chan struct{}),
+	// Self-update. The trigger rides on the reply to the metrics POST, so
+	// there is no second destination to allowlist and no inbound channel. A
+	// local self_update_url outranks the server's URL, the digest comes from
+	// the API rather than the download host, and the accepted signers are
+	// local-only. The installer's signature, signer and embedded version are
+	// verified before it runs; see internal/selfupdate.
+	var updater *selfupdate.Updater
+	if httpTx, ok := transmitter.(*HTTPTransmitter); ok {
+		updater = selfupdate.New(selfupdate.Config{
+			Enabled:         cfg.SelfUpdate.Enabled,
+			WindowStartHour: cfg.SelfUpdate.WindowStartHour,
+			WindowEndHour:   cfg.SelfUpdate.WindowEndHour,
+			CurrentVersion:  version,
+			URLTemplate:     cfg.SelfUpdate.URLTemplate,
+			Signers:         cfg.SelfUpdate.Signers,
+		}, logger.With("component", "selfupdate"))
+		httpTx.SetUpdateHintHandler(updater.HandleHint)
 	}
 
-	// Register all collectors
-	if err := agent.registerCollectors(); err != nil {
+	a := &Agent{
+		config:   cfg,
+		logger:   logger,
+		registry: registry.NewRegistry(logger.With("component", "registry")),
+		hostname: hostname,
+		version:  version,
+
+		transmitter: transmitter,
+		updater:     updater,
+		deltaTracker: metrics.NewDeltaTracker(metrics.DeltaConfig{
+			Threshold: 1.0,             // resend a gauge when it moves by 1%
+			MaxAge:    5 * time.Minute, // ...or at least every 5 minutes
+			Logger:    logger.With("component", "delta"),
+		}),
+		httpClient: sharedhttp.GetClient(),
+
+		stopChan:          make(chan struct{}),
+		cacheCleanupStop:  cache.StartGlobalCleanup(5 * time.Minute),
+		reportingInterval: defaultReportingInterval,
+	}
+
+	a.identityEnabled = true
+	if cfg.SpoolDir != "" {
+		a.spool = spool.New(cfg.SpoolDir, spool.WithLogger(logger.With("component", "spool")))
+		if !spool.CanCreateDirs() {
+			logger.Info("not running as root; spool directories are not created", "dir", cfg.SpoolDir)
+		} else if err := a.spool.EnsureDirs(); err != nil {
+			logger.Warn("could not create spool directories", "dir", cfg.SpoolDir, "error", err)
+		}
+	}
+	a.state = newStateFile(cfg.SpoolDir, version, time.Now(), logger.With("component", "state"))
+	a.state.Init(a.currentInterval())
+
+	if err := a.registerCollectors(); err != nil {
 		return nil, fmt.Errorf("failed to register collectors: %w", err)
 	}
 
-	logger.Info("Netwarden agent created successfully",
+	logger.Info("Netwarden agent created",
 		"hostname", hostname,
-		"collectors", reg.ListCollectors())
+		"collectors", a.registry.ListCollectors())
 
-	return agent, nil
+	return a, nil
 }
 
-// registerCollectors registers all configured collectors with the registry.
+// registerCollectors registers every collector the configuration enables.
 func (a *Agent) registerCollectors() error {
 	collectorLogger := a.logger.With("component", "collector")
+	register := func(what string, c metrics.Collector) error {
+		if err := a.registry.Register(c); err != nil {
+			return fmt.Errorf("failed to register %s collector: %w", what, err)
+		}
+		return nil
+	}
 
-	// CPU collector (always enabled with defaults)
 	if a.config.Collectors.CPU {
-		cpuCollector := cpu.NewCollector(
-			nil, // Use defaults
-			a.hostname,
-			cpu.WithLogger(collectorLogger.With("type", "cpu")),
-		)
-		if err := a.registry.Register(cpuCollector); err != nil {
-			return fmt.Errorf("failed to register CPU collector: %w", err)
+		if err := register("CPU", cpu.NewCollector(a.hostname, cpu.WithLogger(collectorLogger.With("type", "cpu")))); err != nil {
+			return err
 		}
 	}
 
-	// Memory collector (always enabled with defaults)
 	if a.config.Collectors.Memory {
-		memoryCollector := memory.NewCollector(
-			nil, // Use defaults
-			a.hostname,
-			memory.WithLogger(collectorLogger.With("type", "memory")),
-		)
-		if err := a.registry.Register(memoryCollector); err != nil {
-			return fmt.Errorf("failed to register memory collector: %w", err)
+		if err := register("memory", memory.NewCollector(a.hostname, memory.WithLogger(collectorLogger.With("type", "memory")))); err != nil {
+			return err
 		}
 	}
 
-	// System collector (enabled by default for OS info and uptime)
 	if a.config.Collectors.System {
-		systemCollector := system.NewCollector(
-			config.SystemConfig{
-				Enabled:       true,
-				CollectUptime: true,
-			},
+		c := system.NewCollector(
+			config.SystemConfig{Enabled: true, CollectUptime: true},
 			a.hostname,
 			system.WithLogger(collectorLogger.With("type", "system")),
 		)
-		if err := a.registry.Register(systemCollector); err != nil {
-			return fmt.Errorf("failed to register system collector: %w", err)
+		if err := register("system", c); err != nil {
+			return err
 		}
 	}
 
-	// Disk collector (enabled for disk usage monitoring)
 	if a.config.Collectors.Disk {
-		diskCollector := disk.NewCollector(
-			a.hostname,
-			disk.WithLogger(collectorLogger.With("type", "disk")),
-		)
-		if err := a.registry.Register(diskCollector); err != nil {
-			return fmt.Errorf("failed to register disk collector: %w", err)
+		if err := register("disk", disk.NewCollector(a.hostname, disk.WithLogger(collectorLogger.With("type", "disk")))); err != nil {
+			return err
 		}
-		a.logger.Info("registered disk collector")
 	}
 
-	// Network collector (enabled for network interface monitoring)
 	if a.config.Collectors.Network {
-		networkCollector := network.NewCollector(
-			a.config.Network,
-			a.hostname,
-			network.WithLogger(collectorLogger.With("type", "network")),
-		)
-		if err := a.registry.Register(networkCollector); err != nil {
-			return fmt.Errorf("failed to register network collector: %w", err)
+		c := network.NewCollector(a.config.Network, a.hostname, network.WithLogger(collectorLogger.With("type", "network")))
+		if err := register("network", c); err != nil {
+			return err
 		}
-		a.logger.Info("registered network collector")
 	}
 
-	// Container collector (enabled when configured)
 	if a.config.Collectors.Container {
-		containerCollector := container.NewCollector(
-			a.config.Container,
-			a.hostname,
-			container.WithLogger(collectorLogger.With("type", "container")),
-		)
-		if err := a.registry.Register(containerCollector); err != nil {
-			return fmt.Errorf("failed to register container collector: %w", err)
+		c := container.NewCollector(a.config.Container, a.hostname, container.WithLogger(collectorLogger.With("type", "container")))
+		if err := register("container", c); err != nil {
+			return err
 		}
-		a.logger.Info("registered container collector")
 	}
 
-	// VM collector (Linux only)
+	// The Kubernetes collector is active only when the agent runs inside a
+	// cluster (in-cluster ServiceAccount detected). On an ordinary host it
+	// registers but reports Enabled() == false. Default on; disable with
+	// enable_kubernetes: false.
+	if a.config.Collectors.Kubernetes {
+		// Capabilities mirror the RBAC the install manifest granted, so the
+		// agent never starts a watcher it has no permission for (which would
+		// retry forever, logging a 403 each time).
+		c := k8s.NewCollector(
+			a.hostname,
+			k8s.WithLogger(collectorLogger.With("type", "kubernetes")),
+			k8s.WithCapabilities(k8s.Capabilities{
+				Jobs:         a.config.Collectors.K8sJobs,
+				Availability: a.config.Collectors.K8sAvailability,
+				Resources:    a.config.Collectors.K8sResources,
+				CNPG:         a.config.Collectors.K8sCNPG,
+				Ingress:      a.config.Collectors.K8sIngress,
+			}),
+		)
+		if err := register("kubernetes", c); err != nil {
+			return err
+		}
+		a.k8sCollector = c
+		if !c.Enabled() {
+			a.logger.Debug("kubernetes collector registered but inactive (not in-cluster)")
+		}
+	}
+
+	// VM collector (Linux only; see collectors_linux.go).
 	if err := a.registerVMCollector(collectorLogger); err != nil {
 		return err
 	}
@@ -259,76 +308,84 @@ func (a *Agent) registerCollectors() error {
 	// enable_security_* in the config file.
 	a.registerSecurityCollectors(collectorLogger)
 
-	// MySQL collector (auto-detects running MySQL/MariaDB)
-	mysqlCollector := mysql.NewCollector(
-		a.config.Database,
-		a.hostname,
-		mysql.WithLogger(collectorLogger.With("type", "mysql")),
-	)
-	// Only register if explicitly enabled OR if auto-detected and connected
+	// Database collectors register when explicitly enabled or when they
+	// auto-detect a local server they can reach.
+	mysqlCollector := mysql.NewCollector(a.config.Database, a.hostname, mysql.WithLogger(collectorLogger.With("type", "mysql")))
 	if a.config.Database.EnableMySQL || mysqlCollector.Enabled() {
 		if err := a.registry.Register(mysqlCollector); err != nil {
-			// Don't fail if MySQL collector can't be registered (process might not be running)
 			a.logger.Debug("MySQL collector not registered", "error", err)
-		} else {
-			a.logger.Info("registered MySQL collector")
 		}
 	}
 
-	// PostgreSQL collector (auto-detects running PostgreSQL)
-	postgresqlCollector := postgresql.NewCollector(
-		a.config.Database,
-		a.hostname,
-		postgresql.WithLogger(collectorLogger.With("type", "postgresql")),
-	)
-	// Only register if explicitly enabled OR if auto-detected and connected
+	postgresqlCollector := postgresql.NewCollector(a.config.Database, a.hostname, postgresql.WithLogger(collectorLogger.With("type", "postgresql")))
 	if a.config.Database.EnablePostgreSQL || postgresqlCollector.Enabled() {
 		if err := a.registry.Register(postgresqlCollector); err != nil {
-			// Don't fail if PostgreSQL collector can't be registered (process might not be running)
 			a.logger.Debug("PostgreSQL collector not registered", "error", err)
-		} else {
-			a.logger.Info("registered PostgreSQL collector")
 		}
 	}
 
-	// Process collector (monitors configured application processes)
 	if a.config.Process.EnableProcessMonitoring {
-		processCollector := process.NewCollector(
+		c := process.NewCollector(
 			a.config.Process,
 			a.hostname,
 			a.config.APIKey,
 			a.config.ServerURL,
 			process.WithLogger(collectorLogger.With("type", "process")),
+			process.WithUserAgent(a.userAgent()),
 		)
-		if err := a.registry.Register(processCollector); err != nil {
+		if err := a.registry.Register(c); err != nil {
 			a.logger.Warn("failed to register process collector", "error", err)
-		} else {
-			a.logger.Info("registered process collector")
 		}
 	}
 
 	return nil
 }
 
-// FetchRemoteConfig retrieves the reporting interval and other config from backend
+// userAgent is the User-Agent header for every request the agent makes.
+func (a *Agent) userAgent() string {
+	return "Netwarden-Agent/" + a.version
+}
+
+// remoteConfig is the /agent/config response body. The API wraps every
+// response as {success, data}.
+type remoteConfig struct {
+	Success bool `json:"success"`
+	Data    struct {
+		ReportingInterval int    `json:"reporting_interval"`
+		TenantID          string `json:"tenant_id"`
+		PlanID            string `json:"plan_id"`
+
+		// CISProfile is the benchmark profile the operator defined in the
+		// UI. Absent or null means CIS evaluation stays off for this host.
+		CISProfile *cis.Profile `json:"cis_profile"`
+
+		// K8sConfig carries the cluster scope configured in the UI. Absent
+		// means no scoping: watch every namespace.
+		K8sConfig *struct {
+			ExcludedNamespaces  []string `json:"excluded_namespaces"`
+			SustainedForSeconds int      `json:"sustained_for_seconds"`
+			RolloutGraceSeconds int      `json:"rollout_grace_seconds"`
+		} `json:"k8s_config"`
+	} `json:"data"`
+}
+
+// FetchRemoteConfig retrieves the reporting interval and collector settings
+// the server holds for this host, and applies them.
 func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
-	// Create context with timeout for the request
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, "GET",
-		a.config.ServerURL+"/agent/config", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, a.config.ServerURL+"/agent/config", nil)
 	if err != nil {
 		return fmt.Errorf("creating config request: %w", err)
 	}
-
 	req.Header.Set("Authorization", "Bearer "+a.config.APIKey)
-	req.Header.Set("User-Agent", fmt.Sprintf("Netwarden-Agent/%s", a.version))
+	req.Header.Set("User-Agent", a.userAgent())
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("config fetch timeout after 10s")
+			return fmt.Errorf("config fetch timed out after 10s")
 		}
 		return fmt.Errorf("fetching config: %w", err)
 	}
@@ -338,88 +395,72 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 		return fmt.Errorf("config fetch failed: status %d", resp.StatusCode)
 	}
 
-	// ResponseBuilder wraps responses in {success: true, data: {...}}
-	var apiResponse struct {
-		Success bool `json:"success"`
-		Data    struct {
-			ReportingInterval int    `json:"reporting_interval"`
-			TenantID          string `json:"tenant_id"`
-			PlanID            string `json:"plan_id"`
-			Features          struct {
-				MetricsEnabled   bool `json:"metrics_enabled"`
-				ProcessesEnabled bool `json:"processes_enabled"`
-			} `json:"features"`
-
-			// CISProfile is the benchmark profile the operator defined in the
-			// UI. Absent or null means CIS evaluation stays off for this host.
-			CISProfile *cis.Profile `json:"cis_profile"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+	var body remoteConfig
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return fmt.Errorf("decoding config: %w", err)
 	}
-
-	if !apiResponse.Success {
+	if !body.Success {
 		return fmt.Errorf("API returned success=false")
 	}
 
-	// Apply the CIS profile before validating the interval: a server that
-	// returns a nonsensical interval should not also silently discard a
+	// Apply the collector settings before validating the interval: a server
+	// that returns a nonsensical interval should not also silently discard a
 	// profile change the operator just made.
 	if a.cisCollector != nil {
-		a.cisCollector.SetProfile(apiResponse.Data.CISProfile)
+		a.cisCollector.SetProfile(body.Data.CISProfile)
+	}
+	if a.k8sCollector != nil {
+		var excluded []string
+		var sustained, rollout time.Duration
+		if k := body.Data.K8sConfig; k != nil {
+			excluded = k.ExcludedNamespaces
+			sustained = time.Duration(k.SustainedForSeconds) * time.Second
+			rollout = time.Duration(k.RolloutGraceSeconds) * time.Second
+		}
+		a.k8sCollector.SetExcludedNamespaces(excluded)
+		// Zero means unset in the UI; the collector keeps its default.
+		a.k8sCollector.SetThresholds(sustained, rollout)
 	}
 
-	// Validate response has required fields
-	if apiResponse.Data.ReportingInterval <= 0 {
-		return fmt.Errorf("invalid reporting interval: %d", apiResponse.Data.ReportingInterval)
+	interval := time.Duration(body.Data.ReportingInterval) * time.Second
+	if interval < minReportingInterval || interval > maxReportingInterval {
+		return fmt.Errorf("invalid reporting interval from server: %d seconds", body.Data.ReportingInterval)
 	}
 
-	// Update agent's reporting interval with validation and proper locking
 	a.mu.Lock()
-	oldInterval := a.reportingInterval
+	old := a.reportingInterval
+	a.reportingInterval = interval
 	a.mu.Unlock()
 
-	newInterval := time.Duration(apiResponse.Data.ReportingInterval) * time.Second
-
-	// Sanity check: interval should be between 10 seconds and 1 hour
-	if newInterval < 10*time.Second || newInterval > 1*time.Hour {
-		a.logger.Warn("Received invalid interval, using default",
-			"received_interval", newInterval.String(),
-			"default_interval", oldInterval.String())
-		return fmt.Errorf("invalid interval received: %v", newInterval)
+	if old != interval {
+		a.logger.Info("reporting interval updated",
+			"old_interval", old.String(),
+			"new_interval", interval.String(),
+			"plan_id", body.Data.PlanID)
 	}
-
-	// Lock only for the write operation
-	a.mu.Lock()
-	a.reportingInterval = newInterval
-	a.mu.Unlock()
-
-	if oldInterval != newInterval {
-		a.logger.Info("Updated reporting interval",
-			"old_interval", oldInterval.String(),
-			"new_interval", newInterval.String(),
-			"plan_id", apiResponse.Data.PlanID)
-	}
-
 	return nil
 }
 
+// currentInterval returns the reporting interval in effect.
+func (a *Agent) currentInterval() time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reportingInterval
+}
+
 // testConnection performs a startup connectivity check against the server.
-// Logs the result but never blocks agent startup.
+// It logs the result and never blocks startup.
 func (a *Agent) testConnection(ctx context.Context) {
 	testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	url := a.config.ServerURL + "/agent/config"
-	req, err := http.NewRequestWithContext(testCtx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(testCtx, http.MethodGet, a.config.ServerURL+"/agent/config", nil)
 	if err != nil {
 		a.logger.Warn("failed to create connection test request", "error", err)
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+a.config.APIKey)
-	req.Header.Set("User-Agent", "Netwarden-Agent/"+a.version)
+	req.Header.Set("User-Agent", a.userAgent())
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -432,7 +473,7 @@ func (a *Agent) testConnection(ctx context.Context) {
 	resp.Body.Close()
 
 	switch {
-	case resp.StatusCode == 401:
+	case resp.StatusCode == http.StatusUnauthorized:
 		a.logger.Error("server reachable but authentication failed",
 			"server_url", a.config.ServerURL,
 			"hint", "check tenant_id and api_key in config")
@@ -445,109 +486,68 @@ func (a *Agent) testConnection(ctx context.Context) {
 	}
 }
 
-// Run starts the agent's main collection and transmission loop.
+// sleep waits for d or until ctx is done, reporting which.
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Run drives the collection loop until ctx is cancelled or Stop is called.
 func (a *Agent) Run(ctx context.Context) error {
-	// Test server connectivity on startup (non-blocking)
 	a.testConnection(ctx)
 
-	// Add jitter to initial config fetch to prevent thundering herd (0-20 seconds)
-	// This prevents all agents from hitting the API simultaneously during mass deployments
-	initialJitter := time.Duration(rand.Intn(20)) * time.Second
-	time.Sleep(initialJitter)
+	// Spread a fleet's first requests so a mass restart is not a stampede.
+	if err := sleep(ctx, rand.N(startupJitterMax)); err != nil {
+		return err
+	}
 
-	// Fetch initial config from backend
 	if err := a.FetchRemoteConfig(ctx); err != nil {
-		a.mu.RLock()
-		defaultInterval := a.reportingInterval.String()
-		a.mu.RUnlock()
-		// Log at ERROR level for initial failure as it's more important
-		a.logger.Error("Failed to fetch initial remote config on startup",
+		a.logger.Error("failed to fetch remote config on startup; using default interval",
 			"error", err,
 			"hostname", a.hostname,
 			"tenant_id", a.config.TenantID,
-			"default_interval", defaultInterval,
-			"next_retry", "1 hour")
-		// Continue with default interval
+			"default_interval", a.currentInterval().String())
 	}
 
-	a.mu.RLock()
-	currentInterval := a.reportingInterval
-	a.mu.RUnlock()
+	a.logger.Info("starting collection loop", "collection_interval", a.currentInterval().String())
 
-	a.logger.Info("starting Netwarden agent",
-		"collection_interval", currentInterval.String(),
-		"buffer_size", a.config.Buffer.MaxSize)
-
-	// Perform initial health check
 	if err := a.performHealthCheck(ctx); err != nil {
 		a.logger.Warn("initial health check failed", "error", err)
 	}
 
-	// Create ticker for collection intervals using dynamic interval
-	a.mu.RLock()
-	ticker := time.NewTicker(a.reportingInterval)
-	a.mu.RUnlock()
-	// Use closure so defer stops the CURRENT ticker, not the original one
-	defer func() { ticker.Stop() }()
+	// Report once immediately, before entering the ticker loop. The server
+	// creates the host when the first payload arrives, and the interval can be
+	// as long as 10 minutes, during which a new install would look broken. The
+	// startup jitter above keeps a mass restart from stampeding the server.
+	if err := a.collectAndTransmit(ctx); err != nil {
+		a.logger.Error("initial collection and transmission failed", "error", err)
+	}
 
-	// Create ticker for delta tracker cleanup (every hour)
+	ticker := time.NewTicker(a.currentInterval())
+	defer ticker.Stop()
+
+	// The delta tracker forgets metrics it has not seen for a day.
 	cleanupTicker := time.NewTicker(1 * time.Hour)
 	defer cleanupTicker.Stop()
 
-	// Create ticker for config refresh with jitter to prevent thundering herd
-	// Random interval between 50-70 minutes
-	jitterMinutes := 50 + rand.Intn(20)
-	configRefreshTicker := time.NewTicker(time.Duration(jitterMinutes) * time.Minute)
+	// Re-read the server config roughly hourly, jittered so a fleet does
+	// not refresh in lockstep.
+	configRefreshTicker := time.NewTicker(50*time.Minute + rand.N(20*time.Minute))
 	defer configRefreshTicker.Stop()
 
-	// Start background update check goroutine
 	go a.runBackgroundUpdateChecks(ctx)
 
-	// Main collection loop
 	for {
 		select {
 		case <-ctx.Done():
 			a.logger.Info("context cancelled, stopping agent")
 			return ctx.Err()
-		case <-cleanupTicker.C:
-			// Periodic cleanup of delta tracker to prevent memory leaks
-			removed := a.deltaTracker.Cleanup(24 * time.Hour)
-			if removed > 0 {
-				a.logger.Debug("Delta tracker cleanup completed", "removed_metrics", removed)
-			}
-
-		case <-configRefreshTicker.C:
-			// Refresh config periodically to pick up plan changes
-			a.mu.RLock()
-			oldInterval := a.reportingInterval
-			a.mu.RUnlock()
-
-			if err := a.FetchRemoteConfig(ctx); err != nil {
-				// Log at ERROR level for better observability
-				a.logger.Error("Failed to fetch remote config during periodic refresh",
-					"error", err,
-					"hostname", a.hostname,
-					"tenant_id", a.config.TenantID,
-					"current_interval", oldInterval.String(),
-					"will_retry_in", "1 hour")
-				// Continue with existing interval
-			} else {
-				// Check if interval changed
-				a.mu.RLock()
-				newInterval := a.reportingInterval
-				a.mu.RUnlock()
-
-				if oldInterval != newInterval {
-					// Fix: Stop old ticker and create new one (Reset doesn't change duration in Go < 1.23)
-					// IMPORTANT: Keep reference to old ticker to stop it after creating new one
-					oldTicker := ticker
-					ticker = time.NewTicker(newInterval)
-					oldTicker.Stop() // Stop old ticker after new one is created to avoid race
-					a.logger.Info("Collection ticker recreated with new interval",
-						"old_interval", oldInterval.String(),
-						"new_interval", newInterval.String())
-				}
-			}
 
 		case <-a.stopChan:
 			a.logger.Info("stop signal received, stopping agent")
@@ -556,41 +556,48 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if err := a.collectAndTransmit(ctx); err != nil {
 				a.logger.Error("collection and transmission failed", "error", err)
-				// Continue running despite errors
+			}
+
+		case <-cleanupTicker.C:
+			if removed := a.deltaTracker.Cleanup(24 * time.Hour); removed > 0 {
+				a.logger.Debug("delta tracker cleanup completed", "removed_metrics", removed)
+			}
+
+		case <-configRefreshTicker.C:
+			old := a.currentInterval()
+			if err := a.FetchRemoteConfig(ctx); err != nil {
+				a.logger.Error("failed to refresh remote config; keeping current interval",
+					"error", err,
+					"hostname", a.hostname,
+					"tenant_id", a.config.TenantID,
+					"current_interval", old.String())
+				continue
+			}
+			if interval := a.currentInterval(); interval != old {
+				ticker.Reset(interval)
 			}
 		}
 	}
 }
 
-// runBackgroundUpdateChecks runs system update checks in the background
-// to prevent blocking the main metric collection cycle.
+// runBackgroundUpdateChecks asks the OS package manager about pending updates
+// on its own schedule, off the collection path, and caches the answer for the
+// system collector to report.
 func (a *Agent) runBackgroundUpdateChecks(ctx context.Context) {
-	a.logger.Info("starting background update check goroutine")
-
-	// Initial delay of 30 seconds to let the agent stabilize
-	select {
-	case <-time.After(30 * time.Second):
-		// Continue to first check
-	case <-ctx.Done():
-		return
-	case <-a.updateCheckStop:
+	// Let the agent settle before the first (comparatively heavy) check.
+	if err := sleep(ctx, 30*time.Second); err != nil {
 		return
 	}
-
-	// Perform initial update check
 	a.performUpdateCheck(ctx)
 
-	// Create ticker for periodic checks (every 6 hours)
-	ticker := time.NewTicker(6 * time.Hour)
+	ticker := time.NewTicker(updateCheckInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			a.logger.Info("background update check stopped: context cancelled")
 			return
-		case <-a.updateCheckStop:
-			a.logger.Info("background update check stopped: stop signal received")
+		case <-a.stopChan:
 			return
 		case <-ticker.C:
 			a.performUpdateCheck(ctx)
@@ -598,306 +605,194 @@ func (a *Agent) runBackgroundUpdateChecks(ctx context.Context) {
 	}
 }
 
-// performUpdateCheck executes the system update check and caches results.
+// performUpdateCheck runs the update check and caches the result.
 func (a *Agent) performUpdateCheck(ctx context.Context) {
-	// Only perform update checks on supported platforms
-	if runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin" && runtime.GOOS != "freebsd" {
 		return
 	}
 
-	a.logger.Debug("performing background system update check")
-
-	// Get the system collector from registry
-	systemCollector, err := a.getSystemCollector()
-	if err != nil {
-		a.logger.Warn("system collector not available for update checks", "error", err)
+	systemCollector, ok := a.registry.GetCollector("system").(*system.Collector)
+	if !ok {
+		a.logger.Warn("system collector not available for update checks")
 		return
 	}
 
-	// Use the cache system to store results
-	cacheKey := fmt.Sprintf("system:updates:%s", a.hostname)
-
-	// Get available updates count (platform-specific)
 	updateCount, err := systemCollector.GetAvailableUpdates(ctx)
 	if err != nil {
 		a.logger.Warn("background update check failed", "error", err)
 		return
 	}
 
-	// Get security updates count
+	securityUnknown := false
 	securityCount, err := systemCollector.GetSecurityUpdates(ctx)
 	if err != nil {
 		a.logger.Warn("background security update check failed", "error", err)
-		// Continue with general updates even if security check fails
-		securityCount = 0
+		// The general count is still worth reporting; the security count is
+		// left out rather than reported as zero.
+		securityUnknown = true
 	}
 
-	// Store in cache with 6-hour expiration (aligns with check interval)
-	updateInfo := map[string]interface{}{
-		"count":          updateCount,
-		"security_count": securityCount,
-		"timestamp":      time.Now(),
-	}
-	cache.Set(cacheKey, updateInfo, 6*time.Hour)
+	cache.Set(system.UpdatesCacheKey(a.hostname), system.UpdateCounts{
+		Available:       updateCount,
+		Security:        securityCount,
+		SecurityUnknown: securityUnknown,
+	}, updateCheckInterval)
 
 	a.logger.Info("background update check completed",
 		"updates_available", updateCount,
 		"security_updates", securityCount)
 }
 
-// getSystemCollector retrieves the system collector from the registry.
-func (a *Agent) getSystemCollector() (*system.Collector, error) {
-	collectors := a.registry.ListCollectors()
-	for _, name := range collectors {
-		if name == "system" {
-			// Get the collector interface
-			collector := a.registry.GetCollector("system")
-			if collector == nil {
-				return nil, fmt.Errorf("system collector not found in registry")
-			}
-			// Type assert to system.Collector
-			if sysCollector, ok := collector.(*system.Collector); ok {
-				return sysCollector, nil
-			}
-			return nil, fmt.Errorf("system collector type assertion failed")
-		}
-	}
-	return nil, fmt.Errorf("system collector not registered")
-}
-
-// collectAndTransmit performs a single collection cycle and transmits metrics.
+// collectAndTransmit performs one collection cycle and ships the result.
 func (a *Agent) collectAndTransmit(ctx context.Context) error {
-	// Collect metrics from all registered collectors
-	collectedMetrics, err := a.registry.CollectAll(ctx)
-
-	// Log partial collection failures but continue if we have any metrics
+	collected, err := a.registry.CollectAll(ctx)
 	if err != nil {
+		// A partial failure still leaves metrics worth sending.
 		a.logger.Warn("partial collection failure", "error", err)
-		// Don't return error here - continue with metrics we did collect
 	}
 
-	// Drain structured security snapshots produced by this cycle. Must run
-	// after CollectAll() — collectors stage their snapshot during Collect().
+	// Snapshots are staged by collectors during CollectAll and drained here.
 	snapshots := a.registry.Snapshots()
 
-	// Only skip transmission if we have nothing at all to send. A cycle can
-	// legitimately produce a snapshot with no metrics surviving delta
-	// filtering, so snapshots alone are reason enough to transmit.
-	if len(collectedMetrics) == 0 && len(snapshots) == 0 {
+	if len(collected) == 0 && len(snapshots) == 0 {
 		if err != nil {
-			// No metrics AND errors - this is a complete failure
 			return fmt.Errorf("metric collection completely failed: %w", err)
 		}
-		// No metrics but no error either (all collectors disabled?)
 		return nil
 	}
 
-	// Transmit metrics in batches (even if some collectors failed)
-	if err := a.transmitMetrics(ctx, collectedMetrics, snapshots); err != nil {
-		// Track failure
+	if err := a.transmitMetrics(ctx, collected, snapshots); err != nil {
 		a.mu.Lock()
 		a.consecutiveFailures++
-		a.lastTransmissionFailed = true
 		a.mu.Unlock()
-
 		return fmt.Errorf("metric transmission failed: %w", err)
 	}
 
-	// Check if we recovered from previous failures
 	a.mu.Lock()
-	wasFailedBefore := a.lastTransmissionFailed
-	previousFailures := a.consecutiveFailures
-	if wasFailedBefore {
-		// Log recovery message at INFO level so it's visible
-		a.logger.Info("CONNECTION RESTORED: Successfully reconnected to Netwarden backend and resumed metric transmission",
-			"previous_consecutive_failures", previousFailures,
-			"downtime_estimate", fmt.Sprintf("~%d minutes", previousFailures))
-		a.lastTransmissionFailed = false
-		a.consecutiveFailures = 0
-	}
+	failures := a.consecutiveFailures
+	a.consecutiveFailures = 0
 	a.mu.Unlock()
-
+	if failures > 0 {
+		a.logger.Info("connection restored; resumed metric transmission",
+			"previous_consecutive_failures", failures)
+	}
 	return nil
 }
 
-// transmitMetrics sends metrics to the server using Phase 4 optimizations.
+// transmitMetrics applies delta filtering and sends the result in batches.
 //
 // Snapshots bypass delta filtering (they are not time series) and ride along
 // with the first batch only, so the server upserts each snapshot type once
 // per cycle and runs its findings evaluator once rather than once per batch.
-func (a *Agent) transmitMetrics(ctx context.Context, allMetrics []metrics.Metric, snapshots []metrics.Snapshot) error {
-	a.logger.Debug("starting metric transmission", "total_metrics", len(allMetrics), "snapshots", len(snapshots))
+func (a *Agent) transmitMetrics(ctx context.Context, all []metrics.Metric, snapshots []metrics.Snapshot) error {
+	filtered := a.deltaTracker.FilterMetrics(all)
+	a.logger.Debug("delta filtering completed",
+		"total_metrics", len(all),
+		"filtered_metrics", len(filtered),
+		"snapshots", len(snapshots))
 
-	// Phase 4.1: Apply delta compression to filter out unchanged metrics
-	filteredMetrics := a.deltaTracker.FilterMetrics(allMetrics)
-
-	a.logger.Debug("delta filtering completed", "total_metrics", len(allMetrics), "filtered_metrics", len(filteredMetrics))
-
-	// Skip transmission only if there is genuinely nothing to send. Snapshots
-	// must still go out even when every metric was delta-filtered away.
-	if len(filteredMetrics) == 0 && len(snapshots) == 0 {
-		a.logger.Debug("no metrics need to be sent after delta filtering")
+	if len(filtered) == 0 && len(snapshots) == 0 && !a.identityEnabled {
 		return nil
 	}
 
-	// Use simple fixed-size batching
-	batches := a.createBatches(filteredMetrics, a.batchSize)
-
-	// A snapshot-only cycle still needs one request to carry it.
+	batches := batch(filtered, batchSize)
 	if len(batches) == 0 {
-		batches = [][]metrics.Metric{nil}
+		batches = [][]metrics.Metric{nil} // a snapshot-only cycle still needs one request
 	}
 
-	// Transmit each batch
-	for i, batch := range batches {
-		// Attach snapshots to the first batch only.
+	for i, b := range batches {
 		var batchSnapshots []metrics.Snapshot
+		var ack func()
 		if i == 0 {
-			batchSnapshots = snapshots
+			batchSnapshots, ack = a.withExtras(snapshots, b)
 		}
 
 		start := time.Now()
-		err := a.transmitter.Send(ctx, batch, batchSnapshots)
-		transmitDuration := time.Since(start)
-
-		if err != nil {
-			a.logger.Error("Failed to send batch",
-				"batch_index", i,
-				"batch_size", len(batch),
-				"latency_ms", transmitDuration.Milliseconds(),
-				"error", err)
-			return fmt.Errorf("failed to send batch %d: %w", i, err)
+		sendErr := a.transmitter.Send(ctx, b, batchSnapshots)
+		if sendErr == nil && ack != nil {
+			ack() // spool files are deleted only after a 2xx
+			ack = nil
 		}
-
-		a.logger.Debug("Batch sent successfully",
-			"batch_index", i,
-			"batch_size", len(batch),
-			"latency_ms", transmitDuration.Milliseconds())
+		if sendErr == nil && i == 0 && len(snapshots) > 0 {
+			a.ackSnapshots()
+		}
+		a.recordAttempt(start, sendErr)
+		if err := sendErr; err != nil {
+			return fmt.Errorf("failed to send batch %d of %d (%d metrics): %w", i+1, len(batches), len(b), err)
+		}
+		a.logger.Debug("batch sent",
+			"batch", i+1,
+			"of", len(batches),
+			"metrics", len(b),
+			"latency_ms", time.Since(start).Milliseconds())
 	}
-
 	return nil
 }
 
-// performHealthCheck checks the health of all collectors.
+// batch splits metrics into slices of at most size.
+func batch(all []metrics.Metric, size int) [][]metrics.Metric {
+	if len(all) == 0 {
+		return nil
+	}
+	batches := make([][]metrics.Metric, 0, (len(all)+size-1)/size)
+	for start := 0; start < len(all); start += size {
+		end := min(start+size, len(all))
+		batches = append(batches, all[start:end])
+	}
+	return batches
+}
+
+// performHealthCheck runs every collector's health check and logs the outcome.
 func (a *Agent) performHealthCheck(ctx context.Context) error {
-	healthResults := a.registry.HealthCheck(ctx)
+	results := a.registry.HealthCheck(ctx)
 
-	var healthErrors []string
-	healthyCount := 0
-
-	for collectorName, err := range healthResults {
+	var failures []string
+	for name, err := range results {
 		if err != nil {
-			healthErrors = append(healthErrors, fmt.Sprintf("%s: %v", collectorName, err))
-			a.logger.Warn("collector health check failed", "collector", collectorName, "error", err)
-		} else {
-			healthyCount++
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+			a.logger.Warn("collector health check failed", "collector", name, "error", err)
 		}
 	}
 
-	totalCollectors := len(healthResults)
 	a.logger.Info("health check completed",
-		"healthy", healthyCount,
-		"total", totalCollectors,
-		"failed", len(healthErrors))
+		"healthy", len(results)-len(failures),
+		"total", len(results),
+		"failed", len(failures))
 
-	if len(healthErrors) > 0 {
-		return fmt.Errorf("health check failures: %v", healthErrors)
+	if len(failures) > 0 {
+		return fmt.Errorf("health check failures: %v", failures)
 	}
-
 	return nil
 }
 
-// Stop gracefully stops the agent.
+// Stop asks the collection loop to exit. It is safe to call more than once.
 func (a *Agent) Stop() {
 	a.stopOnce.Do(func() {
 		close(a.stopChan)
 	})
 }
 
-// Shutdown performs graceful shutdown with timeout.
+// Shutdown stops the loop and releases every resource the agent holds.
 func (a *Agent) Shutdown(ctx context.Context) error {
 	a.logger.Info("shutting down Netwarden agent")
-
-	// Stop the main loop
 	a.Stop()
+	a.updater.Close()
 
-	var shutdownErrors []error
-
-	// Close transmitter
+	var errs []error
 	if err := a.transmitter.Close(); err != nil {
-		shutdownErrors = append(shutdownErrors, fmt.Errorf("transmitter shutdown error: %w", err))
+		errs = append(errs, fmt.Errorf("transmitter shutdown error: %w", err))
 	}
-
-	// Close registry (which closes all collectors)
 	if err := a.registry.Close(); err != nil {
-		shutdownErrors = append(shutdownErrors, fmt.Errorf("registry shutdown error: %w", err))
+		errs = append(errs, fmt.Errorf("registry shutdown error: %w", err))
 	}
-
-	// Stop cache cleanup
 	if a.cacheCleanupStop != nil {
 		close(a.cacheCleanupStop)
+		a.cacheCleanupStop = nil
 	}
 
-	// Stop background update checks
-	if a.updateCheckStop != nil {
-		close(a.updateCheckStop)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
-
-	if len(shutdownErrors) > 0 {
-		return fmt.Errorf("shutdown errors: %v", shutdownErrors)
-	}
-
 	a.logger.Info("Netwarden agent shutdown completed")
 	return nil
-}
-
-// createBatches creates fixed-size batches from metrics.
-func (a *Agent) createBatches(allMetrics []metrics.Metric, batchSize int) [][]metrics.Metric {
-	if len(allMetrics) == 0 {
-		return nil
-	}
-
-	if batchSize <= 0 {
-		batchSize = 500 // Default batch size
-	}
-
-	var batches [][]metrics.Metric
-	for i := 0; i < len(allMetrics); i += batchSize {
-		end := i + batchSize
-		if end > len(allMetrics) {
-			end = len(allMetrics)
-		}
-		batches = append(batches, allMetrics[i:end])
-	}
-
-	return batches
-}
-
-// GetStatus returns the current status of the agent.
-func (a *Agent) GetStatus(ctx context.Context) map[string]interface{} {
-	// Get current reporting interval with proper locking
-	a.mu.RLock()
-	currentInterval := a.reportingInterval.String()
-	a.mu.RUnlock()
-
-	status := map[string]interface{}{
-		"hostname":            a.hostname,
-		"collection_interval": currentInterval,
-		"buffer_size":         a.config.Buffer.MaxSize,
-		"collectors":          a.registry.ListCollectors(),
-	}
-
-	// Add health check results
-	healthResults := a.registry.HealthCheck(ctx)
-	healthStatus := make(map[string]string)
-	for name, err := range healthResults {
-		if err != nil {
-			healthStatus[name] = fmt.Sprintf("error: %v", err)
-		} else {
-			healthStatus[name] = "healthy"
-		}
-	}
-	status["health"] = healthStatus
-
-	return status
 }

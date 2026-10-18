@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || windows || freebsd
 
 package security
 
@@ -11,16 +11,16 @@ import (
 	"strings"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// maxIncludeFiles caps how many files we resolve from a single Include
+// maxIncludeFiles caps how many files are resolved from a single Include
 // directive (one level of nesting), to bound work on hosts with sprawling
 // drop-in directories.
 const maxIncludeFiles = 64
 
-// Enabled reports whether the SSH config collector should run. We're enabled
-// on Linux unconditionally; missing files are handled at collect time.
+// Enabled reports whether the SSH config collector should run. It always
+// does; a missing file is handled at collect time.
 func (c *SSHConfigCollector) Enabled() bool {
 	return true
 }
@@ -28,16 +28,17 @@ func (c *SSHConfigCollector) Enabled() bool {
 // Collect parses sshd_config (with one level of Include resolution) and emits
 // posture metrics. The directive syntax is identical across OpenSSH ports, so
 // this implementation is shared by Linux, macOS, and the Windows OpenSSH
-// server; only the config path differs (see sshdConfigPath). The work is throttled to once per sshConfigInterval; on
-// intervening cycles the previous metrics are re-emitted with a fresh timestamp.
+// server; only the config path differs (see sshdConfigPath). Parsing runs at
+// most once per sshConfigInterval; in between, the previous metrics are
+// re-emitted with a fresh timestamp.
 func (c *SSHConfigCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 	now := time.Now()
 
 	c.mu.Lock()
 	throttled := !c.lastCollected.IsZero() && now.Sub(c.lastCollected) < sshConfigInterval && len(c.lastMetrics) > 0
 	if throttled {
-		// Refresh timestamps on cached metrics so dashboards keep the
-		// stream live even though we don't re-parse.
+		// Refresh timestamps on cached metrics so the series stays
+		// continuous between parses.
 		refreshed := make([]metrics.Metric, len(c.lastMetrics))
 		for i, m := range c.lastMetrics {
 			m.Timestamp = now
@@ -55,7 +56,7 @@ func (c *SSHConfigCollector) Collect(ctx context.Context) ([]metrics.Metric, err
 	configPath := sshdConfigPath()
 	findings, err := c.parseSSHDConfig(configPath)
 	if err != nil {
-		// Missing/unreadable file — emit nothing this cycle, log once.
+		// Missing or unreadable file: emit nothing this cycle, log once.
 		c.missingLogOnce.Do(func() {
 			c.logger.Info("sshd_config not readable; SSH posture metrics will be skipped",
 				"path", configPath,
@@ -89,9 +90,8 @@ func (c *SSHConfigCollector) Collect(ctx context.Context) ([]metrics.Metric, err
 // parseSSHDConfig reads the primary sshd_config and any Include'd drop-in
 // files (one level deep) and returns the resolved posture findings.
 //
-// sshd uses first-match-wins for most directives, so we walk the include
-// chain in the same order sshd would and stop tracking each directive once
-// it has been set.
+// sshd uses the first value for most directives, so the include chain is
+// walked in sshd's order and each directive is pinned once set.
 func (c *SSHConfigCollector) parseSSHDConfig(path string) (sshConfigFindings, error) {
 	primary, err := os.Open(path)
 	if err != nil {
@@ -101,10 +101,9 @@ func (c *SSHConfigCollector) parseSSHDConfig(path string) (sshConfigFindings, er
 	// Defaults reflect sshd's compiled-in defaults so an unset directive
 	// still maps to a sensible posture value.
 	f := sshConfigFindings{
-		PermitRootLogin: true, // OpenSSH default since 7.0 is "prohibit-password" but
-		// distros frequently override to "yes". We treat *unset* as
-		// noteworthy=1 so operators are nudged to set it explicitly;
-		// most hardened distros do.
+		PermitRootLogin: true, // OpenSSH default since 7.0 is "prohibit-password", but
+		// distros frequently override it to "yes", so unset is reported
+		// as insecure to prompt setting it explicitly.
 		PasswordAuth:    true,  // default yes
 		ProtocolV1:      false, // long retired; default is no
 		X11Forwarding:   false, // default no
@@ -113,7 +112,7 @@ func (c *SSHConfigCollector) parseSSHDConfig(path string) (sshConfigFindings, er
 		SourceFile:      path,
 	}
 
-	// Track which directives we've already pinned (first-match-wins).
+	// Directives already pinned (first match wins).
 	seen := map[string]bool{}
 
 	type stream struct {
@@ -122,12 +121,17 @@ func (c *SSHConfigCollector) parseSSHDConfig(path string) (sshConfigFindings, er
 	}
 	queue := []stream{{path: path, rc: primary}}
 
+	// sshd resolves every relative Include against its config directory
+	// (SSHDIR, /etc/ssh on stock builds), whichever file holds the
+	// directive. The primary config lives in that directory.
+	sshDir := filepath.Dir(path)
+
 	processed := 0
 	for len(queue) > 0 {
 		head := queue[0]
 		queue = queue[1:]
 
-		includes := c.parseStream(head.path, head.rc, &f, seen)
+		includes := c.parseStream(sshDir, head.rc, &f, seen)
 		_ = head.rc.Close()
 
 		for _, inc := range includes {
@@ -149,10 +153,9 @@ func (c *SSHConfigCollector) parseSSHDConfig(path string) (sshConfigFindings, er
 }
 
 // parseStream parses a single sshd_config-format reader into f. Returns the
-// list of expanded paths from any Include directives encountered (callers
-// may decide to walk them — only the top-level call should, per the spec's
-// "one level of nesting" rule).
-func (c *SSHConfigCollector) parseStream(path string, rc *os.File, f *sshConfigFindings, seen map[string]bool) []string {
+// list of expanded paths from any Include directives encountered, with
+// relative paths resolved against sshDir.
+func (c *SSHConfigCollector) parseStream(sshDir string, rc *os.File, f *sshConfigFindings, seen map[string]bool) []string {
 	var includes []string
 
 	sc := bufio.NewScanner(rc)
@@ -174,9 +177,9 @@ func (c *SSHConfigCollector) parseStream(path string, rc *os.File, f *sshConfigF
 		}
 		lkey := strings.ToLower(key)
 
-		// Include is special — collect, don't pin.
+		// Include is collected, not pinned.
 		if lkey == "include" {
-			includes = append(includes, expandIncludes(path, value)...)
+			includes = append(includes, expandIncludes(sshDir, value)...)
 			continue
 		}
 
@@ -225,7 +228,7 @@ func (c *SSHConfigCollector) parseStream(path string, rc *os.File, f *sshConfigF
 	}
 
 	if err := sc.Err(); err != nil && !errors.Is(err, bufio.ErrTooLong) {
-		c.logger.Debug("scanner error reading sshd config", "path", path, "error", err)
+		c.logger.Debug("scanner error reading sshd config", "path", rc.Name(), "error", err)
 	}
 
 	return includes
@@ -249,9 +252,9 @@ func splitDirective(line string) (key, value string, ok bool) {
 }
 
 // expandIncludes turns one Include directive value (which can list multiple
-// paths and contain glob patterns, with paths relative to /etc/ssh) into a
-// concrete list of files to read.
-func expandIncludes(parentPath, value string) []string {
+// paths and contain glob patterns) into a concrete list of files to read.
+// Relative paths resolve against sshDir, the ssh config directory.
+func expandIncludes(sshDir, value string) []string {
 	var out []string
 	// sshd allows whitespace-separated lists.
 	for _, raw := range strings.Fields(value) {
@@ -260,12 +263,11 @@ func expandIncludes(parentPath, value string) []string {
 		if raw == "" {
 			continue
 		}
-		// Resolve relative paths against the parent file's directory
-		// (sshd_config quirk: "If the path is relative, it's relative to
-		// the location of the file that contains the Include directive,
-		// or /etc/ssh if at top level.").
+		// sshd_config(5): "Files without absolute paths are assumed to be
+		// in /etc/ssh", the config directory, even when the Include sits
+		// in an included file elsewhere.
 		if !filepath.IsAbs(raw) {
-			raw = filepath.Join(filepath.Dir(parentPath), raw)
+			raw = filepath.Join(sshDir, raw)
 		}
 
 		matches, err := filepath.Glob(raw)
@@ -298,8 +300,7 @@ func isPermitRootInsecure(v string) bool {
 	case "no", "prohibit-password", "without-password", "forced-commands-only":
 		return false
 	default:
-		// "yes" or anything we don't recognize is treated as the
-		// noteworthy / potentially-insecure case.
+		// "yes" and unrecognized values are treated as insecure.
 		return true
 	}
 }

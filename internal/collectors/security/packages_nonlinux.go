@@ -5,7 +5,7 @@ package security
 import (
 	"context"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Enabled returns false on non-Linux builds. dpkg/rpm have no equivalent on

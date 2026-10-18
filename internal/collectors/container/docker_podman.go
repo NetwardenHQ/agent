@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/user"
@@ -15,13 +16,14 @@ import (
 )
 
 // DockerCompatibleClient implements RuntimeClient for Docker/Podman communication.
-// Both Docker and Podman expose compatible REST APIs, so we can use the same client.
+// Docker and Podman expose compatible REST APIs, so one client serves both.
 type DockerCompatibleClient struct {
 	socketPath  string
 	httpClient  *http.Client
-	runtimeType string // "docker" or "podman"
-	runtimeName string // detected runtime name
-	// Availability caching to prevent repeated expensive checks
+	runtimeType string // "docker" or "podman"; guarded by availabilityMutex
+	runtimeName string // detected runtime name; guarded by availabilityMutex
+	// Availability caching to prevent repeated expensive checks. Also guards
+	// runtimeType/runtimeName, which IsAvailable rewrites from /version.
 	availabilityMutex  sync.RWMutex
 	cachedAvailability bool
 	cacheExpiry        time.Time
@@ -61,6 +63,8 @@ func NewDockerCompatibleClient(socketPath string) *DockerCompatibleClient {
 
 // Name returns the detected runtime name.
 func (d *DockerCompatibleClient) Name() string {
+	d.availabilityMutex.RLock()
+	defer d.availabilityMutex.RUnlock()
 	if d.runtimeName != "" {
 		return d.runtimeName
 	}
@@ -103,9 +107,10 @@ func (d *DockerCompatibleClient) IsAvailable() bool {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 200 {
-		// Try to detect runtime type from version response if not already known
+		// The version body says which runtime answered; read it from the
+		// response already in hand rather than asking again.
 		if d.runtimeType == "unknown" || d.runtimeName == "" {
-			d.detectRuntimeFromResponse(resp)
+			d.detectRuntimeFromVersion(resp.Body)
 		}
 		// Cache positive result for longer time (5 minutes)
 		d.cachedAvailability = true
@@ -153,6 +158,7 @@ func (d *DockerCompatibleClient) ListContainers(ctx context.Context) ([]Containe
 			ID:      ac.ID,
 			Name:    name,
 			Image:   ac.Image,
+			ImageID: normalizeImageID(ac.ImageID),
 			Status:  ac.State,
 			Labels:  ac.Labels,
 			Created: time.Unix(ac.Created, 0),
@@ -199,6 +205,7 @@ type containerFromAPI struct {
 	ID      string            `json:"Id"`
 	Names   []string          `json:"Names"`
 	Image   string            `json:"Image"`
+	ImageID string            `json:"ImageID"`
 	State   string            `json:"State"`
 	Status  string            `json:"Status"`
 	Created int64             `json:"Created"`
@@ -210,9 +217,11 @@ type containerFromAPI struct {
 type statsFromAPI struct {
 	CPUStats struct {
 		CPUUsage struct {
-			TotalUsage uint64 `json:"total_usage"`
+			TotalUsage  uint64   `json:"total_usage"`
+			PercpuUsage []uint64 `json:"percpu_usage"`
 		} `json:"cpu_usage"`
 		SystemUsage uint64 `json:"system_cpu_usage"`
+		OnlineCPUs  uint32 `json:"online_cpus"`
 	} `json:"cpu_stats"`
 	PreCPUStats struct {
 		CPUUsage struct {
@@ -224,11 +233,12 @@ type statsFromAPI struct {
 		Usage uint64 `json:"usage"`
 		Limit uint64 `json:"limit"`
 	} `json:"memory_stats"`
-	Networks map[string]struct {
+	Networks map[string]struct { // absent for host-network containers
 		RxBytes uint64 `json:"rx_bytes"`
 		TxBytes uint64 `json:"tx_bytes"`
 	} `json:"networks"`
 	BlkioStats struct {
+		// nil when the runtime could not read block I/O.
 		IoServiceBytesRecursive []struct {
 			Op    string `json:"op"`
 			Value uint64 `json:"value"`
@@ -244,44 +254,59 @@ func cleanContainerName(name string) string {
 	return name
 }
 
-// convertAPIStats converts Docker/Podman API stats to our internal ContainerStats format.
+// convertAPIStats converts Docker/Podman API stats to ContainerStats.
+//
+// CPU is put on the `docker stats` / `podman stats` scale, 100 = one core:
+// system_cpu_usage is host CPU time summed over every CPU, so the plain
+// ratio is a share of the whole host and is multiplied by the CPU count
+// (online_cpus, or the per-CPU array length on older APIs). The podman CLI
+// client reports the same scale, so the series means one thing whichever
+// client answered. Without a previous sample, a CPU count, or with counters
+// that went backwards (container restarted), utilization is unknown.
 func convertAPIStats(containerID string, stats *statsFromAPI) *ContainerStats {
-	// Calculate CPU percentage
-	cpuPercent := 0.0
-	cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - stats.PreCPUStats.CPUUsage.TotalUsage)
-	systemDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
-	if systemDelta > 0 {
-		cpuPercent = (cpuDelta / systemDelta) * 100.0
+	out := &ContainerStats{ContainerID: containerID}
+
+	cur, pre := stats.CPUStats, stats.PreCPUStats
+	cpus := float64(cur.OnlineCPUs)
+	if cpus == 0 {
+		cpus = float64(len(cur.CPUUsage.PercpuUsage))
+	}
+	if cpus > 0 && pre.SystemUsage > 0 && cur.SystemUsage > pre.SystemUsage &&
+		cur.CPUUsage.TotalUsage >= pre.CPUUsage.TotalUsage {
+		cpuDelta := float64(cur.CPUUsage.TotalUsage - pre.CPUUsage.TotalUsage)
+		systemDelta := float64(cur.SystemUsage - pre.SystemUsage)
+		out.CPUPercent, out.CPUKnown = cpuDelta/systemDelta*cpus*100.0, true
+	}
+
+	// A running container always uses some memory; 0 means not reported.
+	if stats.MemoryStats.Usage > 0 {
+		out.MemoryUsage, out.MemoryKnown = stats.MemoryStats.Usage, true
+		out.MemoryLimit = stats.MemoryStats.Limit
 	}
 
 	// Calculate network totals
-	var networkRx, networkTx uint64
-	for _, network := range stats.Networks {
-		networkRx += network.RxBytes
-		networkTx += network.TxBytes
-	}
-
-	// Calculate disk I/O totals
-	var diskRead, diskWrite uint64
-	for _, io := range stats.BlkioStats.IoServiceBytesRecursive {
-		switch strings.ToLower(io.Op) {
-		case "read":
-			diskRead += io.Value
-		case "write":
-			diskWrite += io.Value
+	if stats.Networks != nil {
+		out.NetworkKnown = true
+		for _, network := range stats.Networks {
+			out.NetworkRxBytes += network.RxBytes
+			out.NetworkTxBytes += network.TxBytes
 		}
 	}
 
-	return &ContainerStats{
-		ContainerID:    containerID,
-		CPUPercent:     cpuPercent,
-		MemoryUsage:    stats.MemoryStats.Usage,
-		MemoryLimit:    stats.MemoryStats.Limit,
-		NetworkRxBytes: networkRx,
-		NetworkTxBytes: networkTx,
-		DiskReadBytes:  diskRead,
-		DiskWriteBytes: diskWrite,
+	// Calculate disk I/O totals
+	if stats.BlkioStats.IoServiceBytesRecursive != nil {
+		out.DiskKnown = true
+		for _, io := range stats.BlkioStats.IoServiceBytesRecursive {
+			switch strings.ToLower(io.Op) {
+			case "read":
+				out.DiskReadBytes += io.Value
+			case "write":
+				out.DiskWriteBytes += io.Value
+			}
+		}
 	}
+
+	return out
 }
 
 // detectContainerRuntime tries to find an available container runtime.
@@ -320,58 +345,30 @@ func detectContainerRuntime() (string, string) {
 	return "/var/run/docker.sock", "docker"
 }
 
-// detectRuntimeFromResponse attempts to detect the runtime from version response.
-func (d *DockerCompatibleClient) detectRuntimeFromResponse(resp *http.Response) {
-	// Reset response body to read it
-	resp.Body.Close()
-
-	// Make a fresh request to get version info
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "GET", "http://runtime/version", nil)
-	versionResp, err := d.httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer versionResp.Body.Close()
-
+// detectRuntimeFromVersion reads a /version body and records whether Docker
+// or Podman is on the other end of the socket.
+func (d *DockerCompatibleClient) detectRuntimeFromVersion(body io.Reader) {
 	var versionInfo struct {
 		Components []struct {
-			Name    string `json:"Name"`
-			Version string `json:"Version"`
-		} `json:"Components"`
-		Engine struct {
 			Name string `json:"Name"`
-		} `json:"Engine"`
+		} `json:"Components"`
 		Platform struct {
 			Name string `json:"Name"`
 		} `json:"Platform"`
 	}
-
-	if err := json.NewDecoder(versionResp.Body).Decode(&versionInfo); err != nil {
+	if err := json.NewDecoder(body).Decode(&versionInfo); err != nil {
 		return
 	}
 
-	// Try to detect from various fields
-	if strings.Contains(strings.ToLower(versionInfo.Platform.Name), "podman") {
-		d.runtimeType = "podman"
-		d.runtimeName = "podman"
-	} else if len(versionInfo.Components) > 0 {
-		// Check components for podman
-		for _, component := range versionInfo.Components {
-			if strings.Contains(strings.ToLower(component.Name), "podman") {
-				d.runtimeType = "podman"
-				d.runtimeName = "podman"
-				return
-			}
+	isPodman := strings.Contains(strings.ToLower(versionInfo.Platform.Name), "podman")
+	for _, component := range versionInfo.Components {
+		if strings.Contains(strings.ToLower(component.Name), "podman") {
+			isPodman = true
 		}
-		// Default to docker if no podman found
-		d.runtimeType = "docker"
-		d.runtimeName = "docker"
+	}
+	if isPodman {
+		d.runtimeType, d.runtimeName = "podman", "podman"
 	} else {
-		// Fallback detection
-		d.runtimeType = "docker"
-		d.runtimeName = "docker"
+		d.runtimeType, d.runtimeName = "docker", "docker"
 	}
 }

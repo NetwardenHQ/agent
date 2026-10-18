@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // AuthCollector tracks failed SSH/login attempts. The implementation is

@@ -4,29 +4,58 @@ package container
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
 // Container represents basic container information.
 type Container struct {
-	ID      string            `json:"id"`
-	Name    string            `json:"name"`
-	Image   string            `json:"image"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Image string `json:"image"` // reference, e.g. "nginx:1.27" or "nginx@sha256:..."
+	// ImageID is the local image ID: the digest of the image's config
+	// object, always "sha256:<hex>" (see normalizeImageID). It is NOT the
+	// registry (manifest / repo) digest that appears after "@" in a
+	// reference; the two differ for the same image.
+	ImageID string            `json:"image_id"`
 	Status  string            `json:"status"`
 	Labels  map[string]string `json:"labels,omitempty"`
 	Created time.Time         `json:"created"`
 }
 
 // ContainerStats represents container resource usage metrics.
+//
+// Each group carries a Known flag: a runtime that could not read a figure
+// (podman prints "--", a host-network container has no interfaces) leaves it
+// false and the collector emits no series, rather than a 0 that would graph
+// as a measurement.
 type ContainerStats struct {
-	ContainerID    string  `json:"container_id"`
-	CPUPercent     float64 `json:"cpu_percent"`
-	MemoryUsage    uint64  `json:"memory_usage"`
-	MemoryLimit    uint64  `json:"memory_limit"`
-	NetworkRxBytes uint64  `json:"network_rx_bytes"`
-	NetworkTxBytes uint64  `json:"network_tx_bytes"`
-	DiskReadBytes  uint64  `json:"disk_read_bytes"`
-	DiskWriteBytes uint64  `json:"disk_write_bytes"`
+	ContainerID string `json:"container_id"`
+	// CPUPercent uses the docker/podman stats scale: 100 = one CPU core
+	// fully busy, so a container using four cores reads 400.
+	CPUPercent float64 `json:"cpu_percent"`
+	CPUKnown   bool    `json:"-"`
+	// MemoryLimit is 0 when the runtime did not report one.
+	MemoryUsage    uint64 `json:"memory_usage"`
+	MemoryLimit    uint64 `json:"memory_limit"`
+	MemoryKnown    bool   `json:"-"`
+	NetworkRxBytes uint64 `json:"network_rx_bytes"`
+	NetworkTxBytes uint64 `json:"network_tx_bytes"`
+	NetworkKnown   bool   `json:"-"`
+	DiskReadBytes  uint64 `json:"disk_read_bytes"`
+	DiskWriteBytes uint64 `json:"disk_write_bytes"`
+	DiskKnown      bool   `json:"-"`
+}
+
+// normalizeImageID returns an image ID in the "sha256:<hex>" form the Docker
+// API uses. `podman ps --format json` reports the bare hex; without this the
+// same image would be two inventory entries depending on which client
+// answered.
+func normalizeImageID(id string) string {
+	if id == "" || strings.Contains(id, ":") {
+		return id
+	}
+	return "sha256:" + id
 }
 
 // RuntimeClient interface for container runtime implementations.

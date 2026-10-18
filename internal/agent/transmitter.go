@@ -1,48 +1,137 @@
-// Package agent provides simplified metric transmission to the Netwarden backend.
 package agent
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"netwarden/internal/config"
-	sharedhttp "netwarden/internal/http"
-	"netwarden/internal/metrics"
-	"netwarden/internal/resilience"
+	"github.com/NetwardenHQ/agent/internal/config"
+	sharedhttp "github.com/NetwardenHQ/agent/internal/http"
+	"github.com/NetwardenHQ/agent/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/resilience"
+	"github.com/NetwardenHQ/agent/internal/selfupdate"
 )
 
-// apiDataPath is the path for metric submission, appended to the server URL.
+// apiDataPath is the metric submission path, appended to the server URL.
 const apiDataPath = "/agent/data"
 
-// maxSnapshotsPerPayload mirrors the server's `.max(16)` on the snapshots
-// array (platform/app/api/agent/data/route.ts). Exceeding it fails Zod
-// validation for the whole request, so the transmitter truncates instead.
+// maxSnapshotsPerPayload is the contract's limit on the snapshots array: the
+// server accepts at most 16. Exceeding it fails schema validation for the
+// whole request, so the transmitter truncates instead.
 const maxSnapshotsPerPayload = 16
 
-// HTTPTransmitter sends metrics to the Netwarden backend using standard HTTP.
-type HTTPTransmitter struct {
-	config        *config.Config
-	logger        *slog.Logger
-	httpClient    *http.Client
-	version       string
-	hostname      string // Agent hostname for consistent identification
-	lastLatencyMs int64  // Last measured latency in milliseconds
+// maxRateLimitRetries bounds how many times a 429 is honored before the
+// batch is given up on for this cycle.
+const maxRateLimitRetries = 3
 
-	// Recovery mechanism
-	consecutiveFailures int
-	lastFailure         time.Time
-	mu                  sync.RWMutex
+// maxRetryAfter caps how long one Retry-After is honored. The server sends
+// tens of seconds; a reply asking for an hour comes from a misconfigured or
+// hostile server, and honoring it would stall the cycle (and shutdown) that
+// long.
+const maxRetryAfter = 5 * time.Minute
+
+// rateLimitSleep is sleep, replaceable in tests.
+var rateLimitSleep = sleep
+
+// errBackingOff is returned when Send skipped the request entirely because
+// of recent failures. No request was made, so it is not an attempt.
+var errBackingOff = errors.New("backing off after consecutive transmission failures")
+
+// payload is the /agent/data request body. Field names are the server's
+// contract; omitempty on the optional ones matters because the server
+// distinguishes an absent field from an empty one.
+type payload struct {
+	Version   string             `json:"version"`
+	OS        string             `json:"os"`
+	Arch      string             `json:"arch"`
+	Hostname  string             `json:"hostname"`
+	TenantID  string             `json:"tenant_id"`
+	Metrics   []payloadMetric    `json:"metrics"`
+	OSInfo    map[string]string  `json:"os_info,omitempty"`
+	Latency   *int64             `json:"agent_latency,omitempty"`
+	Snapshots []metrics.Snapshot `json:"snapshots,omitempty"`
 }
 
-// NewHTTPTransmitter creates a new HTTP transmitter.
+// payloadMetric is one metric as the server expects it.
+type payloadMetric struct {
+	HostID     string            `json:"host_id"`
+	MetricName string            `json:"metric_name"`
+	Value      float64           `json:"value"`
+	Timestamp  string            `json:"timestamp"`
+	Labels     map[string]string `json:"labels"`
+}
+
+// toPayloadMetric converts one metric to its wire form. host_id is the
+// hostname the agent reports as.
+func toPayloadMetric(hostID string, m metrics.Metric) payloadMetric {
+	return payloadMetric{
+		HostID:     hostID,
+		MetricName: m.Name,
+		Value:      m.Value,
+		Timestamp:  m.Timestamp.Format(time.RFC3339),
+		Labels:     m.Labels,
+	}
+}
+
+// serverResponse is the subset of the /agent/data reply the agent acts on.
+//
+// The agent reports its version in every payload; when a newer release exists
+// the server names it here, along with where to get it and what it must hash
+// to. All three are a suggestion: local configuration outranks them, and the
+// agent will not run anything that is not signed by an identity configured on
+// the host itself. See internal/selfupdate for the precedence rules.
+type serverResponse struct {
+	Data struct {
+		AgentUpdate *struct {
+			Version string `json:"version"`
+			URL     string `json:"url"`
+			SHA256  string `json:"sha256"`
+		} `json:"agent_update,omitempty"`
+	} `json:"data"`
+}
+
+// maxResponseBytes caps how much of a reply is read. The body is a small JSON
+// ack; anything larger comes from a malfunctioning or hostile server and must
+// not exhaust the agent's memory.
+const maxResponseBytes = 64 * 1024
+
+// HTTPTransmitter sends metrics to the Netwarden backend.
+type HTTPTransmitter struct {
+	config     *config.Config
+	logger     *slog.Logger
+	httpClient *http.Client
+	version    string
+	hostname   string
+
+	// lastLatencyMs is the round-trip time of the last successful request,
+	// reported in the next payload. -1 until the first measurement, which
+	// omits the field rather than claiming zero.
+	lastLatencyMs atomic.Int64
+
+	// lastStatus is the HTTP status of the last reply, 0 when none arrived.
+	lastStatus atomic.Int64
+
+	// onUpdateHint, when set, is called with the version the server says is
+	// current. The transmitter only reports the hint; deciding whether and
+	// when to act on it belongs to the updater, not to the metrics path.
+	onUpdateHint func(selfupdate.Offer)
+
+	mu                  sync.Mutex
+	consecutiveFailures int
+	lastFailure         time.Time
+}
+
+// NewHTTPTransmitter creates a transmitter for the configured server.
 func NewHTTPTransmitter(cfg *config.Config, hostname string, version string, logger *slog.Logger) (MetricTransmitter, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("configuration cannot be nil")
@@ -58,39 +147,17 @@ func NewHTTPTransmitter(cfg *config.Config, hostname string, version string, log
 	}
 
 	t := &HTTPTransmitter{
-		config:        cfg,
-		logger:        logger,
-		version:       version,
-		hostname:      hostname,
-		httpClient:    sharedhttp.GetClient(), // Use global client
-		lastLatencyMs: -1,                     // sentinel: -1 = no measurement yet (omits the field from the first payload)
+		config:     cfg,
+		logger:     logger,
+		version:    version,
+		hostname:   hostname,
+		httpClient: sharedhttp.GetClient(),
 	}
-
+	t.lastLatencyMs.Store(-1)
 	return t, nil
 }
 
-// clearIdleConnectionsIfNeeded clears idle connections after persistent failures.
-func (t *HTTPTransmitter) clearIdleConnectionsIfNeeded() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Clear connections after 5 consecutive failures
-	if t.consecutiveFailures >= 5 {
-		if t.httpClient != nil {
-			// Close idle connections on the global client's transport
-			if transport, ok := t.httpClient.Transport.(*http.Transport); ok {
-				transport.CloseIdleConnections()
-			}
-		}
-
-		t.logger.Info("cleared idle connections after persistent failures",
-			"consecutive_failures", t.consecutiveFailures)
-
-		t.consecutiveFailures = 0
-	}
-}
-
-// Send transmits metrics to the backend with retry logic and recovery mechanisms.
+// Send transmits one batch, retrying transient failures.
 //
 // snapshots carries structured security snapshots for this cycle and may be
 // nil. The agent attaches them to a single batch per cycle so the server
@@ -98,251 +165,258 @@ func (t *HTTPTransmitter) clearIdleConnectionsIfNeeded() {
 // rather than once per batch.
 func (t *HTTPTransmitter) Send(ctx context.Context, metricList []metrics.Metric, snapshots []metrics.Snapshot) error {
 	if len(metricList) == 0 && len(snapshots) == 0 {
-		t.logger.Debug("no metrics to send")
 		return nil
 	}
 
-	t.logger.Debug("attempting to send metrics", "count", len(metricList), "snapshots", len(snapshots))
-
-	// Check if we should back off due to recent failures
 	if t.shouldBackoff() {
-		t.logger.Debug("backing off due to recent failures")
-		return fmt.Errorf("backing off due to recent transmission failures")
+		return fmt.Errorf("%w (%d)", errBackingOff, t.failureCount())
 	}
 
-	// Clear idle connections if we've had too many failures
-	t.clearIdleConnectionsIfNeeded()
-
-	// Create payload
-	payload := t.createPayload(metricList, snapshots)
-
-	// Marshal to JSON
-	jsonData, err := json.Marshal(payload)
+	body, err := json.Marshal(t.createPayload(metricList, snapshots))
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	// Send with retry
 	err = resilience.Retry(ctx, func() error {
-		return t.sendRequest(ctx, jsonData, 0) // Start with retry count 0
+		return t.sendWithRateLimit(ctx, body)
 	})
-
-	// Update failure tracking
-	t.updateFailureTracking(err)
+	t.recordOutcome(err)
 
 	if err != nil {
 		t.logger.Warn("failed to send metrics", "error", err, "count", len(metricList))
-	} else {
-		t.logger.Debug("successfully sent metrics", "count", len(metricList))
+		return err
 	}
-
-	return err
+	t.logger.Debug("sent metrics", "count", len(metricList), "snapshots", len(snapshots))
+	return nil
 }
 
-// shouldBackoff determines if we should back off from sending due to recent failures.
+// shouldBackoff reports whether recent failures mean this cycle should be
+// skipped. After three consecutive failures the transmitter waits 30 s,
+// then 60 s, 120 s, 240 s, capped at 300 s, before trying again; the
+// collectors keep running so the delta filter's state stays current.
 func (t *HTTPTransmitter) shouldBackoff() bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	// No backoff if we haven't had many failures
 	if t.consecutiveFailures < 3 {
 		return false
 	}
-
-	// Exponential backoff: 30s, 60s, 120s, 240s, then cap at 300s
-	backoffSeconds := 30 * (1 << uint(t.consecutiveFailures-3))
-	if backoffSeconds > 300 {
-		backoffSeconds = 300
-	}
-
-	backoffDuration := time.Duration(backoffSeconds) * time.Second
-	return time.Since(t.lastFailure) < backoffDuration
+	backoff := min(30*time.Second<<uint(t.consecutiveFailures-3), 300*time.Second)
+	return time.Since(t.lastFailure) < backoff
 }
 
-// updateFailureTracking updates the failure counters based on the result.
-func (t *HTTPTransmitter) updateFailureTracking(err error) {
+// failureCount returns the current consecutive-failure count.
+func (t *HTTPTransmitter) failureCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.consecutiveFailures
+}
+
+// recordOutcome updates the failure counters after a Send.
+func (t *HTTPTransmitter) recordOutcome(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if err != nil {
 		t.consecutiveFailures++
 		t.lastFailure = time.Now()
-		t.logger.Warn("transmission failed",
-			"consecutive_failures", t.consecutiveFailures,
-			"error", err)
-	} else {
-		// Reset on success
-		if t.consecutiveFailures > 0 {
-			t.logger.Info("transmission recovered after failures",
-				"previous_consecutive_failures", t.consecutiveFailures)
+		// Persistent failure often means the pooled connection is dead in a
+		// way the transport has not noticed (NAT timeout, server restart).
+		// Drop the pool so the next attempt dials fresh.
+		if t.consecutiveFailures%5 == 0 {
+			if transport, ok := t.httpClient.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+			t.logger.Info("cleared idle connections after persistent failures",
+				"consecutive_failures", t.consecutiveFailures)
 		}
-		t.consecutiveFailures = 0
-		t.lastFailure = time.Time{}
+		return
+	}
+
+	if t.consecutiveFailures > 0 {
+		t.logger.Info("transmission recovered", "previous_consecutive_failures", t.consecutiveFailures)
+	}
+	t.consecutiveFailures = 0
+	t.lastFailure = time.Time{}
+}
+
+// rateLimitedError is a 429 that named how long to wait.
+type rateLimitedError struct{ wait time.Duration }
+
+func (e *rateLimitedError) Error() string {
+	return fmt.Sprintf("rate limited: retry after %v", e.wait)
+}
+
+// sendWithRateLimit performs the POST, honoring a 429's Retry-After (capped at
+// maxRetryAfter) at most maxRateLimitRetries times. Running out of retries is
+// a permanent error for this Send, so resilience.Retry's attempts do not each
+// honor another round of 429s.
+func (t *HTTPTransmitter) sendWithRateLimit(ctx context.Context, body []byte) error {
+	for retries := 0; ; retries++ {
+		err := t.sendRequest(ctx, body)
+		var rl *rateLimitedError
+		if !errors.As(err, &rl) {
+			return err
+		}
+		if retries >= maxRateLimitRetries {
+			return resilience.Permanent(fmt.Errorf("rate limited: exceeded %d retries", maxRateLimitRetries))
+		}
+		if err := rateLimitSleep(ctx, min(rl.wait, maxRetryAfter)); err != nil {
+			return err
+		}
 	}
 }
 
-// sendRequest sends a single HTTP request to the backend and measures latency.
-// retryCount tracks recursive retries to prevent infinite loops (max 3 retries for 429).
-func (t *HTTPTransmitter) sendRequest(ctx context.Context, jsonData []byte, retryCount int) error {
-	const maxRateLimitRetries = 3
-
-	// Create request using configured server URL
-	req, err := http.NewRequestWithContext(ctx, "POST", t.config.ServerURL+apiDataPath, bytes.NewReader(jsonData))
+// sendRequest performs one POST and records its latency.
+func (t *HTTPTransmitter) sendRequest(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.config.ServerURL+apiDataPath, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
-
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+t.config.APIKey)
-	req.Header.Set("User-Agent", fmt.Sprintf("Netwarden-Agent/%s", t.version))
+	req.Header.Set("User-Agent", "Netwarden-Agent/"+t.version)
 
-	// Measure request latency
-	startTime := time.Now()
+	start := time.Now()
 	resp, err := t.httpClient.Do(req)
-	latency := time.Since(startTime)
-
+	latency := time.Since(start)
 	if err != nil {
+		t.lastStatus.Store(0)
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	t.lastStatus.Store(int64(resp.StatusCode))
 
-	// Handle rate limiting (429 Too Many Requests)
-	if resp.StatusCode == 429 {
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
 		retryAfter := resp.Header.Get("Retry-After")
-		interval := resp.Header.Get("X-RateLimit-Interval")
-		host := resp.Header.Get("X-RateLimit-Host")
-
-		t.logger.Warn("Rate limited by backend",
+		t.logger.Warn("rate limited by server",
 			"retry_after", retryAfter,
-			"plan_interval", interval,
-			"host", host,
-			"retry_count", retryCount)
+			"plan_interval", resp.Header.Get("X-RateLimit-Interval"),
+			"host", resp.Header.Get("X-RateLimit-Host"))
 
-		// Check if we've exceeded max retries
-		if retryCount >= maxRateLimitRetries {
-			return fmt.Errorf("rate limited: exceeded max retries (%d)", maxRateLimitRetries)
+		seconds, err := strconv.Atoi(retryAfter)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("rate limited: status 429, Retry-After %q", retryAfter)
 		}
+		return &rateLimitedError{wait: time.Duration(seconds) * time.Second}
 
-		// Parse retry-after header and wait if provided
-		if retryAfter != "" {
-			if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
-				waitDuration := time.Duration(seconds) * time.Second
-				t.logger.Info("Waiting before retry due to rate limit",
-					"wait_seconds", seconds,
-					"retry_count", retryCount+1)
+	case resp.StatusCode == http.StatusUnauthorized:
+		return resilience.Permanent(fmt.Errorf("authentication denied: wrong tenant_id or api_key"))
 
-				// Wait with context awareness
-				select {
-				case <-time.After(waitDuration):
-					// Retry after waiting with incremented counter
-					return t.sendRequest(ctx, jsonData, retryCount+1)
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-		}
+	case resp.StatusCode == http.StatusRequestTimeout, resp.StatusCode == http.StatusTooEarly:
+		// 408 and 425 say "not now", not "not this": the same bytes can
+		// succeed on a retry.
+		return fmt.Errorf("server returned status %d", resp.StatusCode)
 
-		return fmt.Errorf("rate limited: status 429, retry after %s seconds", retryAfter)
-	}
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		// The server rejected this payload; sending the same bytes again
+		// cannot succeed.
+		return resilience.Permanent(fmt.Errorf("server rejected payload: status %d", resp.StatusCode))
 
-	// Check other response status
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Provide specific error message for authentication failures
-		if resp.StatusCode == 401 {
-			return fmt.Errorf("authentication denied: wrong tenant_id or api_key")
-		}
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
-	// Store latency for inclusion in agent_up metric
-	t.lastLatencyMs = latency.Milliseconds()
+	// Read the body even when there is nothing to act on: Go reuses a
+	// keep-alive connection only once the previous response has been drained.
+	t.handleResponse(resp.Body)
 
+	t.lastLatencyMs.Store(latency.Milliseconds())
 	return nil
 }
 
-// createPayload creates the JSON payload structure.
-func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots []metrics.Snapshot) map[string]interface{} {
-	// Convert metrics to simple format
-	metricsData := make([]map[string]interface{}, len(metricList))
-	var osInfo map[string]interface{}
+// handleResponse drains the reply and surfaces an update hint if one is
+// present. It never fails: the metrics were accepted, and an unparseable
+// reply must not turn a successful send into a retry.
+func (t *HTTPTransmitter) handleResponse(body io.Reader) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes))
+	if err != nil || len(raw) == 0 {
+		return
+	}
 
-	for i, metric := range metricList {
-		// Use consistent hostname from transmitter
-		metricsData[i] = map[string]interface{}{
-			"host_id":     t.hostname,
-			"metric_name": metric.Name,
-			"value":       metric.Value,
-			"timestamp":   metric.Timestamp.Format(time.RFC3339),
-			"labels":      metric.Labels,
+	var parsed serverResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.logger.Debug("could not parse server response", "error", err)
+		return
+	}
+	if parsed.Data.AgentUpdate == nil || parsed.Data.AgentUpdate.Version == "" {
+		return
+	}
+	if t.onUpdateHint == nil {
+		return
+	}
+	t.onUpdateHint(selfupdate.Offer{
+		Version: parsed.Data.AgentUpdate.Version,
+		URL:     parsed.Data.AgentUpdate.URL,
+		SHA256:  parsed.Data.AgentUpdate.SHA256,
+	})
+}
+
+// SetUpdateHintHandler registers the callback invoked when the server reports
+// a newer agent version. Call before Send.
+func (t *HTTPTransmitter) SetUpdateHintHandler(fn func(selfupdate.Offer)) {
+	t.onUpdateHint = fn
+}
+
+// createPayload builds the request body for one batch.
+func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots []metrics.Snapshot) payload {
+	p := payload{
+		Version:  t.version,
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
+		Hostname: t.hostname,
+		TenantID: t.config.TenantID,
+		Metrics:  make([]payloadMetric, len(metricList)),
+	}
+
+	for i, m := range metricList {
+		p.Metrics[i] = toPayloadMetric(t.hostname, m)
+
+		// The system_info metric carries the host's OS details in its
+		// labels; the server reads them from the top-level os_info field.
+		if m.Name == "system_info" && m.Labels != nil {
+			p.OSInfo = map[string]string{
+				"os":             m.Labels["os"],
+				"platform":       m.Labels["platform"],
+				"family":         m.Labels["family"],
+				"version":        m.Labels["version"],
+				"arch":           m.Labels["arch"],
+				"kernel_version": m.Labels["kernel_version"],
+			}
+			if distro, ok := m.Labels["distro"]; ok {
+				p.OSInfo["distro"] = distro
+			}
+			if distroVersion, ok := m.Labels["distro_version"]; ok {
+				p.OSInfo["distro_version"] = distroVersion
+			}
 		}
-
-		// Extract detailed OS info from system_info metric
-		if metric.Name == "system_info" && metric.Labels != nil {
-			osInfo = map[string]interface{}{
-				"os":             metric.Labels["os"],
-				"platform":       metric.Labels["platform"], // Keep for compatibility
-				"family":         metric.Labels["family"],
-				"version":        metric.Labels["version"],
-				"arch":           metric.Labels["arch"],
-				"kernel_version": metric.Labels["kernel_version"],
-			}
-			// Add distro if present (Linux systems)
-			if distro, exists := metric.Labels["distro"]; exists {
-				osInfo["distro"] = distro
-			}
-			if distroVersion, exists := metric.Labels["distro_version"]; exists {
-				osInfo["distro_version"] = distroVersion
-			}
-		}
 	}
 
-	// Use consistent hostname from transmitter
-	payload := map[string]interface{}{
-		"version":   t.version,
-		"os":        runtime.GOOS,
-		"arch":      runtime.GOARCH,
-		"hostname":  t.hostname,
-		"tenant_id": t.config.TenantID, // Include tenant_id from config for validation
-		"metrics":   metricsData,
+	if ms := t.lastLatencyMs.Load(); ms >= 0 {
+		p.Latency = &ms
 	}
 
-	// Include detailed OS info if available
-	if osInfo != nil {
-		payload["os_info"] = osInfo
+	if len(snapshots) > maxSnapshotsPerPayload {
+		t.logger.Warn("truncating snapshots to server limit",
+			"count", len(snapshots), "limit", maxSnapshotsPerPayload)
+		snapshots = snapshots[:maxSnapshotsPerPayload]
 	}
-
-	// Include latency information (including 0ms for sub-millisecond responses)
-	if t.lastLatencyMs >= 0 {
-		payload["agent_latency"] = t.lastLatencyMs
-	}
-
-	// Structured security snapshots. The server caps this array at 16
-	// entries and rejects the ENTIRE request if the cap is exceeded or a
-	// type is unrecognized, so truncate defensively rather than risk losing
-	// a cycle's metrics to a schema error.
 	if len(snapshots) > 0 {
-		if len(snapshots) > maxSnapshotsPerPayload {
-			t.logger.Warn("truncating snapshots to server limit",
-				"count", len(snapshots), "limit", maxSnapshotsPerPayload)
-			snapshots = snapshots[:maxSnapshotsPerPayload]
-		}
-		payload["snapshots"] = snapshots
+		p.Snapshots = snapshots
 	}
 
-	return payload
+	return p
 }
 
-// Close closes the transmitter.
+// Close drops pooled connections.
 func (t *HTTPTransmitter) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.httpClient != nil {
-		// Close idle connections
-		if transport, ok := t.httpClient.Transport.(*http.Transport); ok {
-			transport.CloseIdleConnections()
-		}
+	if transport, ok := t.httpClient.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
 	}
 	return nil
 }
+
+// LastStatus returns the HTTP status of the most recent reply, 0 when the
+// last attempt got none.
+func (t *HTTPTransmitter) LastStatus() int { return int(t.lastStatus.Load()) }

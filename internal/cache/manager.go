@@ -1,4 +1,4 @@
-// Package cache provides a centralized cache manager for all collectors.
+// Package cache is a TTL cache shared by the collectors.
 package cache
 
 import (
@@ -8,7 +8,7 @@ import (
 
 // Entry represents a cached value with expiration.
 type Entry struct {
-	Value     interface{}
+	Value     any
 	ExpiresAt time.Time
 }
 
@@ -31,7 +31,7 @@ func NewManager() *Manager {
 }
 
 // Get retrieves a value from cache if not expired.
-func (m *Manager) Get(key string) (interface{}, bool) {
+func (m *Manager) Get(key string) (any, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -44,7 +44,7 @@ func (m *Manager) Get(key string) (interface{}, bool) {
 }
 
 // Set stores a value in cache with TTL.
-func (m *Manager) Set(key string, value interface{}, ttl time.Duration) {
+func (m *Manager) Set(key string, value any, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -52,22 +52,6 @@ func (m *Manager) Set(key string, value interface{}, ttl time.Duration) {
 		Value:     value,
 		ExpiresAt: time.Now().Add(ttl),
 	}
-}
-
-// Delete removes a value from cache.
-func (m *Manager) Delete(key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	delete(m.entries, key)
-}
-
-// Clear removes all entries from cache.
-func (m *Manager) Clear() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.entries = make(map[string]*Entry)
 }
 
 // CleanExpired removes expired entries.
@@ -102,34 +86,17 @@ func (m *Manager) StartCleanup(interval time.Duration) chan struct{} {
 	return stop
 }
 
-// Size returns the number of entries in cache.
-func (m *Manager) Size() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.entries)
-}
-
 // Global cache instance for all collectors.
 var globalCache = NewManager()
 
 // Get retrieves from global cache.
-func Get(key string) (interface{}, bool) {
+func Get(key string) (any, bool) {
 	return globalCache.Get(key)
 }
 
 // Set stores in global cache.
-func Set(key string, value interface{}, ttl time.Duration) {
+func Set(key string, value any, ttl time.Duration) {
 	globalCache.Set(key, value, ttl)
-}
-
-// Delete removes from global cache.
-func Delete(key string) {
-	globalCache.Delete(key)
-}
-
-// Clear clears global cache.
-func Clear() {
-	globalCache.Clear()
 }
 
 // StartGlobalCleanup starts cleanup for global cache.

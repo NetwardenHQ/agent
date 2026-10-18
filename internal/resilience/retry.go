@@ -1,99 +1,65 @@
-// Package resilience provides simple retry logic for network operations.
+// Package resilience provides retry logic for network operations.
 package resilience
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
-// Retry performs a simple 3-attempt retry with fixed delays.
-func Retry(ctx context.Context, operation func() error) error {
-	maxAttempts := 3
-	delay := 2 * time.Second
+const (
+	maxAttempts = 3
+	retryDelay  = 2 * time.Second
+)
 
+// PermanentError marks a failure that retrying cannot fix, such as a rejected
+// credential or a payload the server refuses. Retry returns it at once.
+type PermanentError struct {
+	Err error
+}
+
+func (e *PermanentError) Error() string { return e.Err.Error() }
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+// Permanent wraps err so Retry stops on it.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PermanentError{Err: err}
+}
+
+// Retry runs operation up to three times with a fixed delay between
+// attempts. It stops early on a PermanentError or when ctx is done. The
+// returned error wraps the last failure.
+func Retry(ctx context.Context, operation func() error) error {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// Check context before attempting
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		// Try the operation
-		if err := operation(); err == nil {
-			return nil // Success
-		} else {
-			lastErr = err
+		err := operation()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		var permanent *PermanentError
+		if errors.As(err, &permanent) {
+			return permanent.Err
 		}
 
-		// Don't sleep after the last attempt
 		if attempt < maxAttempts {
+			timer := time.NewTimer(retryDelay)
 			select {
-			case <-time.After(delay):
-				// Continue to next attempt
+			case <-timer.C:
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
 			}
 		}
 	}
-
-	// Customize error message for authentication failures
-	if lastErr != nil && strings.Contains(lastErr.Error(), "authentication denied") {
-		// Extract the detail part after "authentication denied: "
-		errMsg := lastErr.Error()
-		if idx := strings.Index(errMsg, "authentication denied: "); idx >= 0 {
-			detail := errMsg[idx+len("authentication denied: "):]
-			return fmt.Errorf("authentication denied after %d attempts: %s", maxAttempts, detail)
-		}
-		return fmt.Errorf("authentication denied after %d attempts: %w", maxAttempts, lastErr)
-	}
-
 	return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
-}
-
-// RetryWithResult performs a simple retry for operations that return a value.
-func RetryWithResult[T any](ctx context.Context, operation func() (T, error)) (T, error) {
-	maxAttempts := 3
-	delay := 2 * time.Second
-
-	var zero T
-	var lastErr error
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// Check context before attempting
-		if ctx.Err() != nil {
-			return zero, ctx.Err()
-		}
-
-		// Try the operation
-		result, err := operation()
-		if err == nil {
-			return result, nil // Success
-		}
-		lastErr = err
-
-		// Don't sleep after the last attempt
-		if attempt < maxAttempts {
-			select {
-			case <-time.After(delay):
-				// Continue to next attempt
-			case <-ctx.Done():
-				return zero, ctx.Err()
-			}
-		}
-	}
-
-	// Customize error message for authentication failures
-	if lastErr != nil && strings.Contains(lastErr.Error(), "authentication denied") {
-		// Extract the detail part after "authentication denied: "
-		errMsg := lastErr.Error()
-		if idx := strings.Index(errMsg, "authentication denied: "); idx >= 0 {
-			detail := errMsg[idx+len("authentication denied: "):]
-			return zero, fmt.Errorf("authentication denied after %d attempts: %s", maxAttempts, detail)
-		}
-		return zero, fmt.Errorf("authentication denied after %d attempts: %w", maxAttempts, lastErr)
-	}
-
-	return zero, fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
 }

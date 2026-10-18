@@ -1,56 +1,82 @@
-// Package registry provides a simple collector registry for managing metric collectors.
+// Package registry holds the set of collectors and runs one collection cycle
+// across all of them.
 package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"time"
 
-	"netwarden/internal/collectors/pool"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// Registry is a simplified collector registry for managing metric collectors.
+// collectorTimeout bounds a single collector's Collect call. A collector that
+// ignores its context still cannot hold the cycle past this; its result is
+// dropped and logged, and the others proceed. It is a variable so tests can
+// shorten it.
+var collectorTimeout = 10 * time.Second
+
+// maxConcurrency caps how many collectors run at once. The collectors are
+// I/O-bound (procfs, sockets, a few exec'd tools), so a small number keeps
+// the agent's own CPU footprint flat on busy hosts while still overlapping
+// the slow ones.
+const maxConcurrency = 3
+
+// Registry is the collector set. It is safe for concurrent use.
 type Registry struct {
-	collectors     []metrics.Collector
-	mutex          sync.RWMutex
-	logger         *slog.Logger
-	workerPool     *pool.WorkerPool
-	poolStarted    bool
-	poolStartMutex sync.Mutex
+	mu         sync.RWMutex
+	collectors []metrics.Collector
+	logger     *slog.Logger
+
+	// inFlight marks collectors whose Collect has not returned yet, possibly
+	// from an earlier cycle that abandoned it. Such a collector is skipped
+	// rather than started again: a collector that ignores its context would
+	// otherwise gain one more stuck goroutine every cycle, and would run
+	// concurrently with itself, which none of them is written to survive.
+	flightMu sync.Mutex
+	inFlight map[string]bool
+	stuck    map[string]bool // skipped at least once since it last returned
 }
 
-// NewRegistry creates a new registry with concurrent collection support.
-func NewRegistry(logger *slog.Logger) metrics.Registry {
+// NewRegistry creates an empty registry.
+func NewRegistry(logger *slog.Logger) *Registry {
 	if logger == nil {
 		logger = slog.Default()
 	}
-
-	// Create worker pool for concurrent collection (but don't start it yet)
-	poolConfig := pool.DefaultWorkerPoolConfig()
-	poolConfig.Logger = logger.With("component", "worker_pool")
-	workerPool := pool.NewWorkerPool(poolConfig)
-
-	return &Registry{
-		collectors:  make([]metrics.Collector, 0),
-		logger:      logger,
-		workerPool:  workerPool,
-		poolStarted: false,
-	}
+	return &Registry{logger: logger, inFlight: map[string]bool{}}
 }
 
-// Register adds a collector to the registry.
+// claim marks name in flight. It reports false when a previous call is still
+// running.
+func (r *Registry) claim(name string) bool {
+	r.flightMu.Lock()
+	defer r.flightMu.Unlock()
+	if r.inFlight[name] {
+		return false
+	}
+	r.inFlight[name] = true
+	return true
+}
+
+func (r *Registry) release(name string) {
+	r.flightMu.Lock()
+	delete(r.inFlight, name)
+	r.flightMu.Unlock()
+}
+
+// Register adds a collector. Names must be unique.
 func (r *Registry) Register(collector metrics.Collector) error {
 	if collector == nil {
 		return fmt.Errorf("collector cannot be nil")
 	}
 
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	// Check for duplicates
 	name := collector.Name()
 	for _, existing := range r.collectors {
 		if existing.Name() == name {
@@ -63,122 +89,197 @@ func (r *Registry) Register(collector metrics.Collector) error {
 	return nil
 }
 
-// ensureWorkerPoolStarted starts the worker pool if not already started (lazy initialization).
-func (r *Registry) ensureWorkerPoolStarted(ctx context.Context) error {
-	// Fast path: check if already started
-	if r.poolStarted {
-		return nil
-	}
-
-	// Slow path: acquire lock and start pool
-	r.poolStartMutex.Lock()
-	defer r.poolStartMutex.Unlock()
-
-	// Double-check pattern
-	if r.poolStarted {
-		return nil
-	}
-
-	// Start the worker pool
-	if err := r.workerPool.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start worker pool: %w", err)
-	}
-
-	r.poolStarted = true
-	r.logger.Info("worker pool started on first collection")
-	return nil
+// result is one collector's outcome for a cycle.
+type result struct {
+	name     string
+	metrics  []metrics.Metric
+	err      error
+	duration time.Duration
 }
 
-// Unregister removes a collector from the registry.
-func (r *Registry) Unregister(name string) error {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-
-	for i, collector := range r.collectors {
-		if collector.Name() == name {
-			// Close the collector
-			if err := collector.Close(); err != nil {
-				r.logger.Warn("error closing collector", "name", name, "error", err)
-			}
-			// Remove from slice
-			r.collectors = append(r.collectors[:i], r.collectors[i+1:]...)
-			r.logger.Info("unregistered collector", "name", name)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("collector %s not found", name)
-}
-
-// CollectAll gathers metrics from all enabled collectors concurrently.
+// CollectAll runs every enabled collector for one cycle and returns the
+// combined metrics. Collectors run concurrently, at most maxConcurrency at a
+// time, each under collectorTimeout. A failing collector does not fail the
+// cycle: its error is folded into the returned error and the metrics from the
+// others are still returned, so the caller ships what it has.
+//
+// Each call is self-contained: goroutines, results and timeouts belong to
+// this cycle only, so a collector that outlives the deadline cannot deliver
+// its metrics into a later cycle.
+//
+// A collector still running from an earlier cycle is skipped and reported as
+// a failure until it returns; see Registry.inFlight.
 func (r *Registry) CollectAll(ctx context.Context) ([]metrics.Metric, error) {
-	r.mutex.RLock()
-	// Filter enabled collectors and make a copy to avoid holding lock during collection
-	var enabledCollectors []metrics.Collector
-	for _, collector := range r.collectors {
-		if collector.Enabled() {
-			enabledCollectors = append(enabledCollectors, collector)
+	r.mu.RLock()
+	enabled := make([]metrics.Collector, 0, len(r.collectors))
+	for _, c := range r.collectors {
+		if c.Enabled() {
+			enabled = append(enabled, c)
 		}
 	}
-	r.mutex.RUnlock()
+	r.mu.RUnlock()
 
-	if len(enabledCollectors) == 0 {
-		r.logger.Debug("no enabled collectors found")
-		return []metrics.Metric{}, nil
+	if len(enabled) == 0 {
+		return nil, nil
 	}
 
-	// Start worker pool on first use (lazy initialization)
-	if err := r.ensureWorkerPoolStarted(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start worker pool: %w", err)
+	// Everything this cycle starts, including goroutines still queued for a
+	// slot, ends with the cycle deadline as well as with the caller's ctx.
+	cycleCtx, cancelCycle := context.WithTimeout(ctx, cycleDeadline())
+	defer cancelCycle()
+
+	// results is written by the collector goroutines and read once the cycle
+	// is over. The mutex matters for the cycle that times out: an abandoned
+	// goroutine may still be finishing while this call reads.
+	var (
+		resultsMu sync.Mutex
+		results   = make([]result, len(enabled))
+		sem       = make(chan struct{}, maxConcurrency)
+		wg        sync.WaitGroup
+	)
+	store := func(i int, res result) {
+		resultsMu.Lock()
+		results[i] = res
+		resultsMu.Unlock()
 	}
 
-	r.logger.Debug("starting concurrent collection", "enabled_collectors", len(enabledCollectors))
-
-	// Use worker pool for concurrent collection
-	results := r.workerPool.CollectAll(ctx, enabledCollectors)
-
-	// Convert results to metrics and aggregate errors
-	var allMetrics []metrics.Metric
-	var collectionErrors []string
-
-	for _, result := range results {
-		if result.Error != nil {
-			r.logger.Warn("collector failed",
-				"collector", result.CollectorName,
-				"error", result.Error,
-				"duration", result.Duration)
-			collectionErrors = append(collectionErrors,
-				fmt.Sprintf("%s: %v", result.CollectorName, result.Error))
+	for i, c := range enabled {
+		name := c.Name()
+		if !r.claim(name) {
+			store(i, result{name: name, err: errStillRunning})
 			continue
 		}
-		allMetrics = append(allMetrics, result.Metrics...)
+		wg.Add(1)
+		go func(i int, c metrics.Collector) {
+			defer wg.Done()
+			defer r.release(name)
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-cycleCtx.Done():
+				store(i, result{name: name, err: cycleCtx.Err()})
+				return
+			}
+
+			cctx, cancel := context.WithTimeout(cycleCtx, collectorTimeout)
+			defer cancel()
+
+			start := time.Now()
+			m, err := c.Collect(cctx)
+			store(i, result{name: name, metrics: m, err: err, duration: time.Since(start)})
+		}(i, c)
 	}
 
-	// Return aggregated error if any collectors failed
-	if len(collectionErrors) > 0 {
-		return allMetrics, fmt.Errorf("partial collection failure (%d collectors failed): %v",
-			len(collectionErrors), collectionErrors)
+	// Wait under the cycle deadline so one collector that ignores its
+	// context cannot stall the cycle; its slot in results stays empty and
+	// the goroutine is abandoned to finish (or not) on its own.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-cycleCtx.Done():
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		r.logger.Error("collection cycle timed out; shipping partial results",
+			"timeout", cycleDeadline().String())
 	}
 
-	return allMetrics, nil
+	resultsMu.Lock()
+	finished := make([]result, len(results))
+	copy(finished, results)
+	resultsMu.Unlock()
+
+	var all []metrics.Metric
+	var failures []string
+	for _, res := range finished {
+		if res.name == "" {
+			continue // did not finish before the deadline
+		}
+		if res.err == errStillRunning {
+			// Logged once per stuck run, not once per cycle.
+			if r.noteStuck(res.name) {
+				r.logger.Warn("collector still running from an earlier cycle; skipping it until it returns",
+					"collector", res.name)
+			}
+			failures = append(failures, fmt.Sprintf("%s: %v", res.name, res.err))
+			continue
+		}
+		r.clearStuck(res.name)
+		if res.err != nil {
+			r.logger.Warn("collector failed",
+				"collector", res.name,
+				"error", res.err,
+				"duration", res.duration)
+			failures = append(failures, fmt.Sprintf("%s: %v", res.name, res.err))
+			continue
+		}
+		all = append(all, res.metrics...)
+	}
+
+	if len(failures) > 0 {
+		return all, fmt.Errorf("partial collection failure (%d collectors failed): %v",
+			len(failures), failures)
+	}
+	return all, nil
 }
 
-// Snapshots gathers structured snapshots from every collector implementing
-// metrics.SnapshotProvider. Collectors that produced nothing this cycle
-// return nil and are skipped.
+// errStillRunning marks a collector skipped because its previous Collect has
+// not returned.
+var errStillRunning = errors.New("still running from an earlier cycle; skipped")
+
+// noteStuck records that name was skipped and reports whether this is the
+// first skip of the current stuck run.
+func (r *Registry) noteStuck(name string) bool {
+	r.flightMu.Lock()
+	defer r.flightMu.Unlock()
+	if r.stuck == nil {
+		r.stuck = map[string]bool{}
+	}
+	if r.stuck[name] {
+		return false
+	}
+	r.stuck[name] = true
+	return true
+}
+
+func (r *Registry) clearStuck(name string) {
+	r.flightMu.Lock()
+	defer r.flightMu.Unlock()
+	if r.stuck[name] {
+		delete(r.stuck, name)
+		r.logger.Info("collector returned and is collecting again", "collector", name)
+	}
+}
+
+// cycleDeadline is the most a whole cycle may take. Windows gets longer: its
+// collectors go through WMI/COM, which is markedly slower than procfs. It is
+// a variable so tests can shorten it.
+var cycleDeadline = func() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 40 * time.Second
+	}
+	return 30 * time.Second
+}
+
+// Snapshots gathers structured snapshots from every enabled collector that
+// implements metrics.SnapshotProvider. Call it after CollectAll: it returns
+// what that cycle staged and does not collect anything itself.
 func (r *Registry) Snapshots() []metrics.Snapshot {
-	r.mutex.RLock()
+	r.mu.RLock()
 	collectors := make([]metrics.Collector, len(r.collectors))
 	copy(collectors, r.collectors)
-	r.mutex.RUnlock()
+	r.mu.RUnlock()
 
 	var out []metrics.Snapshot
 	for _, c := range collectors {
 		provider, ok := c.(metrics.SnapshotProvider)
-		if !ok {
-			continue
-		}
-		if !c.Enabled() {
+		if !ok || !c.Enabled() {
 			continue
 		}
 		for _, snap := range provider.Snapshots() {
@@ -193,76 +294,58 @@ func (r *Registry) Snapshots() []metrics.Snapshot {
 	return out
 }
 
-// ListCollectors returns the names of all registered collectors.
+// ListCollectors returns the registered collector names in registration order.
 func (r *Registry) ListCollectors() []string {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	names := make([]string, len(r.collectors))
-	for i, collector := range r.collectors {
-		names[i] = collector.Name()
+	for i, c := range r.collectors {
+		names[i] = c.Name()
 	}
 	return names
 }
 
-// GetCollector returns a collector by name, or nil if not found.
+// GetCollector returns the collector with the given name, or nil.
 func (r *Registry) GetCollector(name string) metrics.Collector {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	for _, collector := range r.collectors {
-		if collector.Name() == name {
-			return collector
+	for _, c := range r.collectors {
+		if c.Name() == name {
+			return c
 		}
 	}
 	return nil
 }
 
-// Close shuts down all collectors and the worker pool.
-func (r *Registry) Close() error {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-
-	// Stop the worker pool first (only if it was started)
-	if r.workerPool != nil && r.poolStarted {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := r.workerPool.Stop(ctx); err != nil {
-			r.logger.Warn("error stopping worker pool", "error", err)
-		}
-		r.workerPool = nil
-		r.poolStarted = false
-	}
-
-	// Close all collectors
-	var lastError error
-	for _, collector := range r.collectors {
-		if err := collector.Close(); err != nil {
-			r.logger.Error("error closing collector", "name", collector.Name(), "error", err)
-			lastError = err
-		}
-	}
-
-	r.collectors = nil
-	r.logger.Info("registry closed")
-	return lastError
-}
-
-// HealthCheck checks the health of all collectors.
+// HealthCheck runs HealthCheck on every collector that implements it.
 func (r *Registry) HealthCheck(ctx context.Context) map[string]error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	healthResults := make(map[string]error)
-	for _, collector := range r.collectors {
-		if healthChecker, ok := collector.(metrics.HealthChecker); ok {
-			healthResults[collector.Name()] = healthChecker.HealthCheck(ctx)
+	out := make(map[string]error)
+	for _, c := range r.collectors {
+		if hc, ok := c.(metrics.HealthChecker); ok {
+			out[c.Name()] = hc.HealthCheck(ctx)
 		}
 	}
-	return healthResults
+	return out
 }
 
-// GetStats returns empty stats (not needed in simplified version).
-func (r *Registry) GetStats() metrics.RegistryStats {
-	return metrics.RegistryStats{}
+// Close closes every collector. It returns the last error seen; every
+// collector is closed regardless.
+func (r *Registry) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var lastErr error
+	for _, c := range r.collectors {
+		if err := c.Close(); err != nil {
+			r.logger.Error("error closing collector", "name", c.Name(), "error", err)
+			lastErr = err
+		}
+	}
+	r.collectors = nil
+	return lastErr
 }

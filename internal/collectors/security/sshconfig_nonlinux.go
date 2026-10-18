@@ -1,16 +1,15 @@
-//go:build !linux && !darwin && !windows
+//go:build !linux && !darwin && !windows && !freebsd
 
 package security
 
 import (
 	"context"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // Enabled reports false on platforms with no sshd_config implementation.
-// Linux, macOS, and Windows are handled by sshconfig_impl.go; this stub
-// covers everything else.
+// Linux, macOS, FreeBSD and Windows are handled by sshconfig_impl.go.
 func (c *SSHConfigCollector) Enabled() bool {
 	return false
 }

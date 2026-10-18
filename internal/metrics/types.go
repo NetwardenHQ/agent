@@ -19,7 +19,6 @@ const (
 )
 
 // Metric represents a single metric data point with associated metadata.
-// All fields are strongly typed to eliminate interface{} usage.
 type Metric struct {
 	// Timestamp is when this metric was collected.
 	Timestamp time.Time `json:"timestamp"`
@@ -56,28 +55,38 @@ type Collector interface {
 
 // Snapshot is a structured, non-time-series observation shipped alongside
 // metrics in the /agent/data payload. Unlike a Metric (one float per point),
-// a snapshot carries a whole object — an sshd_config audit, the listening
-// socket table, the installed-package inventory — that the platform persists
-// verbatim into host_security_snapshots and feeds to its findings evaluator.
+// a snapshot carries a whole object, such as an sshd_config audit, the
+// listening socket table or the installed-package inventory, which the
+// platform stores verbatim and evaluates.
 //
-// Type MUST match one of the snapshot types the server accepts (see the
-// z.enum in platform/app/api/agent/data/route.ts and the SnapshotType union
-// in platform/lib/security/findings-types.ts). Unknown types are rejected by
-// the endpoint's schema validation, failing the whole request — so only emit
-// types the server knows.
+// Type must be one of the snapshot types the server accepts. The server
+// validates the payload as a whole, so an unknown type fails the entire
+// request.
 type Snapshot struct {
 	Type    string         `json:"type"`
 	Payload map[string]any `json:"payload"`
 }
 
-// Snapshot type identifiers. Keep in lockstep with the server-side
-// SnapshotType union; adding one here without adding it there breaks
-// ingestion for the entire payload, not just the snapshot.
+// Snapshot type identifiers. They must match the types the server accepts;
+// one the server does not know breaks ingestion of the entire payload, not
+// just the snapshot.
 const (
-	SnapshotSSHConfig         = "ssh_config"
-	SnapshotListeningPorts    = "listening_ports"
-	SnapshotInstalledPackages = "installed_packages"
-	SnapshotCISResults        = "cis_results"
+	SnapshotSSHConfig            = "ssh_config"
+	SnapshotListeningPorts       = "listening_ports"
+	SnapshotInstalledPackages    = "installed_packages"
+	SnapshotCISResults           = "cis_results"
+	SnapshotContainerImages      = "container_images"
+	SnapshotFileIntegrity        = "file_integrity"
+	SnapshotK8sHealthDelta       = "k8s_health_delta"
+	SnapshotK8sClusterHealth     = "k8s_cluster_health"
+	SnapshotK8sComponentVersions = "k8s_component_versions"
+	SnapshotK8sInventory         = "k8s_inventory"
+	SnapshotK8sCronJobs          = "k8s_cronjobs"
+	SnapshotK8sCNPG              = "k8s_cnpg"
+	SnapshotK8sIngress           = "k8s_ingress"
+	SnapshotEvents               = "events"
+	SnapshotNetworkExposure      = "network_exposure"
+	SnapshotDeviceIdentity       = "device_identity"
 )
 
 // SnapshotProvider is an optional interface for collectors that produce
@@ -85,11 +94,12 @@ const (
 //
 // Contract: Snapshots() is called by the registry immediately after
 // CollectAll() completes, and returns whatever the most recent Collect()
-// produced. Returning nil is normal and means "nothing new this cycle" —
+// produced. Returning nil is normal and means "nothing new this cycle":
 // collectors that run on a slower cadence than the reporting interval (the
 // package inventory, for instance) return nil on intervening cycles rather
 // than re-shipping an unchanged payload. Implementations must be safe for
-// concurrent use, since Collect() runs on the worker pool.
+// concurrent use: Collect() runs on a collection goroutine and Snapshots()
+// on the agent's.
 type SnapshotProvider interface {
 	Snapshots() []Snapshot
 }
@@ -115,16 +125,13 @@ type ConnectionManager interface {
 	IsConnected() bool
 }
 
-// Registry manages a collection of metric collectors and orchestrates their execution.
+// Registry manages a collection of metric collectors and runs collection cycles.
 type Registry interface {
-	// Register adds a collector to the registry with validation.
+	// Register adds a collector. Names must be unique.
 	Register(collector Collector) error
 
-	// Unregister removes a collector from the registry.
-	Unregister(name string) error
-
-	// CollectAll gathers metrics from all enabled collectors.
-	// Collection happens concurrently with proper error handling.
+	// CollectAll runs every enabled collector for one cycle and returns the
+	// combined metrics. Collectors run concurrently.
 	CollectAll(ctx context.Context) ([]Metric, error)
 
 	// ListCollectors returns the names of all registered collectors.
@@ -134,8 +141,8 @@ type Registry interface {
 	GetCollector(name string) Collector
 
 	// Snapshots gathers structured snapshots from every registered collector
-	// implementing SnapshotProvider. Call after CollectAll() — it returns
-	// what the last collection cycle produced, it does not itself collect.
+	// implementing SnapshotProvider. Call it after CollectAll(): it returns
+	// what the last collection cycle produced and does not collect itself.
 	Snapshots() []Snapshot
 
 	// HealthCheck checks the health of all collectors that implement HealthChecker.
@@ -143,28 +150,4 @@ type Registry interface {
 
 	// Close shuts down all collectors gracefully.
 	Close() error
-
-	// GetStats returns registry statistics for monitoring.
-	GetStats() RegistryStats
-}
-
-// RegistryStats provides registry operational statistics.
-type RegistryStats struct {
-	// TotalCollectors is the number of registered collectors.
-	TotalCollectors int `json:"total_collectors"`
-
-	// EnabledCollectors is the number of enabled collectors.
-	EnabledCollectors int `json:"enabled_collectors"`
-
-	// LastCollectionDuration is the time taken for the last collection cycle.
-	LastCollectionDuration time.Duration `json:"last_collection_duration"`
-
-	// TotalCollections is the total number of collection cycles performed.
-	TotalCollections int64 `json:"total_collections"`
-
-	// FailedCollections is the number of failed collection cycles.
-	FailedCollections int64 `json:"failed_collections"`
-
-	// LastCollectionTime is when the last collection occurred.
-	LastCollectionTime time.Time `json:"last_collection_time"`
 }

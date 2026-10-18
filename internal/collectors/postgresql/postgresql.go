@@ -6,52 +6,17 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL driver
-	"netwarden/internal/config"
-	"netwarden/internal/metrics"
+
+	"github.com/NetwardenHQ/agent/internal/config"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
-
-// pgCache provides caching for PostgreSQL stats to reduce query load.
-type pgCache struct {
-	stats    map[string]interface{}
-	cachedAt time.Time
-	ttl      time.Duration
-	mutex    sync.RWMutex
-}
-
-// newPGCache creates a new PostgreSQL cache with 30-second TTL.
-func newPGCache() *pgCache {
-	return &pgCache{
-		ttl:   30 * time.Second,
-		stats: make(map[string]interface{}),
-	}
-}
-
-// get retrieves cached stats if they're still valid.
-func (c *pgCache) get() (map[string]interface{}, bool) {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	if time.Since(c.cachedAt) > c.ttl {
-		return nil, false
-	}
-	return c.stats, true
-}
-
-// set stores stats in the cache.
-func (c *pgCache) set(stats map[string]interface{}) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.stats = stats
-	c.cachedAt = time.Now()
-}
 
 // Collector implements metrics.Collector for PostgreSQL metrics.
 type Collector struct {
@@ -59,7 +24,6 @@ type Collector struct {
 	hostname string
 	logger   *slog.Logger
 	db       *sql.DB
-	cache    *pgCache
 
 	// Distribution-aware socket paths
 	socketPaths    []string
@@ -83,7 +47,6 @@ func NewCollector(cfg config.DatabaseConfig, hostname string, opts ...CollectorO
 		config:   cfg,
 		hostname: hostname,
 		logger:   slog.Default().With("component", "postgresql_collector"),
-		cache:    newPGCache(),
 		socketPaths: []string{
 			// Most distributions
 			"/var/run/postgresql",
@@ -144,59 +107,72 @@ func (c *Collector) connect() error {
 }
 
 // buildConnStr constructs the PostgreSQL connection string.
+//
+// Every value is quoted (pqQuote), so a password with a space, quote or
+// "key=value" text in it stays one value instead of rewriting the options.
+// sslmode is disable for a unix socket or a loopback host and prefer (TLS
+// when the server offers it) for anything else; lib/pq supports prefer.
 func (c *Collector) buildConnStr() string {
 	database := c.config.PostgreSQLDatabase
 	if database == "" {
 		database = "postgres"
 	}
 
-	// Default to TCP connection (simpler, works everywhere, no pg_hba.conf changes needed)
-	// Only use socket if user explicitly configured postgresql_socket path
+	// TCP unless postgresql_socket names a socket explicitly; TCP needs no
+	// pg_hba.conf changes on a default install.
 	useSocket := c.config.PostgreSQLSocket != "" && c.config.PostgreSQLSocket != "auto" && !c.isWindows
 
-	if c.config.PostgreSQLUser != "" {
-		// Use credentials if provided
-		if useSocket {
-			return fmt.Sprintf("host=%s user=%s password=%s dbname=%s sslmode=disable",
-				c.config.PostgreSQLSocket, c.config.PostgreSQLUser, c.config.PostgreSQLPassword, database)
-		} else {
-			// Default: TCP connection to localhost:5432
-			// Parse host:port if provided, otherwise default to localhost:5432
-			host := c.config.PostgreSQLHost
-			port := "5432"
-			if host == "" {
-				host = "localhost"
-			} else {
-				// Split host:port if provided
-				parts := strings.SplitN(host, ":", 2)
-				if len(parts) == 2 {
-					host = parts[0]
-					port = parts[1]
-				}
-			}
-			return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-				host, port, c.config.PostgreSQLUser, c.config.PostgreSQLPassword, database)
-		}
+	var kv []string
+	add := func(key, value string) { kv = append(kv, key+"="+pqQuote(value)) }
+
+	if useSocket {
+		add("host", c.config.PostgreSQLSocket)
 	} else {
-		// Try connection without credentials (usually won't work)
-		if useSocket {
-			return fmt.Sprintf("host=%s dbname=%s sslmode=disable", c.config.PostgreSQLSocket, database)
-		} else {
-			host := c.config.PostgreSQLHost
-			port := "5432"
-			if host == "" {
-				host = "localhost"
-			} else {
-				// Split host:port if provided
-				parts := strings.SplitN(host, ":", 2)
-				if len(parts) == 2 {
-					host = parts[0]
-					port = parts[1]
-				}
-			}
-			return fmt.Sprintf("host=%s port=%s dbname=%s sslmode=disable", host, port, database)
+		// postgresql_host defaults to localhost:5432 and may carry a port ("db:6543", "[::1]:6543").
+		host, port := c.config.PostgreSQLHost, "5432"
+		if host == "" {
+			host = "localhost"
+		} else if h, p, err := net.SplitHostPort(host); err == nil {
+			host, port = h, p
 		}
+		add("host", host)
+		add("port", port)
 	}
+	// Without credentials the connection usually fails, but it is tried.
+	if c.config.PostgreSQLUser != "" {
+		add("user", c.config.PostgreSQLUser)
+		add("password", c.config.PostgreSQLPassword)
+	}
+	add("dbname", database)
+
+	sslmode := "prefer"
+	if useSocket || isLoopbackHost(c.config.PostgreSQLHost) {
+		sslmode = "disable"
+	}
+	add("sslmode", sslmode)
+	return strings.Join(kv, " ")
+}
+
+// pqQuote quotes a libpq key/value connection-string value: single quotes,
+// with backslash and single quote backslash-escaped.
+func pqQuote(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return "'" + r.Replace(v) + "'"
+}
+
+// isLoopbackHost reports whether a configured host (optionally host:port) is
+// this machine. Empty means the localhost default.
+func isLoopbackHost(hostPort string) bool {
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Name returns the collector name.
@@ -391,7 +367,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 
 	} else {
-		// No connection, just report that PostgreSQL is running
+		// No connection: report only that PostgreSQL is running.
 		collected = append(collected, metrics.Metric{
 			Name:      "postgresql_connection_failed",
 			Value:     1,
@@ -626,12 +602,12 @@ func (c *Collector) HealthCheck(ctx context.Context) error {
 	hasProcess := c.checkProcess()
 
 	if !hasSocket && !hasProcess {
-		// PostgreSQL is not installed or running - this is not an error, just log info
+		// PostgreSQL is not installed or not running, which is not an error.
 		c.logger.Info("No PostgreSQL service detected")
 		return nil
 	}
 
-	// PostgreSQL appears to be installed, now check if we can connect
+	// PostgreSQL appears to be installed; check whether it accepts a connection.
 	if c.db != nil {
 		// Try a simple query
 		var result int

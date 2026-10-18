@@ -3,24 +3,28 @@ package agent
 import (
 	"log/slog"
 
-	"netwarden/internal/collectors/cis"
-	"netwarden/internal/collectors/security"
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/collectors/cis"
+	"github.com/NetwardenHQ/agent/internal/collectors/fim"
+	"github.com/NetwardenHQ/agent/internal/collectors/opnsense"
+	"github.com/NetwardenHQ/agent/internal/collectors/security"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // registerSecurityCollectors wires up the security-posture collectors on every
 // platform. Each collector reports its own Enabled() based on whether the
-// current OS has an implementation, and the registry skips disabled ones — so
-// registering unconditionally here is safe and keeps the platform matrix in
-// one place (the collector) rather than split across registration sites.
+// current OS has an implementation, and the registry skips disabled ones, so
+// registering unconditionally is safe and keeps the platform matrix in one
+// place (the collector) rather than split across registration sites.
 //
-// Coverage as of this revision:
+// Coverage:
 //
 //	security_ports      Linux (ss/netstat), macOS + Windows (gopsutil)
 //	security_sshconfig  Linux, macOS, Windows (OpenSSH config syntax is shared)
 //	security_auth       Linux only (journald / auth.log / secure)
 //	security_packages   Linux only (dpkg / rpm)
 //	cis                 Linux only, and only once a profile is defined in the UI
+//	fim                 Linux, macOS, Windows, FreeBSD; opt-in, periodic + real-time integrity monitoring
+//	opnsense            OPNsense firewalls only (inactive on any other host)
 //
 // Registration failures are logged and skipped rather than aborting agent
 // startup: losing a posture collector should never take resource monitoring
@@ -50,6 +54,29 @@ func (a *Agent) registerSecurityCollectors(collectorLogger *slog.Logger) {
 		a.registerSecurityCollector("security_ports", c)
 	}
 
+	if a.config.Collectors.FIM {
+		opts := []fim.Option{
+			fim.WithLogger(collectorLogger.With("type", "fim")),
+			fim.WithRealtime(a.config.FIMRealtime),
+		}
+		if a.config.FIMManifestPath != "" {
+			opts = append(opts, fim.WithManifestPath(a.config.FIMManifestPath))
+		}
+		if len(a.config.FIMRoots) > 0 {
+			opts = append(opts, fim.WithRoots(a.config.FIMRoots))
+		}
+		a.registerSecurityCollector("fim", fim.NewCollector(a.hostname, opts...))
+	}
+
+	if a.config.Collectors.OPNsense {
+		c := opnsense.NewCollector(
+			a.hostname,
+			opnsense.WithLogger(collectorLogger.With("type", "opnsense")),
+		)
+		a.opnsenseCollector = c
+		a.registerSecurityCollector("opnsense", c)
+	}
+
 	if a.config.Collectors.CIS {
 		c := cis.NewCollector(
 			a.hostname,
@@ -63,6 +90,7 @@ func (a *Agent) registerSecurityCollectors(collectorLogger *slog.Logger) {
 		c := security.NewPackagesCollector(
 			a.hostname,
 			security.WithPackagesLogger(collectorLogger.With("type", "security_packages")),
+			security.WithLangPackages(a.config.Collectors.SecurityLangPackages, a.config.LangPackageRoots),
 		)
 		a.registerSecurityCollector("security_packages", c)
 	}

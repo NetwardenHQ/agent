@@ -1,6 +1,5 @@
-// Package security: cross-platform shell of the listening-port audit collector.
-// The Linux-specific data gathering lives in ports_linux.go; non-Linux builds
-// get a no-op shell from ports_nonlinux.go.
+// Cross-platform part of the listening-port audit collector. Socket
+// enumeration lives in the per-platform ports_*.go files.
 package security
 
 import (
@@ -10,24 +9,29 @@ import (
 	"sync"
 	"time"
 
-	"netwarden/internal/metrics"
+	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
 // PortsCollector enumerates listening TCP/UDP sockets and emits aggregate
 // gauges plus a single snapshot metric carrying the per-socket payload as a
-// JSON-encoded label value (see snapshotLabel constant). Cadence: every 5
-// minutes — runtime listening state changes rarely.
+// JSON-encoded label value (see snapshotLabel). A full enumeration runs every
+// PortsCollectionInterval, since listening state changes rarely.
 type PortsCollector struct {
 	hostname string
 	logger   *slog.Logger
 	builder  metrics.MetricBuilder
 
-	// Snapshot handoff. Collect() runs on the worker pool and stores the
-	// listening-socket table here; Snapshots() is called afterwards on the
-	// agent goroutine and drains it. Guarded because those are different
-	// goroutines.
+	// Snapshot handoff. Collect() stores the socket table from a collection
+	// goroutine; Snapshots() drains it from the agent goroutine.
 	mu      sync.Mutex
 	pending *metrics.Snapshot
+
+	// Cadence. Enumerating sockets means exec'ing `ss` (sockstat on FreeBSD)
+	// and shipping the whole socket table, which is costly at a reporting
+	// interval as short as ten seconds. Between full runs the last gauges are
+	// re-emitted under a fresh timestamp and no snapshot is staged.
+	lastFull   time.Time
+	lastGauges []metrics.Metric
 }
 
 // NewPortsCollector creates a new listening-port audit collector.
@@ -68,23 +72,20 @@ func (c *PortsCollector) Close() error {
 	return nil
 }
 
-// PortsCollectionInterval documents the slowest acceptable cadence for
-// listening-port auditing. This collector deliberately runs on the agent's
-// global reporting interval (default 60s) instead: `ss` is a single cheap
-// exec, the snapshot is a few KB, and a newly exposed management port is the
-// finding that most needs to be caught quickly. The constant is the ceiling
-// a future per-collector scheduler must not exceed, not the current cadence.
+// PortsCollectionInterval is how often the socket table is actually
+// enumerated and a listening_ports snapshot shipped; see the cadence note on
+// PortsCollector. Collect still runs every reporting interval, but between
+// full runs it only re-emits the last gauges under a fresh timestamp.
 const PortsCollectionInterval = 5 * time.Minute
 
-// Canonical protocol values. The platform contract (ListeningPortEntry.proto
-// in lib/security/findings-types.ts) expects exactly "tcp" or "udp".
+// Canonical protocol values. The platform accepts exactly "tcp" or "udp".
 const (
 	protoTCP = "tcp"
 	protoUDP = "udp"
 )
 
-// listeningSocket describes a single listening socket. Field tags are
-// shared with the platform-side payload contract — keep them stable.
+// listeningSocket describes a single listening socket. The JSON tags are
+// part of the agent API and must stay stable.
 type listeningSocket struct {
 	Proto       string `json:"proto"`        // "tcp" | "udp"
 	Port        int    `json:"port"`         // 0..65535
@@ -94,8 +95,7 @@ type listeningSocket struct {
 }
 
 // managementPorts is the canonical list of high-value management ports
-// flagged when bound publicly. Mirrors the spec exactly — keep in sync with
-// platform-side CVE/exposure rules.
+// flagged when bound publicly. It must match the platform's exposure rules.
 var managementPorts = map[int]string{
 	22:    "ssh",
 	3389:  "rdp",
@@ -123,11 +123,10 @@ func isPublicBindAddr(addr string) bool {
 // stripZone removes a scope/zone identifier from a bind address.
 //
 // The kernel appends "%<iface>" when a socket is bound to a specific
-// interface — IPv6 link-local addresses always carry one (fe80::1%eth0), and
-// so do IPv4 sockets using SO_BINDTODEVICE, which is how dnsmasq on a libvirt
-// bridge shows up as "0.0.0.0%virbr0". Without stripping, such a wildcard
-// bind matched neither the public nor the loopback case and silently fell out
-// of both counters — observed live on a host running libvirt.
+// interface. IPv6 link-local addresses always carry one (fe80::1%eth0), and
+// so do IPv4 sockets using SO_BINDTODEVICE, such as dnsmasq on a libvirt
+// bridge ("0.0.0.0%virbr0"). Unstripped, such a wildcard bind would match
+// neither the public nor the loopback case.
 func stripZone(addr string) string {
 	if i := strings.IndexByte(addr, '%'); i >= 0 {
 		return addr[:i]
@@ -142,8 +141,8 @@ func isLoopbackBindAddr(addr string) bool {
 	case "127.0.0.1", "::1":
 		return true
 	}
-	// The whole 127.0.0.0/8 range is loopback, not just 127.0.0.1 —
-	// systemd-resolved binds 127.0.0.53, for instance.
+	// The whole 127.0.0.0/8 range is loopback; systemd-resolved, for
+	// instance, binds 127.0.0.53.
 	return strings.HasPrefix(addr, "127.")
 }
 
@@ -196,7 +195,7 @@ func classifySockets(sockets []listeningSocket) (total, public, loopback, manage
 		}
 
 		// A management port counts as exposed when it is bound to anything
-		// other than loopback — a wildcard bind or a specific routable
+		// other than loopback: a wildcard bind and a specific routable
 		// address both reach the network.
 		name, isManagement := managementPorts[s.Port]
 		if !isManagement {
@@ -211,4 +210,29 @@ func classifySockets(sockets []listeningSocket) (total, public, loopback, manage
 	}
 
 	return total, public, loopback, management, managementParts
+}
+
+// cachedGauges returns the previous run's gauges re-stamped with now when the
+// last full enumeration is younger than PortsCollectionInterval, else nil.
+func (c *PortsCollector) cachedGauges(now time.Time) []metrics.Metric {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastFull.IsZero() || now.Sub(c.lastFull) >= PortsCollectionInterval || len(c.lastGauges) == 0 {
+		return nil
+	}
+	out := make([]metrics.Metric, len(c.lastGauges))
+	for i, m := range c.lastGauges {
+		m.Timestamp = now
+		out[i] = m
+	}
+	return out
+}
+
+// rememberGauges records a full run's gauges for re-emission until the next
+// full enumeration is due.
+func (c *PortsCollector) rememberGauges(at time.Time, gauges []metrics.Metric) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastFull = at
+	c.lastGauges = gauges
 }
