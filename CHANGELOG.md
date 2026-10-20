@@ -5,6 +5,14 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.2] - 2026-10-20
+
+### Fixed
+- Kubernetes: a failed Job kept as CronJob history (`failedJobsHistoryLimit`) no longer marks
+  the CronJob degraded once a later run has finished. The most recent finished run decides, so
+  `k8s_workloads_degraded`, `k8s_jobs_failing` and the related findings clear when the CronJob
+  recovers rather than when Kubernetes prunes the failed run.
+
 ## [3.1.1] - 2026-10-18
 
 ### Fixed

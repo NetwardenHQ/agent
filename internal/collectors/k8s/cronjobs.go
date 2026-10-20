@@ -66,19 +66,7 @@ func buildCronJobReport(cluster string, cronJobs []CronJob, jobs []Job, now time
 		}
 		key := j.Metadata.Namespace + "|" + owner
 
-		failed := false
-		finished := false
-		for _, c := range j.Status.Conditions {
-			if c.Status != "True" {
-				continue
-			}
-			switch c.Type {
-			case "Failed":
-				failed, finished = true, true
-			case "Complete":
-				finished = true
-			}
-		}
+		finished, failed := jobFinished(j)
 		if failed {
 			failures[key]++
 		}

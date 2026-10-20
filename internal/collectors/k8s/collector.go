@@ -1013,11 +1013,15 @@ func (c *Collector) observe(
 		})
 	}
 
+	superseded := supersededJobs(jobs)
 	for _, j := range jobs {
 		if c.skip(j.Metadata.Namespace) {
 			continue
 		}
 		hs := jobHealth(j)
+		if !hs.healthy && superseded[j.key()] {
+			hs = healthState{healthy: true}
+		}
 		surface := surfaceOf(j.key(), hs)
 		if !hs.healthy {
 			counts.jobsFailing++

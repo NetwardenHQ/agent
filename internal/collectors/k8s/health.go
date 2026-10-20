@@ -260,6 +260,61 @@ func jobHealth(j Job) healthState {
 	return healthState{true, "", ""}
 }
 
+// jobFinished reports whether a Job has finished, and whether it failed.
+func jobFinished(j Job) (finished, failed bool) {
+	for _, c := range j.Status.Conditions {
+		if c.Status != "True" {
+			continue
+		}
+		switch c.Type {
+		case "Failed":
+			return true, true
+		case "Complete":
+			finished = true
+		}
+	}
+	return finished, false
+}
+
+// supersededJobs returns the keys of failed Jobs that are not their owner's
+// most recent finished run. A CronJob keeps failed runs as history
+// (failedJobsHistoryLimit) after a later run succeeds; those Jobs describe the
+// past, not the CronJob's current state. Jobs without an owner are never
+// superseded.
+func supersededJobs(jobs []Job) map[string]bool {
+	type run struct {
+		key, owner string
+		when       time.Time
+	}
+	latest := map[string]time.Time{}
+	var failed []run
+	for _, j := range jobs {
+		owner := jobOwner(j)
+		done, didFail := jobFinished(j)
+		if owner == "" || !done {
+			continue
+		}
+		when, err := time.Parse(time.RFC3339, j.Metadata.CreationTimestamp)
+		if err != nil {
+			continue
+		}
+		owner = j.Metadata.Namespace + "|" + owner
+		if when.After(latest[owner]) {
+			latest[owner] = when
+		}
+		if didFail {
+			failed = append(failed, run{key: j.key(), owner: owner, when: when})
+		}
+	}
+	out := map[string]bool{}
+	for _, r := range failed {
+		if latest[r.owner].After(r.when) {
+			out[r.key] = true
+		}
+	}
+	return out
+}
+
 // jobOwner returns the Job's controller, usually the CronJob that created it, or
 // an empty string when it has none.
 func jobOwner(j Job) string {

@@ -13,7 +13,7 @@ The Netwarden agent is a small Go program that collects system, container,
 database, VM, Kubernetes and security-posture data and sends it to the
 Netwarden platform.
 
-[![Version](https://img.shields.io/badge/version-3.1.1-blue)](https://github.com/NetwardenHQ/agent/releases)
+[![Version](https://img.shields.io/badge/version-3.1.2-blue)](https://github.com/NetwardenHQ/agent/releases)
 [![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://golang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Code Signed](https://img.shields.io/badge/windows-code%20signed-blue?logo=windows)](https://github.com/NetwardenHQ/agent/releases)
@@ -116,28 +116,24 @@ sudo apt-get install -f
 ### macOS
 
 ```bash
-curl -LO https://get.netwarden.com/netwarden-latest-darwin-arm64.tar.gz   # Apple Silicon
-curl -LO https://get.netwarden.com/netwarden-latest-darwin-amd64.tar.gz   # Intel
-
-tar -xzf netwarden-latest-darwin-*.tar.gz
-cd netwarden-*-darwin-*
-sudo ./scripts/install.sh
+curl -fsSL https://get.netwarden.com/install.sh | sudo bash -s -- --tenant-id YOUR_TENANT_ID --api-key YOUR_API_KEY
 ```
 
-The installer copies the binary to `/usr/local/bin/netwarden` and the config
-template to `/usr/local/etc/netwarden/`. To install by hand instead:
+The installer verifies the download against the SHA-256 in
+`https://get.netwarden.com/latest.json`, installs `/usr/local/bin/netwarden`,
+writes `/etc/netwarden/netwarden.conf` (mode 600) and runs the agent as the
+launchd daemon `com.netwarden.agent`, which starts at boot. Re-running it
+upgrades in place and keeps the config.
 
 ```bash
-sudo install -m 755 bin/netwarden /usr/local/bin/netwarden
-sudo mkdir -p /usr/local/etc/netwarden
-sudo install -m 600 config/netwarden.conf /usr/local/etc/netwarden/
-sudo vim /usr/local/etc/netwarden/netwarden.conf
-
-netwarden --config /usr/local/etc/netwarden/netwarden.conf
+sudo launchctl print system/com.netwarden.agent          # status
+sudo launchctl kickstart -k system/com.netwarden.agent   # restart
 ```
 
-On macOS the built-in default config path is `/etc/netwarden/netwarden.conf`,
-so pass `--config` when the file lives under `/usr/local/etc`.
+To install by hand, take the tarball for your Mac
+(`netwarden-latest-macos-arm64.tar.gz` for Apple silicon,
+`netwarden-latest-macos-intel.tar.gz` for Intel); it contains the `netwarden`
+binary.
 
 ### Windows
 
