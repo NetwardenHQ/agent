@@ -52,6 +52,11 @@ type podmanPSEntry struct {
 	State   string            `json:"State"`
 	Labels  map[string]string `json:"Labels"`
 	Created int64             `json:"Created"`
+	// "Up 5 seconds (healthy)", "Exited (3) 5 seconds ago".
+	Status   string `json:"Status"`
+	ExitCode *int   `json:"ExitCode"`
+	Exited   bool   `json:"Exited"`
+	Restarts *int   `json:"Restarts"`
 }
 
 func (p *PodmanCLIClient) run(ctx context.Context, args ...string) ([]byte, error) {
@@ -83,6 +88,11 @@ func (p *PodmanCLIClient) ListContainers(ctx context.Context) ([]Container, erro
 		if len(e.Names) > 0 {
 			name = e.Names[0]
 		}
+		health, _ := parseStatus(e.Status)
+		var exitCode *int
+		if e.Exited {
+			exitCode = e.ExitCode
+		}
 		containers = append(containers, Container{
 			ID:      e.ID,
 			Name:    name,
@@ -90,9 +100,12 @@ func (p *PodmanCLIClient) ListContainers(ctx context.Context) ([]Container, erro
 			ImageID: normalizeImageID(e.ImageID), // bare hex here
 			// Podman and the socket client use the same state vocabulary
 			// ("running", "exited", "paused").
-			Status:  strings.ToLower(e.State),
-			Labels:  e.Labels,
-			Created: time.Unix(e.Created, 0),
+			Status:   strings.ToLower(e.State),
+			Labels:   e.Labels,
+			Created:  time.Unix(e.Created, 0),
+			Health:   health,
+			ExitCode: exitCode,
+			Restarts: e.Restarts,
 		})
 	}
 	return containers, nil

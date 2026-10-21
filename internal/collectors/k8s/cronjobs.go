@@ -37,7 +37,10 @@ type cronJobState struct {
 	LastSuccessful string `json:"last_successful,omitempty"`
 	// RFC3339, or empty when the schedule cannot be projected (e.g. @every).
 	NextRun string `json:"next_run,omitempty"`
-	Active  int    `json:"active"`
+	// spec.timeZone; empty means UTC. The UI recomputes a stale NextRun from
+	// Schedule in this zone.
+	TimeZone string `json:"time_zone,omitempty"`
+	Active   int    `json:"active"`
 	// Outcome of the most recent finished Job this CronJob owns.
 	LastOutcome string `json:"last_outcome,omitempty"` // succeeded | failed | (empty: never run)
 	FailedRuns  int    `json:"failed_runs"`
@@ -96,6 +99,9 @@ func buildCronJobReport(cluster string, cronJobs []CronJob, jobs []Job, now time
 			LastSchedule:   cj.Status.LastScheduleTime,
 			LastSuccessful: cj.Status.LastSuccessfulTime,
 			Active:         len(cj.Status.Active),
+		}
+		if cj.Spec.TimeZone != nil {
+			st.TimeZone = *cj.Spec.TimeZone
 		}
 
 		key := cj.Metadata.Namespace + "|CronJob/" + cj.Metadata.Name

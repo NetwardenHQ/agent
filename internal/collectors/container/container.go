@@ -107,9 +107,12 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 
 		// The container id in the metric name gives each container its own
 		// series.
-		if m, err := c.builder.GaugeWithLabels("container_status_"+shortID(ct.ID), status, c.labels(ct, runtime)); err == nil {
+		id := shortID(ct.ID)
+		labels := c.labels(ct, runtime)
+		if m, err := c.builder.GaugeWithLabels("container_status_"+id, status, labels); err == nil {
 			collected = append(collected, m)
 		}
+		collected = append(collected, c.stateMetrics(id, ct, labels)...)
 	}
 
 	collected = append(collected, c.collectStats(ctx, runtime, running)...)
@@ -118,6 +121,30 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		collected = append(collected, m)
 	}
 	return collected, nil
+}
+
+// stateMetrics reports what container_status_ cannot: the exact state, the
+// health check, the exit code of a stopped container and the restart count.
+// The values are numeric because the platform reads them without labels; the
+// codes are defined in container_state.go.
+func (c *Collector) stateMetrics(id string, ct Container, labels map[string]string) []metrics.Metric {
+	var out []metrics.Metric
+	add := func(name string, v float64) {
+		if m, err := c.builder.GaugeWithLabels(name+id, v, labels); err == nil {
+			out = append(out, m)
+		}
+	}
+	add("container_state_", stateCode(ct.Status))
+	if v, ok := healthCode(ct.Health); ok {
+		add("container_health_", v)
+	}
+	if ct.ExitCode != nil {
+		add("container_exit_code_", float64(*ct.ExitCode))
+	}
+	if ct.Restarts != nil {
+		add("container_restarts_", float64(*ct.Restarts))
+	}
+	return out
 }
 
 // labels is the label set shared by every series of one container.

@@ -21,6 +21,12 @@ type AuthCollector struct {
 
 	// One-time warning so we don't spam logs when log sources are unreadable.
 	warnOnce sync.Once
+
+	// windowEnd is where the last successful collection stopped reading.
+	// The next window starts there, so every event is counted exactly once
+	// whatever the collection interval. Zero until the first success.
+	mu        sync.Mutex
+	windowEnd time.Time
 }
 
 // NewAuthCollector creates a new failed-login collector.
@@ -108,10 +114,13 @@ func (c *AuthCollector) addGaugeWithLabels(out *[]metrics.Metric, name string, v
 }
 
 // emitMetrics produces the security_failed_logins_* gauge family from a stats
-// struct. Used by both the live path and the "permission denied / no source"
-// fallback path so we always report something (even zeros).
+// struct, plus security_auth_log_readable = 1. It is only called when a log
+// source was read: an unreadable host reports security_auth_log_readable = 0
+// and no counts, because a zero would claim nobody tried to log in.
 func (c *AuthCollector) emitMetrics(stats authStats, ts time.Time) []metrics.Metric {
-	out := make([]metrics.Metric, 0, 4)
+	out := make([]metrics.Metric, 0, 5)
+
+	c.addGauge(&out, "security_auth_log_readable", 1, ts)
 
 	c.addGauge(&out, "security_failed_logins", float64(stats.FailedAttempts), ts)
 	c.addGauge(&out, "security_failed_logins_unique_users", float64(stats.UniqueUsers), ts)

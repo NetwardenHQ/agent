@@ -126,7 +126,9 @@ func (d *DockerCompatibleClient) IsAvailable() bool {
 
 // ListContainers retrieves all containers from the runtime daemon.
 func (d *DockerCompatibleClient) ListContainers(ctx context.Context) ([]Container, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://runtime/containers/json", nil)
+	// all=true: without it the endpoint lists running containers only, and a
+	// container that crashed would vanish instead of reporting as exited.
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://runtime/containers/json?all=true", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -154,14 +156,20 @@ func (d *DockerCompatibleClient) ListContainers(ctx context.Context) ([]Containe
 		} else if len(ac.ID) > 12 {
 			name = ac.ID[:12]
 		}
+		health, exitCode := parseStatus(ac.Status)
+		if ac.State != "exited" && ac.State != "dead" {
+			exitCode = nil
+		}
 		containers[i] = Container{
-			ID:      ac.ID,
-			Name:    name,
-			Image:   ac.Image,
-			ImageID: normalizeImageID(ac.ImageID),
-			Status:  ac.State,
-			Labels:  ac.Labels,
-			Created: time.Unix(ac.Created, 0),
+			ID:       ac.ID,
+			Name:     name,
+			Image:    ac.Image,
+			ImageID:  normalizeImageID(ac.ImageID),
+			Status:   ac.State,
+			Labels:   ac.Labels,
+			Created:  time.Unix(ac.Created, 0),
+			Health:   health,
+			ExitCode: exitCode,
 		}
 	}
 

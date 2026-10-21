@@ -175,3 +175,20 @@ func TestCronReportInputsHonorExclusions(t *testing.T) {
 		t.Fatalf("got %+v", jobs)
 	}
 }
+
+// The UI recomputes a stale next run from the schedule, so it needs the zone
+// the schedule is read in.
+func TestReportCarriesTimeZone(t *testing.T) {
+	job := cj("app", "report", "0 8 * * *", false)
+	tz := "Asia/Tokyo"
+	job.Spec.TimeZone = &tz
+	plain := cj("app", "plain", "0 8 * * *", false)
+	r := buildCronJobReport("c", []CronJob{job, plain}, nil, at("2026-09-14T09:00:00Z"))
+	got := map[string]string{}
+	for _, s := range r.CronJobs {
+		got[s.Name] = s.TimeZone
+	}
+	if got["report"] != "Asia/Tokyo" || got["plain"] != "" {
+		t.Errorf("time zones = %v, want report=Asia/Tokyo, plain empty", got)
+	}
+}

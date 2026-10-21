@@ -63,6 +63,17 @@ type Collector struct {
 	db       *sql.DB
 	cache    *mysqlCache
 
+	// active is set once, at construction, when MySQL is enabled in the
+	// config or a server process was found. It does not depend on the
+	// connection: a server the agent cannot reach still reports mysql_up and
+	// mysql_connection_failed, which is the point of watching it.
+	active bool
+	// processRunning replaces checkProcess in tests.
+	processRunning func() bool
+	// connFailing remembers that the last connection attempt failed, so the
+	// failure is logged once rather than every cycle.
+	connFailing bool
+
 	// Distribution-aware socket paths
 	socketPaths    []string
 	detectedSocket string
@@ -105,10 +116,15 @@ func NewCollector(cfg config.DatabaseConfig, hostname string, opts ...CollectorO
 		opt(collector)
 	}
 
-	// Auto-detect if MySQL is running
+	// Monitor when enabled in the config or when a local server is running.
 	if collector.detectMySQL() {
 		collector.logger.Info("MySQL/MariaDB process detected, enabling monitoring")
-		collector.connect()
+		collector.active = true
+	} else if cfg.EnableMySQL {
+		collector.active = true
+	}
+	if collector.active {
+		_ = collector.connect()
 	}
 
 	return collector
@@ -197,14 +213,40 @@ func (c *Collector) Name() string {
 	return "mysql"
 }
 
-// Enabled returns whether the collector is enabled.
+// Enabled reports whether MySQL is monitored on this host: configured, or
+// detected at startup. Reachability is reported by Collect, not here; a
+// collector that disabled itself on a failed ping could never say the
+// database is down.
 func (c *Collector) Enabled() bool {
-	if c.db == nil {
-		return false
+	return c.active
+}
+
+// ensureConnected returns a live connection, reconnecting when the previous
+// one was lost or never made.
+func (c *Collector) ensureConnected(ctx context.Context) error {
+	if c.db != nil {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := c.db.PingContext(pingCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		c.db.Close()
+		c.db = nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return c.db.PingContext(ctx) == nil
+	return c.connect()
+}
+
+// maxConnections reads the server's connection limit.
+func (c *Collector) maxConnections(ctx context.Context) (float64, error) {
+	var n sql.NullInt64
+	if err := c.db.QueryRowContext(ctx, "SELECT @@GLOBAL.max_connections").Scan(&n); err != nil {
+		return 0, err
+	}
+	if !n.Valid || n.Int64 <= 0 {
+		return 0, fmt.Errorf("max_connections not set")
+	}
+	return float64(n.Int64), nil
 }
 
 // Collect gathers MySQL metrics.
@@ -213,7 +255,11 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 	timestamp := time.Now()
 
 	// Basic health check - is MySQL running?
-	isRunning := c.checkProcess()
+	running := c.checkProcess
+	if c.processRunning != nil {
+		running = c.processRunning
+	}
+	isRunning := running()
 	collected = append(collected, metrics.Metric{
 		Name:      "mysql_up",
 		Value:     boolToFloat(isRunning),
@@ -227,124 +273,118 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		return collected, nil
 	}
 
-	// If we have a database connection, collect detailed metrics
-	if c.db != nil {
-		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		if err := c.db.PingContext(pingCtx); err == nil {
-			stats, err := c.collectStats(ctx)
-			if err != nil {
-				c.logger.Warn("failed to collect MySQL stats", "error", err)
-				// Try to reconnect
-				c.db.Close()
-				if reconnectErr := c.connect(); reconnectErr != nil {
-					c.logger.Error("failed to reconnect to MySQL", "error", reconnectErr)
-				}
-			} else {
-				// Connection metrics
-				if val, ok := stats["Threads_connected"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_connections_current",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+	if err := c.ensureConnected(ctx); err != nil {
+		if !c.connFailing {
+			c.logger.Warn("MySQL is running but the agent cannot connect; reporting mysql_connection_failed", "error", err)
+		}
+		c.connFailing = true
+		collected = append(collected, c.gauge("mysql_connection_failed", 1, timestamp))
+		return collected, nil
+	}
+	if c.connFailing {
+		c.logger.Info("MySQL connection restored")
+	}
+	c.connFailing = false
+	collected = append(collected, c.gauge("mysql_connection_failed", 0, timestamp))
 
-				if val, ok := stats["Max_used_connections"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_connections_max_used",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+	stats, err := c.collectStats(ctx)
+	if err != nil {
+		c.logger.Warn("failed to collect MySQL stats", "error", err)
+		// Try to reconnect
+		c.db.Close()
+		c.db = nil
+		if reconnectErr := c.connect(); reconnectErr != nil {
+			c.logger.Error("failed to reconnect to MySQL", "error", reconnectErr)
+		}
+	} else {
+		// Connection metrics
+		if val, ok := stats["Threads_connected"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_connections_current",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				// Query metrics
-				if val, ok := stats["Queries"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_queries_total",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+		// The limit, so connections can be judged as a share of it. A full
+		// server refuses new clients with "Too many connections".
+		if limit, err := c.maxConnections(ctx); err == nil {
+			collected = append(collected, c.gauge("mysql_max_connections", limit, timestamp))
+			if val, ok := stats["Threads_connected"]; ok {
+				collected = append(collected, c.gauge("mysql_connections_used_percent", val/limit*100, timestamp))
+			}
+		} else {
+			c.logger.Debug("could not read max_connections", "error", err)
+		}
 
-				if val, ok := stats["Slow_queries"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_slow_queries_total",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+		if val, ok := stats["Max_used_connections"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_connections_max_used",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				// InnoDB buffer pool metrics
-				if val, ok := stats["Innodb_buffer_pool_read_requests"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_innodb_buffer_pool_read_requests",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+		// Query metrics
+		if val, ok := stats["Queries"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_queries_total",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				if val, ok := stats["Innodb_buffer_pool_reads"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_innodb_buffer_pool_reads",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+		if val, ok := stats["Slow_queries"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_slow_queries_total",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				// Calculate buffer pool hit ratio
-				if requests, ok1 := stats["Innodb_buffer_pool_read_requests"]; ok1 {
-					if reads, ok2 := stats["Innodb_buffer_pool_reads"]; ok2 {
-						if requests > 0 {
-							hitRatio := (1 - (reads / requests)) * 100
-							collected = append(collected, metrics.Metric{
-								Name:      "mysql_buffer_pool_hit_ratio",
-								Value:     hitRatio,
-								Timestamp: timestamp,
-								Labels: map[string]string{
-									"host": c.hostname,
-								},
-							})
-						}
-					}
-				}
+		// InnoDB buffer pool metrics
+		if val, ok := stats["Innodb_buffer_pool_read_requests"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_innodb_buffer_pool_read_requests",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				// Table locks
-				if val, ok := stats["Table_locks_waited"]; ok {
-					collected = append(collected, metrics.Metric{
-						Name:      "mysql_table_locks_waited",
-						Value:     val,
-						Timestamp: timestamp,
-						Labels: map[string]string{
-							"host": c.hostname,
-						},
-					})
-				}
+		if val, ok := stats["Innodb_buffer_pool_reads"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_innodb_buffer_pool_reads",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 
-				// Replication lag (if replica)
-				lag, err := c.getReplicationLag(ctx)
-				if err == nil && lag >= 0 {
+		// Calculate buffer pool hit ratio
+		if requests, ok1 := stats["Innodb_buffer_pool_read_requests"]; ok1 {
+			if reads, ok2 := stats["Innodb_buffer_pool_reads"]; ok2 {
+				if requests > 0 {
+					hitRatio := (1 - (reads / requests)) * 100
 					collected = append(collected, metrics.Metric{
-						Name:      "mysql_replication_lag_seconds",
-						Value:     lag,
+						Name:      "mysql_buffer_pool_hit_ratio",
+						Value:     hitRatio,
 						Timestamp: timestamp,
 						Labels: map[string]string{
 							"host": c.hostname,
@@ -353,19 +393,44 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 				}
 			}
 		}
-	} else {
-		// No connection: report only that MySQL is running.
-		collected = append(collected, metrics.Metric{
-			Name:      "mysql_connection_failed",
-			Value:     1,
-			Timestamp: timestamp,
-			Labels: map[string]string{
-				"host": c.hostname,
-			},
-		})
+
+		// Table locks
+		if val, ok := stats["Table_locks_waited"]; ok {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_table_locks_waited",
+				Value:     val,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
+
+		// Replication lag (if replica)
+		lag, err := c.getReplicationLag(ctx)
+		if err == nil && lag >= 0 {
+			collected = append(collected, metrics.Metric{
+				Name:      "mysql_replication_lag_seconds",
+				Value:     lag,
+				Timestamp: timestamp,
+				Labels: map[string]string{
+					"host": c.hostname,
+				},
+			})
+		}
 	}
 
 	return collected, nil
+}
+
+// gauge builds one host-labeled MySQL gauge.
+func (c *Collector) gauge(name string, value float64, ts time.Time) metrics.Metric {
+	return metrics.Metric{
+		Name:      name,
+		Value:     value,
+		Timestamp: ts,
+		Labels:    map[string]string{"host": c.hostname},
+	}
 }
 
 // collectStats gathers MySQL statistics from SHOW STATUS.

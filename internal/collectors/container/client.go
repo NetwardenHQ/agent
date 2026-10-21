@@ -21,6 +21,15 @@ type Container struct {
 	Status  string            `json:"status"`
 	Labels  map[string]string `json:"labels,omitempty"`
 	Created time.Time         `json:"created"`
+
+	// Health is the health check state ("healthy", "unhealthy", "starting"),
+	// or "" for a container without a health check.
+	Health string `json:"health,omitempty"`
+	// ExitCode is set for a container that has exited, when the runtime says.
+	ExitCode *int `json:"exit_code,omitempty"`
+	// Restarts is the restart count, when the runtime lists it (Podman does,
+	// Docker's list endpoint does not).
+	Restarts *int `json:"restarts,omitempty"`
 }
 
 // ContainerStats represents container resource usage metrics.

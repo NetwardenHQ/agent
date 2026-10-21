@@ -5,6 +5,35 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Kubernetes: the CronJob report carries each job's `time_zone` (spec.timeZone), so the dashboard
+  can recompute the next run from the schedule once the reported one has passed.
+- Containers: per-container `container_state_<id>` (0 created, 1 running, 2 paused, 3 restarting,
+  4 exited, 5 dead, 6 removing, -1 unknown), `container_health_<id>` (1 healthy, 0 unhealthy,
+  2 starting; only for containers with a health check), `container_exit_code_<id>` for stopped
+  containers, and `container_restarts_<id>` where the runtime lists it (Podman).
+- MySQL and PostgreSQL: `*_max_connections` and `*_connections_used_percent`. PostgreSQL counts
+  client backends only, the ones `max_connections` limits.
+- `security_auth_log_readable`: 1 when the failed-login collector read journald or a syslog file,
+  0 when it could read neither.
+
+### Fixed
+- Failed logins were undercounted on hosts collecting less often than once a minute: the
+  collector looked back a fixed 60 seconds. It now counts the events since the previous
+  collection, at any interval, with a single look-back capped at one hour.
+- Failed logins read from `/var/log/auth.log` or `/var/log/secure` were counted again on every
+  collection while they stayed in the tail of the file. Each line is placed by its own timestamp,
+  in RFC 3339 or traditional syslog format.
+- A host whose login sources were unreadable reported 0 failed logins. It reports
+  `security_auth_log_readable 0` and no counts instead.
+- The Docker-compatible socket client listed running containers only, so a stopped or crashed
+  container disappeared from the report instead of showing as exited.
+- MySQL and PostgreSQL went silent when the server stopped or refused the agent: the collector
+  disabled itself whenever its ping failed. A configured or detected server keeps reporting
+  `*_up`, and `*_connection_failed` is 1 while the agent cannot connect and 0 once it can.
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
