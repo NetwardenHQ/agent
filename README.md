@@ -13,7 +13,7 @@ The Netwarden agent is a small Go program that collects system, container,
 database, VM, Kubernetes and security-posture data and sends it to the
 Netwarden platform.
 
-[![Version](https://img.shields.io/badge/version-3.1.2-blue)](https://github.com/NetwardenHQ/agent/releases)
+[![Version](https://img.shields.io/badge/version-3.2.0-blue)](https://github.com/NetwardenHQ/agent/releases)
 [![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://golang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Code Signed](https://img.shields.io/badge/windows-code%20signed-blue?logo=windows)](https://github.com/NetwardenHQ/agent/releases)
@@ -208,13 +208,14 @@ api_key: nw_sk_...
 log_level: info                               # debug, info, warn, error
 # log_file: /var/log/netwarden/netwarden.log
 
-# ---- Self-update (applied on Windows only; Linux upgrades through apt/yum) ----
+# ---- Self-update (Windows, Linux packages, macOS, FreeBSD, Kubernetes; off on OPNsense) ----
 # self_update: true
 # self_update_window_start: 1                 # local hour the window opens
 # self_update_window_end: 5                   # local hour it closes
 # self_update_url: https://mirror.internal/netwarden-{version}-{os}-{arch}-installer.exe
 # self_update_signers: spki-sha256:<hex>      # replaces the built-in signer list;
-#                                             # also sha256:<cert thumbprint> or an exact CN
+#                                             # also sha256:<cert thumbprint>; an exact CN
+#                                             # is accepted for the Windows installer only
 
 # ---- Resource collectors (on by default) ----
 # enable_cpu: true
@@ -707,7 +708,7 @@ agent/
 │   ├── config/                 # netwarden.conf parsing and validation
 │   ├── identity/               # device_identity snapshot
 │   ├── spool/                  # local producers' spool (docs/spool.md)
-│   ├── selfupdate/             # signed self-update (Windows)
+│   ├── selfupdate/             # signed self-update
 │   ├── winsec/                 # Windows security descriptor checks
 │   ├── http/                   # shared HTTP client and TLS settings
 │   ├── resilience/             # retry with permanent-error short-circuit
@@ -826,7 +827,7 @@ Report vulnerabilities privately to security@netwarden.com. See
 - TLS certificates are verified unless `tls_skip_verify` is set. `tls_ca_cert` adds a private CA.
 - Some sources need root: the OPNsense collector, and CIS checks against `/etc/shadow` and `/etc/sudoers` (or `CAP_DAC_READ_SEARCH`). Unprivileged, those CIS checks report `error` instead of a result.
 - Files read with elevated privileges are opened without following symlinks and checked on the open descriptor.
-- Windows self-updates are verified against pinned code-signing identities that only the local config can change.
+- Self-updates are verified against pinned signing keys that only the local config can change: the Authenticode signature on Windows, the release signature on macOS and FreeBSD, and the signed apt/yum repository on Linux packages.
 
 Recommendations:
 

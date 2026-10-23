@@ -65,6 +65,13 @@ func inClusterConfig() (*Config, bool) {
 	}, true
 }
 
+// InCluster reports whether the agent runs inside a Kubernetes pod with a
+// service account, the same test the collector uses to start.
+func InCluster() bool {
+	_, ok := inClusterConfig()
+	return ok
+}
+
 // buildAuthority joins host and port into a URL authority, bracketing an IPv6
 // literal as RFC 3986 requires.
 func buildAuthority(host, port string) string {

@@ -17,20 +17,35 @@
 //     A local mirror carries no vendor digest; see resolveTarget.
 //   - The accepted signers are local-only (self_update_signers, or the
 //     built-in pins). The server cannot add a signer.
-//   - The installer's signature, and then the version embedded in it, are
-//     verified before it runs. That is the security boundary; everything
-//     else is scheduling.
-//   - Applying an update is implemented only on Windows. On Linux the
-//     packages register a signed apt/yum repository and the systemd unit
-//     forbids the agent from writing its own binary, so upgrades belong to
-//     the package manager.
+//   - On Windows the installer's Authenticode signature, and then the version
+//     embedded in it, are verified before it runs. On macOS and FreeBSD the
+//     release manifest's signature over the version, platform and digest is
+//     verified (release.go). That is the security boundary; everything else
+//     is scheduling.
+//
+// How an update is applied depends on how the agent was installed:
+//
+//   - Windows: the signed installer runs silently.
+//   - Linux packages: the agent asks for an upgrade and the netwarden-update
+//     systemd service runs apt or dnf against the signed Netwarden
+//     repository. The agent's own unit keeps forbidding it to write its
+//     binary, and the package manager's signature check is the boundary.
+//   - Kubernetes: the agent restarts, and the kubelet pulls the image again.
+//   - macOS: the verified binary replaces the running one and launchd
+//     restarts the agent.
+//   - FreeBSD and OPNsense: a helper run through daemon(8) installs the
+//     verified package with pkg(8) and restarts the service.
+//
+// Anything else (a manual install, a container outside Kubernetes, the
+// Synology package, which runs unprivileged) reports self-update as
+// unsupported and ignores hints.
 package selfupdate
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -44,6 +59,25 @@ const (
 	retryBackoff = 24 * time.Hour
 	// maxSpread is the most an update is delayed to spread a fleet out.
 	maxSpread = 30 * time.Minute
+)
+
+// Support describes whether this host can apply an update, and how.
+type Support struct {
+	// Available is false when nothing on this host can install an update.
+	Available bool
+	// Reason explains why an update is not available, for the log.
+	Reason string
+	// Download is true when the agent fetches and verifies the release
+	// itself. On Linux packages the package manager does both.
+	Download bool
+}
+
+// Reported states, sent to the platform with every payload so it knows which
+// hosts keep themselves current.
+const (
+	StateEnabled     = "enabled"
+	StateDisabled    = "disabled"
+	StateUnsupported = "unsupported"
 )
 
 // Config controls the updater. Zero value is safe: disabled.
@@ -84,9 +118,9 @@ type Updater struct {
 	cancel context.CancelFunc
 
 	// seams for tests
-	goos  string
-	now   func() time.Time
-	apply func(ctx context.Context, target Target, signers []string, logger *slog.Logger) error
+	support func() Support
+	now     func() time.Time
+	apply   func(ctx context.Context, target Target, signers []string, logger *slog.Logger) error
 }
 
 // acceptedSigners returns the configured signing subjects, or the built-in
@@ -112,10 +146,24 @@ func New(cfg Config, logger *slog.Logger) *Updater {
 		lastAttempt: make(map[string]time.Time),
 		ctx:         ctx,
 		cancel:      cancel,
-		goos:        runtime.GOOS,
+		support:     platformSupport,
 		now:         time.Now,
 		apply:       applyUpdate,
 	}
+}
+
+// State reports whether this agent will apply updates on its own.
+func (u *Updater) State() string {
+	if u == nil {
+		return ""
+	}
+	if !u.cfg.Enabled {
+		return StateDisabled
+	}
+	if !u.support().Available {
+		return StateUnsupported
+	}
+	return StateEnabled
 }
 
 // Close abandons any scheduled update and cancels one in progress. Safe on
@@ -140,11 +188,8 @@ func (u *Updater) decide(hinted string, claim bool) (bool, string) {
 	if !u.cfg.Enabled {
 		return false, "self-update disabled"
 	}
-	if u.goos != "windows" {
-		// Linux upgrades belong to apt/yum: the packages already trust the
-		// signing key and the systemd unit denies the agent write access to
-		// its own binary on purpose.
-		return false, "self-update only implemented on windows"
+	if sup := u.support(); !sup.Available {
+		return false, sup.Reason
 	}
 	if hinted == "" {
 		return false, "no version offered"
@@ -208,6 +253,19 @@ func spreadDelay(remaining time.Duration) time.Duration {
 	return rand.N(limit)
 }
 
+// resolve turns an offer into a target. Where the package manager fetches
+// the release, only the version matters, and it still has to be a shape a
+// release can produce.
+func (u *Updater) resolve(offer Offer) (Target, error) {
+	if u.support().Download {
+		return resolveTarget(offer, u.cfg)
+	}
+	if !safeVersion(offer.Version) {
+		return Target{}, fmt.Errorf("refusing unsafe version string %q", offer.Version)
+	}
+	return Target{Version: offer.Version, Current: u.cfg.CurrentVersion}, nil
+}
+
 // HandleHint is the callback the transmitter invokes. It returns at once; the
 // download and install run on their own goroutine so a slow download cannot
 // hold up metric collection.
@@ -220,7 +278,7 @@ func (u *Updater) HandleHint(offer Offer) {
 		return
 	}
 
-	target, err := resolveTarget(offer, u.cfg)
+	target, err := u.resolve(offer)
 	if err != nil {
 		u.logger.Warn("update hint rejected", "offered", version, "error", err)
 		return

@@ -15,6 +15,11 @@ type Offer struct {
 	Version string
 	URL     string
 	SHA256  string
+	// Signature and Certificate sign the release statement for packages that
+	// carry no signature of their own (see release.go). The certificate is
+	// only trusted if its key is pinned locally.
+	Signature   string
+	Certificate string
 }
 
 // Target is the resolved decision: exactly what to fetch, what it must hash
@@ -29,6 +34,11 @@ type Target struct {
 	// still applies; the digest means a compromised download host alone cannot
 	// serve different bytes.
 	SHA256 string
+	// Signature and Certificate are the release statement's signature and
+	// signing certificate, as offered. Used where the package itself is not
+	// signed.
+	Signature   string
+	Certificate string
 }
 
 // safeVersion allows only what a release can actually produce: digits, dots
@@ -122,7 +132,13 @@ func resolveTarget(offer Offer, cfg Config) (Target, error) {
 		return Target{}, err
 	}
 
-	t := Target{Version: offer.Version, Current: cfg.CurrentVersion, URL: raw}
+	t := Target{
+		Version:     offer.Version,
+		Current:     cfg.CurrentVersion,
+		URL:         raw,
+		Signature:   offer.Signature,
+		Certificate: offer.Certificate,
+	}
 	// A locally configured mirror serves whatever the operator put there,
 	// which will not match the vendor's published digest; the signature check
 	// still applies.

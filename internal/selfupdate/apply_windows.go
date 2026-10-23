@@ -22,6 +22,11 @@ import (
 	"github.com/NetwardenHQ/agent/internal/winsec"
 )
 
+// platformSupport: every Windows install is the NSIS installer's.
+func platformSupport() Support {
+	return Support{Available: true, Download: true}
+}
+
 // maxInstallerBytes caps the download. Release installers are a few MB; a
 // reply far larger than that comes from a malfunctioning or hostile host.
 const maxInstallerBytes = 128 * 1024 * 1024

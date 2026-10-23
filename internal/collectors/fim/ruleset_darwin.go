@@ -5,9 +5,9 @@ package fim
 const rulesetRevision = 1
 
 // defaultRoots for macOS: the Unix-family sensitive paths that exist on a Mac.
-func defaultRoots() []string {
-	return []string{
-		"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
+// The credential scope leaves out the binary directories.
+func defaultRoots(scope Scope) []string {
+	credentials := []string{
 		"/etc/sudoers", "/etc/sudoers.d",
 		"/etc/pam.d",
 		"/etc/ssh/sshd_config",
@@ -15,4 +15,8 @@ func defaultRoots() []string {
 		"/Library/LaunchDaemons", "/Library/LaunchAgents",
 		"/etc/crontab",
 	}
+	if scope != ScopeFull {
+		return credentials
+	}
+	return append([]string{"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin"}, credentials...)
 }

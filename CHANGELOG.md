@@ -8,6 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Self-update on Linux, macOS, FreeBSD, OPNsense and Kubernetes, with the same maintenance window,
+  spread and backoff as Windows.
+  - Linux packages: the agent creates `/var/lib/netwarden/update-request` and the new
+    `netwarden-update.path` and `netwarden-update.service` units upgrade the `netwarden` package
+    from the signed Netwarden repository with apt or dnf. The agent's own unit still cannot write
+    its binary.
+  - macOS: the agent downloads the release, verifies it, replaces its binary and restarts through
+    launchd.
+  - FreeBSD and OPNsense: the agent downloads and verifies the package, and
+    `/usr/local/libexec/netwarden/apply-update` installs it with `pkg add` and restarts the
+    service. Off by default on OPNsense; set `self_update: true` to turn it on.
+  - Kubernetes: the agent restarts so the kubelet pulls the image again.
+- Release signatures for packages without one of their own: each artifact in `latest.json` carries
+  an ECDSA signature over its version, platform, format, architecture and SHA-256, checked
+  against the pinned release key before anything is installed. Only `spki-sha256:` and `sha256:`
+  entries in `self_update_signers` accept these signatures; a name never does.
+- `self_update` in every payload (`enabled`, `disabled` or `unsupported`), so the platform knows
+  which hosts keep themselves current.
+- Security events: successful logins, new accounts and new administrators are sent one by one
+  through the spool (`docs/spool.md`), so they are delivered at least once and survive restarts.
+  - Linux: `ssh.login` (with the key fingerprint for public-key logins, and how many times the
+    source failed in the hour before), from journald or `auth.log`/`secure`. Lines from
+    `sshd-session` (OpenSSH 9.8 and later) are read like `sshd` ones. `account.created` and
+    `account.admin_granted` (sudo, wheel, admin) from `useradd`, `usermod` and `gpasswd`.
+  - Windows: the Security event log (4624, 4625, 4720, 4732, 1102) gives `rdp.login`,
+    `console.login`, `network.login` (from public addresses only), `account.created`,
+    `account.admin_granted` (Administrators) and `audit.log_cleared`. A bookmark in
+    `%ProgramData%\Netwarden\auth-bookmark.xml` keeps restarts from repeating or skipping events.
+    The failed-login metrics now work on Windows too, from 4625. `security_audit_logon` and
+    `security_audit_account_management` say whether the local audit policy records these events;
+    the agent never changes it.
+  - Identical events in one collection are folded into one with a `count`. A failed login is never
+    sent as an event: the username field sometimes holds a mistyped password.
+  - `security_events_enabled` is 0 when there is no spool directory to write to, and
+    `security_events_dropped` counts events that could not be written.
+
+### Changed
+- File integrity monitoring is on by default for the account, privilege and persistence files
+  (sudoers, passwd, shadow, group, PAM, sshd_config, cron, systemd units, launchd on macOS). The
+  system binary directories, which are costly to hash, are watched only with `enable_fim: true`;
+  `enable_fim: false` turns FIM off. On OPNsense `/conf/config.xml` is left to the plugin's
+  configuration events. Agents inside a Kubernetes cluster keep FIM off unless `enable_fim` is
+  set. Changing scope rebuilds the baseline (`roots_changed`) without reporting changes.
+- The spool is on by default on Windows, at `%ProgramData%\Netwarden\spool`.
+
+### Fixed
+- `state.json` could not be written on Linux packages: the unit's `ProtectSystem=strict` left
+  `/var/lib/netwarden` read-only. The unit sets `StateDirectory=netwarden`.
+
+## [3.2.0] - 2026-10-21
+
+### Added
 - Kubernetes: the CronJob report carries each job's `time_zone` (spec.timeZone), so the dashboard
   can recompute the next run from the schedule once the reported one has passed.
 - Containers: per-container `container_state_<id>` (0 created, 1 running, 2 paused, 3 restarting,

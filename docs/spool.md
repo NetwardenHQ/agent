@@ -18,7 +18,8 @@ The spool directory is `spool_dir` in `netwarden.conf`:
 |---|---|
 | FreeBSD / OPNsense | `/var/db/netwarden/spool` |
 | Linux | `/var/lib/netwarden/spool` |
-| other (macOS, Windows) | off unless `spool_dir` is set |
+| Windows | `%ProgramData%\Netwarden\spool` |
+| other (macOS) | off unless `spool_dir` is set |
 
 `spool_dir: off` disables the spool.
 
@@ -75,6 +76,33 @@ delivered in parts, tracked by byte offset; if the file is replaced by a
 shorter one, reading starts again from the beginning. A file that holds only
 invalid or blank lines is deleted once read. The platform deduplicates on the
 host and `dedupe_key` within 24 hours.
+
+### Events the agent writes itself
+
+The agent's own collectors write security events into the same directory, as
+`events/agent-auth-<nanoseconds>.jsonl`, and they travel like any producer's.
+`spool_dir: off` therefore turns them off too; the agent then reports
+`security_events_enabled 0`. Every one has `"v":1` and `"severity":"info"`;
+the platform raises findings from them, so they never notify on their own.
+
+| `type` | Source | `labels` |
+|---|---|---|
+| `ssh.login` | sshd `Accepted …` (Linux) | `user`, `source_ip`, `method`, `key_fp` (public-key logins), `prior_failures`, `count` |
+| `rdp.login` | 4624, logon type 10 (Windows) | `user`, `source_ip`, `prior_failures`, `count` |
+| `console.login` | 4624, logon types 2 and 11 (Windows) | `user`, `count` |
+| `network.login` | 4624, logon type 3, public source only (Windows) | `user`, `source_ip`, `auth`, `prior_failures`, `count` |
+| `account.created` | `useradd` (Linux), 4720 (Windows) | `user`, `by` when known, `count` |
+| `account.admin_granted` | `usermod`/`gpasswd` into sudo, wheel or admin (Linux), 4732 into Administrators (Windows) | `user`, `group`, `by` when known, `count` |
+| `audit.log_cleared` | 1102 (Windows) | `by`, `count` |
+
+- `count`: identical events in one collection are folded into one; the event
+  carries the first occurrence's time.
+- `prior_failures`: failed logins from `source_ip` on this host in the hour
+  before the login.
+- `dedupe_key`: `auth:` and 32 hex digits of the log line's SHA-256 on Linux,
+  `win:<EventRecordID>` on Windows.
+- A failed login is never an event, only a count (`security_failed_logins`):
+  the username of a failed login is sometimes a mistyped password.
 
 ## `exposure.json`
 

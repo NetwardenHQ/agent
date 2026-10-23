@@ -31,6 +31,22 @@ func TestHandleResponseSurfacesUpdateHint(t *testing.T) {
 	}
 }
 
+func TestHandleResponseCarriesTheReleaseSignature(t *testing.T) {
+	// macOS and FreeBSD packages are verified against a signature the
+	// platform passes along with the hint.
+	tr, seen := newHintTransmitter()
+	tr.handleResponse(strings.NewReader(
+		`{"data":{"agent_update":{"version":"3.3.0","url":"https://mirror.test/a.tar.gz",` +
+			`"sha256":"abc","signature":"c2ln","certificate":"Y2VydA=="}}}`))
+
+	if len(*seen) != 1 {
+		t.Fatalf("expected one hint, got %v", *seen)
+	}
+	if got := (*seen)[0]; got.Signature != "c2ln" || got.Certificate != "Y2VydA==" {
+		t.Fatalf("signature not carried through: %+v", got)
+	}
+}
+
 func TestHandleResponseIgnoresOrdinaryReply(t *testing.T) {
 	// The ordinary ack an up-to-date agent receives.
 	tr, seen := newHintTransmitter()

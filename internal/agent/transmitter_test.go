@@ -54,6 +54,20 @@ func TestCreatePayload_OmitsSnapshotsWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestCreatePayload_ReportsSelfUpdateState(t *testing.T) {
+	tr := newTestTransmitter(t)
+	m := wire(t, tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil))
+	if _, present := m["self_update"]; present {
+		t.Error("self_update must be omitted when no updater is wired")
+	}
+
+	tr.SetSelfUpdateState(func() string { return "enabled" })
+	m = wire(t, tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil))
+	if got := string(m["self_update"]); got != `"enabled"` {
+		t.Fatalf("self_update = %s, want \"enabled\"", got)
+	}
+}
+
 func TestCreatePayload_SnapshotsMatchServerContract(t *testing.T) {
 	tr := newTestTransmitter(t)
 	snaps := []metrics.Snapshot{

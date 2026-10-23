@@ -74,14 +74,60 @@ func TestInWindow(t *testing.T) {
 	}
 }
 
-// newTestUpdater builds an updater with a fixed clock on the host GOOS. Off
-// Windows, ShouldApply refuses at the GOOS gate; windowsUpdater covers the
-// Windows path.
+// supported stands in for a host that can apply updates, so the policy is
+// tested the same way on every build platform.
+func supported() Support { return Support{Available: true, Download: true} }
+
+// newTestUpdater builds an updater with a fixed clock on a host that can apply
+// updates.
 func newTestUpdater(current string, hour int) *Updater {
 	u := New(Config{Enabled: true, CurrentVersion: current, WindowStartHour: 1, WindowEndHour: 5},
 		slog.New(slog.DiscardHandler))
+	u.support = supported
 	u.now = func() time.Time { return time.Date(2026, 9, 19, hour, 0, 0, 0, time.Local) }
 	return u
+}
+
+func TestShouldApplyRefusesWhereNothingCanInstall(t *testing.T) {
+	u := newTestUpdater("1.0.0", 2)
+	u.support = func() Support { return Support{Reason: "no package updater on this host"} }
+	if ok, reason := u.ShouldApply("3.0.0"); ok || reason != "no package updater on this host" {
+		t.Fatalf("got ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestStateReportsWhatTheHostCanDo(t *testing.T) {
+	u := newTestUpdater("1.0.0", 2)
+	if got := u.State(); got != StateEnabled {
+		t.Fatalf("supported and enabled: got %q", got)
+	}
+	u.support = func() Support { return Support{Reason: "manual install"} }
+	if got := u.State(); got != StateUnsupported {
+		t.Fatalf("unsupported host: got %q", got)
+	}
+	u.cfg.Enabled = false
+	if got := u.State(); got != StateDisabled {
+		t.Fatalf("disabled in config: got %q", got)
+	}
+	var none *Updater
+	if got := none.State(); got != "" {
+		t.Fatalf("nil updater: got %q", got)
+	}
+}
+
+func TestPackageManagedUpdatesNeedOnlyASafeVersion(t *testing.T) {
+	u := newTestUpdater("1.0.0", 2)
+	u.support = func() Support { return Support{Available: true} }
+	target, err := u.resolve(Offer{Version: "3.0.0"})
+	if err != nil {
+		t.Fatalf("a version-only hint must be enough where apt or dnf fetch the release: %v", err)
+	}
+	if target.Version != "3.0.0" || target.Current != "1.0.0" || target.URL != "" {
+		t.Fatalf("unexpected target %+v", target)
+	}
+	if _, err := u.resolve(Offer{Version: "3.0.0; rm -rf /"}); err == nil {
+		t.Fatal("an unsafe version must be refused even without a download")
+	}
 }
 
 func TestShouldApplyRefusesWhenDisabled(t *testing.T) {
@@ -98,7 +144,7 @@ func TestShouldApplyRefusesDowngradeAndSideways(t *testing.T) {
 		if ok {
 			t.Fatalf("offered %q against 3.0.0 should be refused", offered)
 		}
-		if reason != "offered version is not newer" && reason != "self-update only implemented on windows" {
+		if reason != "offered version is not newer" {
 			t.Fatalf("offered %q: unexpected reason %q", offered, reason)
 		}
 	}
@@ -122,8 +168,6 @@ func TestShouldApplyRefusesGarbageVersion(t *testing.T) {
 }
 
 func TestShouldApplyRespectsWindowAndBackoff(t *testing.T) {
-	// Outside the window. Off Windows the GOOS gate refuses first; either way
-	// the update must not proceed.
 	if ok, _ := newTestUpdater("1.0.0", 13).ShouldApply("3.0.0"); ok {
 		t.Fatal("must not apply outside the maintenance window")
 	}
@@ -216,19 +260,19 @@ func TestSpreadDelayStaysInsideTheWindow(t *testing.T) {
 	}
 }
 
-// windowsUpdater is an updater that believes it runs on Windows, with the
+// supportedUpdater is an updater on a host that can apply updates, with the
 // clock at the given time.
-func windowsUpdater(at time.Time) *Updater {
+func supportedUpdater(at time.Time) *Updater {
 	u := New(Config{Enabled: true, CurrentVersion: "1.0.0", WindowStartHour: 1, WindowEndHour: 5},
 		slog.New(slog.DiscardHandler))
-	u.goos = "windows"
+	u.support = supported
 	u.now = func() time.Time { return at }
 	return u
 }
 
 func TestConcurrentHintsStartOneUpdate(t *testing.T) {
 	// One second of window left, so the spread delay is under a second.
-	u := windowsUpdater(time.Date(2026, 9, 19, 4, 59, 59, 0, time.Local))
+	u := supportedUpdater(time.Date(2026, 9, 19, 4, 59, 59, 0, time.Local))
 	var calls atomic.Int32
 	done := make(chan struct{}, 8)
 	u.apply = func(context.Context, Target, []string, *slog.Logger) error {
@@ -255,7 +299,7 @@ func TestConcurrentHintsStartOneUpdate(t *testing.T) {
 }
 
 func TestCloseAbandonsAScheduledUpdate(t *testing.T) {
-	u := windowsUpdater(time.Date(2026, 9, 19, 2, 0, 0, 0, time.Local))
+	u := supportedUpdater(time.Date(2026, 9, 19, 2, 0, 0, 0, time.Local))
 	u.apply = func(context.Context, Target, []string, *slog.Logger) error {
 		t.Error("a closed updater must not install")
 		return nil

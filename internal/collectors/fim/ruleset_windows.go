@@ -18,7 +18,9 @@ const rulesetRevision = 1
 // that legitimately churn on Windows Update and would bury real signal. The
 // narrow, high-signal paths below are the equivalent of the Unix
 // cron/systemd/sudoers set.
-func defaultRoots() []string {
+//
+// The list is already narrow, so both scopes watch all of it.
+func defaultRoots(Scope) []string {
 	sys := os.Getenv("SystemRoot")
 	if sys == "" {
 		sys = `C:\Windows`

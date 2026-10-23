@@ -10,22 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/NetwardenHQ/agent/internal/metrics"
-)
-
-// Each collection counts the events since the previous one ended, so the
-// count is right at any collection interval (plans range from one to ten
-// minutes). The first collection looks back firstWindow; after a long pause
-// a single look-back stops at maxLookBack, so a host that was asleep for a
-// day does not read a day of logs in one go.
-const (
-	firstWindow = 60 * time.Second
-	maxLookBack = time.Hour
 )
 
 // maxLogTailBytes caps how much of /var/log/auth.log or /var/log/secure we
@@ -41,6 +30,10 @@ const maxLogTailBytes int64 = 4 << 20
 var (
 	journalctlPath = "/usr/bin/journalctl"
 	sshUnits       = []string{"ssh.service", "sshd.service"}
+
+	// accountTools are the programs whose log lines record new accounts and
+	// administrator grants (authevents.go).
+	accountTools = []string{"SYSLOG_IDENTIFIER=useradd", "SYSLOG_IDENTIFIER=usermod", "SYSLOG_IDENTIFIER=gpasswd"}
 
 	// Syslog files tried in order when the journal is not available.
 	authLogFiles = []struct{ path, source string }{
@@ -91,34 +84,9 @@ func (c *AuthCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		"unique_users", stats.UniqueUsers,
 		"unique_ips", stats.UniqueIPs)
 
-	return c.emitMetrics(stats, ts), nil
-}
-
-// windowStart is where the window ending at now begins: the end of the last
-// successful window, bounded to maxLookBack.
-func (c *AuthCollector) windowStart(now time.Time) time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.windowEnd.IsZero() {
-		return now.Add(-firstWindow)
-	}
-	if now.Sub(c.windowEnd) > maxLookBack {
-		return now.Add(-maxLookBack)
-	}
-	return c.windowEnd
-}
-
-func (c *AuthCollector) advanceWindow(end time.Time) {
-	c.mu.Lock()
-	c.windowEnd = end
-	c.mu.Unlock()
-}
-
-// inWindow reports whether an event at t belongs to the window (since, until].
-// The open start is the previous window's closed end, so no event is counted
-// twice.
-func inWindow(t, since, until time.Time) bool {
-	return t.After(since) && !t.After(until)
+	out := c.emitMetrics(stats, ts)
+	c.emitEvents(&out, stats.Events, ts)
+	return out, nil
 }
 
 // collectAuthStats picks the best available data source and parses sshd
@@ -159,53 +127,60 @@ func (c *AuthCollector) statsFromJournal(ctx context.Context, since, until time.
 
 	any := false
 	for _, unit := range sshUnits {
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		// --since/--until take whole seconds in local time, so the query is
-		// widened by a second on each side and short-unix output gives every
-		// line its exact timestamp to filter on.
-		cmd := exec.CommandContext(cctx,
-			journalctlPath,
-			"_SYSTEMD_UNIT="+unit,
-			"--since", since.Add(-time.Second).Format("2006-01-02 15:04:05"),
-			"--until", until.Add(time.Second).Format("2006-01-02 15:04:05"),
-			"--no-pager",
-			"--output=short-unix",
-		)
-		// Don't leak parent env; journalctl honors $SYSTEMD_COLORS etc.
-		cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin"}
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			cancel()
-			return authStats{}, err
+		if c.scanJournal(ctx, []string{"_SYSTEMD_UNIT=" + unit}, since, until, &combined, users, ips) {
+			any = true
 		}
-		if err := cmd.Start(); err != nil {
-			cancel()
-			// Permission denied or missing journal is recoverable; don't
-			// return immediately, try other units / sources.
-			c.logger.Debug("journalctl start failed", "unit", unit, "error", err)
-			continue
-		}
-
-		any = true
-		c.scanLines(stdout, journalTime, since, until, &combined, users, ips)
-
-		// Drain any remainder so Wait doesn't block indefinitely.
-		_, _ = io.Copy(io.Discard, stdout)
-		if err := cmd.Wait(); err != nil {
-			c.logger.Debug("journalctl exited non-zero", "unit", unit, "error", err)
-		}
-		cancel()
 	}
-
 	if !any {
 		return authStats{}, errors.New("journalctl unavailable for all candidate units")
 	}
+	// The account tools log under their own names, outside the ssh unit.
+	// Matches on the same field are ORed.
+	c.scanJournal(ctx, accountTools, since, until, &combined, users, ips)
 
 	combined.UniqueUsers = len(users)
 	combined.UniqueIPs = len(ips)
 	combined.TopIPs = topNIPs(ips, 5)
 	return combined, nil
+}
+
+// scanJournal runs one journalctl query over the window and scans its lines.
+// It reports whether journalctl ran; a permission error or a missing journal
+// is not fatal, the caller tries other sources.
+func (c *AuthCollector) scanJournal(ctx context.Context, matches []string, since, until time.Time,
+	stats *authStats, users map[string]struct{}, ips map[string]int) bool {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// --since/--until take whole seconds in local time, so the query is
+	// widened by a second on each side and short-unix output gives every
+	// line its exact timestamp to filter on.
+	args := append(append([]string{}, matches...),
+		"--since", since.Add(-time.Second).Format("2006-01-02 15:04:05"),
+		"--until", until.Add(time.Second).Format("2006-01-02 15:04:05"),
+		"--no-pager",
+		"--output=short-unix",
+	)
+	cmd := exec.CommandContext(cctx, journalctlPath, args...)
+	// Don't leak parent env; journalctl honors $SYSTEMD_COLORS etc.
+	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin"}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		c.logger.Debug("journalctl pipe failed", "matches", matches, "error", err)
+		return false
+	}
+	if err := cmd.Start(); err != nil {
+		c.logger.Debug("journalctl start failed", "matches", matches, "error", err)
+		return false
+	}
+	c.scanLines(stdout, journalTime, since, until, stats, users, ips)
+
+	// Drain any remainder so Wait doesn't block indefinitely.
+	_, _ = io.Copy(io.Discard, stdout)
+	if err := cmd.Wait(); err != nil {
+		c.logger.Debug("journalctl exited non-zero", "matches", matches, "error", err)
+	}
+	return true
 }
 
 // statsFromLogFile reads the tail of a sshd-style log file and aggregates
@@ -268,10 +243,11 @@ func (c *AuthCollector) scanLines(r io.Reader, timeOf func(string) (time.Time, b
 	for sc.Scan() {
 		line := sc.Text()
 		// Cheap pre-filter to skip the vast majority of non-auth lines.
-		if !strings.Contains(line, "Failed ") && !strings.Contains(line, "Invalid user ") {
+		if !mayBeAuthLine(line) {
 			continue
 		}
-		if t, ok := timeOf(line); !ok || !inWindow(t, since, until) {
+		t, ok := timeOf(line)
+		if !ok || !inWindow(t, since, until) {
 			continue
 		}
 
@@ -279,14 +255,31 @@ func (c *AuthCollector) scanLines(r io.Reader, timeOf func(string) (time.Time, b
 			stats.FailedAttempts++
 			users[m[1]] = struct{}{}
 			ips[m[2]]++
+			c.failures.add(m[2], t)
 			continue
 		}
 		if m := invalidUserRe.FindStringSubmatch(line); m != nil {
 			stats.FailedAttempts++
 			users[m[1]] = struct{}{}
 			ips[m[2]]++
+			c.failures.add(m[2], t)
+			continue
+		}
+		if ev, ok := parseAuthMessage(messageOf(line)); ok {
+			ev.At, ev.Key = t, lineKey(line)
+			stats.Events = append(stats.Events, ev)
 		}
 	}
+}
+
+// mayBeAuthLine is the cheap test that skips most lines before any parsing.
+func mayBeAuthLine(line string) bool {
+	for _, s := range []string{"Failed ", "Invalid user ", "Accepted ", "new user: ", "' to group '", " added by "} {
+		if strings.Contains(line, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // journalTime reads the timestamp journalctl --output=short-unix puts first
@@ -344,26 +337,4 @@ func syslogTime(line string, now time.Time) (time.Time, bool) {
 		t = t.AddDate(-1, 0, 0)
 	}
 	return t, true
-}
-
-// topNIPs returns the top n entries from the per-IP count map, ordered by
-// count desc and IP asc as a tiebreaker for stable output.
-func topNIPs(m map[string]int, n int) []ipCount {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]ipCount, 0, len(m))
-	for ip, count := range m {
-		out = append(out, ipCount{IP: ip, Count: count})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
-		}
-		return out[i].IP < out[j].IP
-	})
-	if len(out) > n {
-		out = out[:n]
-	}
-	return out
 }

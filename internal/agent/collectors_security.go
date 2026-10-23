@@ -5,6 +5,7 @@ import (
 
 	"github.com/NetwardenHQ/agent/internal/collectors/cis"
 	"github.com/NetwardenHQ/agent/internal/collectors/fim"
+	"github.com/NetwardenHQ/agent/internal/collectors/k8s"
 	"github.com/NetwardenHQ/agent/internal/collectors/opnsense"
 	"github.com/NetwardenHQ/agent/internal/collectors/security"
 	"github.com/NetwardenHQ/agent/internal/metrics"
@@ -20,10 +21,10 @@ import (
 //
 //	security_ports      Linux (ss/netstat), macOS + Windows (gopsutil)
 //	security_sshconfig  Linux, macOS, Windows (OpenSSH config syntax is shared)
-//	security_auth       Linux only (journald / auth.log / secure)
+//	security_auth       Linux (journald / auth.log / secure), Windows (Security event log)
 //	security_packages   Linux only (dpkg / rpm)
 //	cis                 Linux only, and only once a profile is defined in the UI
-//	fim                 Linux, macOS, Windows, FreeBSD; opt-in, periodic + real-time integrity monitoring
+//	fim                 Linux, macOS, Windows, FreeBSD; credential files by default, binaries with enable_fim: true
 //	opnsense            OPNsense firewalls only (inactive on any other host)
 //
 // Registration failures are logged and skipped rather than aborting agent
@@ -34,6 +35,9 @@ func (a *Agent) registerSecurityCollectors(collectorLogger *slog.Logger) {
 		c := security.NewAuthCollector(
 			a.hostname,
 			security.WithAuthLogger(collectorLogger.With("type", "security_auth")),
+			// Logins and account changes go out as spool events; with the
+			// spool off they are not recorded, and the collector says so.
+			security.WithSpoolDir(a.config.SpoolDir),
 		)
 		a.registerSecurityCollector("security_auth", c)
 	}
@@ -54,10 +58,11 @@ func (a *Agent) registerSecurityCollectors(collectorLogger *slog.Logger) {
 		a.registerSecurityCollector("security_ports", c)
 	}
 
-	if a.config.Collectors.FIM {
+	if fimWanted(a.config.Collectors.FIM, a.config.FIMExplicit, k8s.InCluster()) {
 		opts := []fim.Option{
 			fim.WithLogger(collectorLogger.With("type", "fim")),
 			fim.WithRealtime(a.config.FIMRealtime),
+			fim.WithScope(fim.Scope(a.config.FIMScope)),
 		}
 		if a.config.FIMManifestPath != "" {
 			opts = append(opts, fim.WithManifestPath(a.config.FIMManifestPath))
@@ -108,4 +113,14 @@ func (a *Agent) registerSecurityCollector(name string, c metrics.Collector) {
 	} else {
 		a.logger.Debug("security collector registered but inactive on this platform", "name", name)
 	}
+}
+
+// fimWanted decides whether FIM runs. It is on by default, but an agent
+// inside a Kubernetes cluster would only be watching its own container
+// image, so there it runs only when enable_fim asks for it.
+func fimWanted(enabled, explicit, inCluster bool) bool {
+	if !enabled {
+		return false
+	}
+	return explicit || !inCluster
 }

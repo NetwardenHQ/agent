@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,15 +31,34 @@ import (
 // DefaultServerURL is the SaaS endpoint used when no server_url is configured.
 const DefaultServerURL = "https://api.netwarden.com"
 
+// defaultSpoolDir is where the spool lives unless spool_dir says otherwise.
+// The agent writes its own security events there, so it is on wherever the
+// agent can record them: Linux, FreeBSD and Windows. On Windows it sits
+// beside the FIM manifest, and the spool creates it SYSTEM+Administrators
+// only. Empty (off) elsewhere.
+func defaultSpoolDir(goos, programData string) string {
+	switch goos {
+	case "freebsd":
+		return "/var/db/netwarden/spool"
+	case "linux":
+		return "/var/lib/netwarden/spool"
+	case "windows":
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		return filepath.Join(programData, "Netwarden", "spool")
+	}
+	return ""
+}
+
 // SelfUpdateConfig bounds when and from where the agent may replace itself.
 //
 // These settings are local and take precedence over the server, so an
 // operator can rule out unattended upgrades, use an internal mirror or trust
 // their own signing certificate, and have that decision be final.
 type SelfUpdateConfig struct {
-	// Enabled allows silent self-update. It defaults to true on every
-	// platform, but only the Windows build acts on it (see Config.SelfUpdate).
-	// When false the agent ignores update hints.
+	// Enabled allows silent self-update. It defaults to true everywhere
+	// except OPNsense. When false the agent ignores update hints.
 	Enabled bool
 
 	// WindowStartHour/WindowEndHour bound the local hours in which an update
@@ -55,7 +75,9 @@ type SelfUpdateConfig struct {
 	URLTemplate string
 
 	// Signers replaces the built-in list of acceptable code-signing subjects,
-	// for builds signed with a different certificate.
+	// for builds signed with a different certificate. Releases other than the
+	// Windows installer are accepted only from a pinned key (spki-sha256: or
+	// sha256:), never by name.
 	//
 	// The server can never influence this setting: it may say where to
 	// download from, never whose signature to accept.
@@ -82,10 +104,8 @@ type Config struct {
 	LogLevel string
 	LogFile  string
 
-	// SelfUpdate controls silent agent upgrades. Windows only: on Linux the
-	// packages register a signed apt/yum repo and the systemd unit denies
-	// the agent write access to its own binary, so upgrades belong to the
-	// package manager.
+	// SelfUpdate controls silent agent upgrades. How an upgrade is applied
+	// depends on how the agent was installed; see internal/selfupdate.
 	SelfUpdate SelfUpdateConfig
 
 	// Collector flags
@@ -105,11 +125,20 @@ type Config struct {
 	FIMRoots        []string
 
 	// SpoolDir is the directory local producers (for example an OPNsense UI
-	// plugin) write events and exposure files into for the agent to forward.
+	// plugin) write events and exposure files into for the agent to forward;
+	// the agent's own security events (logins, account changes) go there too.
 	// Empty disables the spool. Default: /var/db/netwarden/spool on FreeBSD,
-	// /var/lib/netwarden/spool on Linux, disabled elsewhere unless spool_dir
-	// is set. spool_dir: off disables it explicitly.
+	// /var/lib/netwarden/spool on Linux, %ProgramData%\Netwarden\spool on
+	// Windows, disabled elsewhere unless spool_dir is set. spool_dir: off
+	// disables it explicitly, and with it the security events.
 	SpoolDir string
+
+	// FIMScope is the FIM ruleset: "credentials" by default, "full" (adds the
+	// binary directories) when enable_fim: true. FIMExplicit records that
+	// netwarden.conf set enable_fim at all; an agent inside a Kubernetes
+	// cluster runs FIM only then, since it would be watching its own image.
+	FIMScope    string
+	FIMExplicit bool
 
 	// FIMRealtime enables the fsnotify real-time layer. Default true, except
 	// on macOS and FreeBSD, where kqueue holds an open descriptor for every
@@ -265,8 +294,10 @@ type CollectorToggles struct {
 	// on and a profile is defined in the UI.
 	CIS bool
 
-	// FIM enables file integrity monitoring. Default off: unlike the other
-	// collectors it does sustained I/O and keeps a baseline manifest on disk.
+	// FIM enables file integrity monitoring. Default on, for the account,
+	// privilege and persistence files only (Config.FIMScope "credentials"):
+	// the system binaries, the costly part to hash, are watched only with
+	// enable_fim: true. enable_fim: false turns it off.
 	FIM bool
 
 	// K8sJobs, K8sAvailability, K8sResources, K8sCNPG and K8sIngress mirror the
@@ -384,18 +415,17 @@ func LoadConfig(filename string) (*Config, error) {
 	// behind. The download location comes from the server this agent reports
 	// to, so a self-hosted install serves its own repository. The default
 	// window is the quiet hours, because applying an update restarts the
-	// service. Only Windows acts on it; Linux upgrades through the package's
-	// apt/yum repository.
-	config.SelfUpdate.Enabled = true
+	// service. OPNsense is the exception: on a firewall its owner decides
+	// when software changes, so self_update must be set there.
+	config.SelfUpdate.Enabled = !isOPNsense()
 	config.SelfUpdate.WindowStartHour = 1
 	config.SelfUpdate.WindowEndHour = 5
 
-	switch runtime.GOOS {
-	case "freebsd":
-		config.SpoolDir = "/var/db/netwarden/spool"
-	case "linux":
-		config.SpoolDir = "/var/lib/netwarden/spool"
-	}
+	config.SpoolDir = defaultSpoolDir(runtime.GOOS, os.Getenv("ProgramData"))
+
+	// FIM watches the credential and persistence files unless told otherwise.
+	config.Collectors.FIM = true
+	config.FIMScope = "credentials"
 
 	config.Collectors.CPU = true
 	config.Collectors.Memory = true
@@ -488,7 +518,11 @@ func LoadConfig(filename string) (*Config, error) {
 		case "k8s_enable_ingress":
 			config.Collectors.K8sIngress = isTruthy(value)
 		case "enable_fim", "enable_file_integrity":
+			config.FIMExplicit = true
 			config.Collectors.FIM = isTruthy(value)
+			if config.Collectors.FIM {
+				config.FIMScope = "full"
+			}
 		case "enable_fim_realtime":
 			config.FIMRealtime = isTruthy(value)
 		case "spool_dir":
@@ -710,8 +744,11 @@ api_key: nw_sk_CHANGE_ME
 # tls_ca_cert: /etc/netwarden/ca.pem      # trust a private CA for server_url
 # tls_skip_verify: false                  # insecure; only for self-signed test servers
 
-# Self-update (default: on; applied on Windows only, Linux upgrades through
-# apt/yum). The server announces new versions in its replies to the agent.
+# Self-update (default: on, except on OPNsense). The server announces new
+# versions in its replies to the agent. Windows runs the signed installer,
+# Linux packages upgrade from the signed apt/yum repository, macOS and
+# FreeBSD install a release whose signature matches a pinned key, and in
+# Kubernetes the agent restarts to pull the image. Other installs ignore it.
 # self_update: true
 # self_update_window_start: 1             # local hour the update window opens
 # self_update_window_end: 5               # local hour it closes; an update restarts the service
@@ -722,7 +759,8 @@ api_key: nw_sk_CHANGE_ME
 # Code-signing identities to accept, comma separated, replacing the built-in
 # list (for builds signed with your own certificate). Each entry is a key pin
 # (spki-sha256:<hex>, survives renewal with the same key), a certificate pin
-# (sha256:<hex> thumbprint) or an exact certificate CN (weakest).
+# (sha256:<hex> thumbprint) or an exact certificate CN (weakest, and accepted
+# for the Windows installer only).
 # self_update_signers: Acme Corp
 
 # Hostname to report (default: the system hostname)
@@ -811,16 +849,21 @@ log_level: info                           # debug|info|warn|error
 # language_package_roots: /srv/app    # extra directories to scan for node_modules
 # enable_cis: true                    # CIS benchmark, when a profile is set in the UI
 
-# File integrity monitoring (off by default; it keeps a baseline on disk)
-# enable_fim: false
+# File integrity monitoring. On by default for the account, privilege and
+# persistence files (sudoers, passwd, shadow, PAM, sshd_config, cron, systemd
+# units). "true" also hashes the system binary directories, which is
+# sustained I/O; "false" turns it off.
+# enable_fim: true
 # enable_fim_realtime: true           # real-time layer over the hourly walk (default off on macOS and FreeBSD)
 # fim_manifest_path: /var/lib/netwarden/fim-manifest   # FreeBSD: /var/db/netwarden/fim-manifest
 # fim_roots: /etc/myapp,/opt/myapp/bin                 # paths added to the default ruleset
 
 # Spool directory for events and exposure files written by local producers,
-# such as an OPNsense UI plugin (format: docs/spool.md). It must be owned by
-# root and not group- or world-writable. Default: /var/db/netwarden/spool on
-# FreeBSD, /var/lib/netwarden/spool on Linux, off elsewhere.
+# such as an OPNsense UI plugin (format: docs/spool.md), and for the agent's
+# own security events. It must be owned by root (SYSTEM or Administrators on
+# Windows) and not writable by anyone else. Default: /var/db/netwarden/spool
+# on FreeBSD, /var/lib/netwarden/spool on Linux, %ProgramData%\Netwarden\spool
+# on Windows, off elsewhere. "off" also turns the security events off.
 # spool_dir: /var/db/netwarden/spool  # "off" disables it
 `
 
@@ -914,4 +957,16 @@ func isTruthy(value string) bool {
 		return true
 	}
 	return false
+}
+
+// opnsenseMarker exists on every OPNsense install.
+const opnsenseMarker = "/usr/local/opnsense/version/core"
+
+// isOPNsense reports whether this host is an OPNsense firewall.
+func isOPNsense() bool {
+	if runtime.GOOS != "freebsd" {
+		return false
+	}
+	_, err := os.Stat(opnsenseMarker)
+	return err == nil
 }

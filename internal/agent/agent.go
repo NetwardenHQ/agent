@@ -158,8 +158,8 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 	// there is no second destination to allowlist and no inbound channel. A
 	// local self_update_url outranks the server's URL, the digest comes from
 	// the API rather than the download host, and the accepted signers are
-	// local-only. The installer's signature, signer and embedded version are
-	// verified before it runs; see internal/selfupdate.
+	// local-only. Nothing is installed before its signature is verified
+	// against them; see internal/selfupdate.
 	var updater *selfupdate.Updater
 	if httpTx, ok := transmitter.(*HTTPTransmitter); ok {
 		updater = selfupdate.New(selfupdate.Config{
@@ -171,6 +171,7 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 			Signers:         cfg.SelfUpdate.Signers,
 		}, logger.With("component", "selfupdate"))
 		httpTx.SetUpdateHintHandler(updater.HandleHint)
+		httpTx.SetSelfUpdateState(updater.State)
 	}
 
 	a := &Agent{

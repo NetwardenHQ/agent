@@ -2,10 +2,16 @@
 
 package fim
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestWindowsRulesetNonEmpty(t *testing.T) {
-	roots := defaultRoots()
+	roots := defaultRoots(ScopeCredentials)
+	if !slices.Equal(roots, defaultRoots(ScopeFull)) {
+		t.Fatal("windows scopes differ; the ruleset has no costly part to leave out")
+	}
 	if len(roots) == 0 {
 		t.Fatal("windows default ruleset is empty; FIM would be inert")
 	}

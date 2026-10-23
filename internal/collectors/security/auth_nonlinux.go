@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package security
 
@@ -8,8 +8,9 @@ import (
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
-// Enabled reports false on non-Linux platforms — failed-login monitoring
-// requires journald or syslog-style auth logs.
+// Enabled reports false where there is no log source the collector reads:
+// Linux has journald or auth.log (auth_linux.go), Windows the Security event
+// log (auth_windows.go).
 func (c *AuthCollector) Enabled() bool {
 	return false
 }

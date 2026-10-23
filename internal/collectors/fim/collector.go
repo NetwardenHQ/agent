@@ -57,6 +57,7 @@ type Collector struct {
 	walkTimeout  time.Duration
 	manifestPath string
 	roots        []string
+	scope        Scope
 	realtime     bool
 
 	// ctx bounds background walks; Close cancels it.
@@ -160,7 +161,7 @@ func WithRoots(roots []string) Option {
 }
 
 // NewCollector creates the FIM collector. The default ruleset for the host's
-// platform is always included; WithRoots adds to it.
+// platform, in the chosen scope, is always included; WithRoots adds to it.
 func NewCollector(hostname string, opts ...Option) *Collector {
 	c := &Collector{
 		hostname:     hostname,
@@ -169,13 +170,13 @@ func NewCollector(hostname string, opts ...Option) *Collector {
 		interval:     DefaultInterval,
 		walkTimeout:  defaultWalkTimeout,
 		manifestPath: defaultManifestPath(),
-		roots:        defaultRoots(),
+		scope:        ScopeCredentials,
 		reportAcked:  true,
 	}
 	for _, o := range opts {
 		o(c)
 	}
-	c.roots = normalizeRoots(c.roots)
+	c.roots = normalizeRoots(append(defaultRoots(c.scope), c.roots...))
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c
 }

@@ -60,6 +60,9 @@ type payload struct {
 	OSInfo    map[string]string  `json:"os_info,omitempty"`
 	Latency   *int64             `json:"agent_latency,omitempty"`
 	Snapshots []metrics.Snapshot `json:"snapshots,omitempty"`
+	// SelfUpdate is "enabled", "disabled" or "unsupported", so the platform
+	// knows which hosts keep themselves current.
+	SelfUpdate string `json:"self_update,omitempty"`
 }
 
 // payloadMetric is one metric as the server expects it.
@@ -86,16 +89,19 @@ func toPayloadMetric(hostID string, m metrics.Metric) payloadMetric {
 // serverResponse is the subset of the /agent/data reply the agent acts on.
 //
 // The agent reports its version in every payload; when a newer release exists
-// the server names it here, along with where to get it and what it must hash
-// to. All three are a suggestion: local configuration outranks them, and the
-// agent will not run anything that is not signed by an identity configured on
-// the host itself. See internal/selfupdate for the precedence rules.
+// the server names it here, along with where to get it, what it must hash to
+// and, for packages that carry no signature of their own, the release
+// signature. All of it is a suggestion: local configuration outranks it, and
+// the agent will not install anything not signed by a key pinned on the host
+// itself. See internal/selfupdate for the precedence rules.
 type serverResponse struct {
 	Data struct {
 		AgentUpdate *struct {
-			Version string `json:"version"`
-			URL     string `json:"url"`
-			SHA256  string `json:"sha256"`
+			Version     string `json:"version"`
+			URL         string `json:"url"`
+			SHA256      string `json:"sha256"`
+			Signature   string `json:"signature"`
+			Certificate string `json:"certificate"`
 		} `json:"agent_update,omitempty"`
 	} `json:"data"`
 }
@@ -125,6 +131,9 @@ type HTTPTransmitter struct {
 	// current. The transmitter only reports the hint; deciding whether and
 	// when to act on it belongs to the updater, not to the metrics path.
 	onUpdateHint func(selfupdate.Offer)
+
+	// selfUpdateState, when set, reports the updater's state in each payload.
+	selfUpdateState func() string
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -347,9 +356,11 @@ func (t *HTTPTransmitter) handleResponse(body io.Reader) {
 		return
 	}
 	t.onUpdateHint(selfupdate.Offer{
-		Version: parsed.Data.AgentUpdate.Version,
-		URL:     parsed.Data.AgentUpdate.URL,
-		SHA256:  parsed.Data.AgentUpdate.SHA256,
+		Version:     parsed.Data.AgentUpdate.Version,
+		URL:         parsed.Data.AgentUpdate.URL,
+		SHA256:      parsed.Data.AgentUpdate.SHA256,
+		Signature:   parsed.Data.AgentUpdate.Signature,
+		Certificate: parsed.Data.AgentUpdate.Certificate,
 	})
 }
 
@@ -357,6 +368,12 @@ func (t *HTTPTransmitter) handleResponse(body io.Reader) {
 // a newer agent version. Call before Send.
 func (t *HTTPTransmitter) SetUpdateHintHandler(fn func(selfupdate.Offer)) {
 	t.onUpdateHint = fn
+}
+
+// SetSelfUpdateState registers the function that reports the updater's state
+// in each payload. Call before Send.
+func (t *HTTPTransmitter) SetSelfUpdateState(fn func() string) {
+	t.selfUpdateState = fn
 }
 
 // createPayload builds the request body for one batch.
@@ -395,6 +412,9 @@ func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots [
 
 	if ms := t.lastLatencyMs.Load(); ms >= 0 {
 		p.Latency = &ms
+	}
+	if t.selfUpdateState != nil {
+		p.SelfUpdate = t.selfUpdateState()
 	}
 
 	if len(snapshots) > maxSnapshotsPerPayload {
