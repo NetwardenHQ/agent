@@ -98,6 +98,9 @@ type Reader struct {
 	logger *slog.Logger
 	uid    int
 	now    func() time.Time
+	// volume, when set, is a directory only this container can write; see
+	// WithOwnVolume.
+	volume string
 
 	// Lock order: mu, then wmu. warn() takes wmu and is called with mu
 	// held; nothing takes mu while holding wmu.
@@ -158,6 +161,20 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithOwnerUID overrides the required owner (default 0). Tests only.
 func WithOwnerUID(uid int) Option { return func(r *Reader) { r.uid = uid } }
+
+// WithOwnVolume trusts a spool kept by this process's own user inside
+// volume, a directory only this container can write: a Kubernetes emptyDir.
+// The kubelet creates it world-writable, which the usual checks refuse, so
+// the volume directory itself is not checked; the directories above it are,
+// and the spool directory, which must be inside the volume, and everything
+// in it must still be owned by this user and not group or world writable.
+// A non-root agent in a pod has no root-owned directory to keep a spool in.
+func WithOwnVolume(volume string) Option {
+	return func(r *Reader) {
+		r.uid = os.Geteuid()
+		r.volume = filepath.Clean(volume)
+	}
+}
 
 // WithClock overrides the clock. Tests only.
 func WithClock(now func() time.Time) Option { return func(r *Reader) { r.now = now } }
@@ -234,7 +251,14 @@ func (r *Reader) openSpool() (*os.Root, bool) {
 		}
 		return nil, false
 	}
-	if err := checkParents(parent, r.uid); err != nil {
+	checkFrom := parent
+	if r.volume != "" {
+		if vol, err := filepath.EvalSymlinks(r.volume); err == nil &&
+			(parent == vol || strings.HasPrefix(parent, vol+string(filepath.Separator))) {
+			checkFrom = filepath.Dir(vol)
+		}
+	}
+	if err := checkParents(checkFrom, r.uid); err != nil {
 		r.warn(key, "a directory above the spool is not trusted; spool ignored", "dir", r.dir, "reason", err.Error())
 		return nil, false
 	}

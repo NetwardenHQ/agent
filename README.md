@@ -244,6 +244,8 @@ log_level: info                               # debug, info, warn, error
 # k8s_enable_resources: true
 # k8s_enable_cnpg: true
 # k8s_enable_ingress: true
+# k8s_enable_ingress_logs: false              # read the ingress-nginx access log; see "Kubernetes"
+# k8s_ingress_logs_namespace: ingress-nginx   # the controller's namespace
 
 # ---- Databases (off by default) ----
 # enable_postgresql: false                    # see "Database Monitoring"
@@ -271,6 +273,7 @@ log_level: info                               # debug, info, warn, error
 
 # ---- Spool for local producers ----
 # spool_dir: /var/lib/netwarden/spool         # "off" disables it
+# spool_volume: /var/lib/netwarden/spool      # in a pod only; see docs/spool.md
 ```
 
 The reporting interval is not set here. The platform sets it per plan, and the
@@ -614,6 +617,55 @@ virsh list --all                                             # libvirt access?
 
 Use read-only accounts and API tokens, keep hypervisor APIs on private
 networks, and leave TLS verification on in production.
+
+## Kubernetes
+
+Inside a cluster the agent watches the Kubernetes API rather than the machine
+it runs on. Install it with the manifest the dashboard generates (Add a host,
+Kubernetes): one read-only Deployment, a ServiceAccount, and a ClusterRole
+granting `get`, `list` and `watch` on what each ticked capability reads. The
+`k8s_enable_*` keys in its config mirror those grants and must match them; a
+watcher started without its permission retries forever and logs a 403 each
+time.
+
+### Attack detection from the ingress log
+
+With `k8s_enable_ingress_logs` the agent follows the access log of every
+ingress-nginx controller replica and reports the addresses that probe your
+sites: requests for secret files, admin consoles, exploit paths, GraphQL,
+Next.js server actions, paths built from your own host names, and crawler
+names that do not match the crawler's published addresses. Normal traffic
+never leaves the cluster; one `web.probe` event per probing address per
+cycle does. A secret-file path answered with something other than the site's
+not-found page is a `web.exposure` event, reported at once.
+
+Reading logs is granted in the controller's namespace only: the manifest adds
+a ClusterRole with `get` on `pods/log` and binds it with a RoleBinding in
+that namespace (`k8s_ingress_logs_namespace`, default `ingress-nginx`).
+Cluster-wide it would be every application's logs. The capability is off
+unless ticked when the manifest is generated.
+
+The controller's default log format works, with limits: it records no Host
+header and no response type, so it cannot show server-action probes, and it
+can only judge an exposure by its size. Set the JSON format in the
+controller's ConfigMap to get all of it. The field names are what the agent
+reads:
+
+```yaml
+log-format-escape-json: "true"
+log-format-upstream: '{"time":"$time_iso8601","ip":"$remote_addr","method":"$request_method","host":"$host","path":"$uri","protocol":"$server_protocol","status":"$status","bytes":"$body_bytes_sent","request_bytes":"$request_length","duration":"$request_time","user_agent":"$http_user_agent","content_type":"$content_type","response_type":"$sent_http_content_type","next_action":"$http_next_action","rsc":"$http_rsc","namespace":"$namespace","ingress":"$ingress_name","service":"$service_name","upstream":"$proxy_upstream_name","upstream_addr":"$upstream_addr","upstream_status":"$upstream_status","upstream_time":"$upstream_response_time","request_id":"$req_id"}'
+```
+
+`$uri` carries no query string, and the referrer and cookies are not logged:
+tokens in links never reach the log, let alone the agent.
+
+The agent reports how the reading goes as `k8s_ingress_log_reading`,
+`k8s_ingress_log_full_format`, `k8s_ingress_log_lines`,
+`k8s_ingress_log_unparsed`, `k8s_ingress_log_gap_seconds`,
+`k8s_ingress_log_sources_flagged`, `k8s_ingress_log_sources_dropped` and, per
+ingress, `k8s_ingress_log_server_action_blind`. Events go through the spool,
+which in a pod lives in an `emptyDir` (see [docs/spool.md](docs/spool.md));
+they survive a container restart, not a reschedule.
 
 ## Service Management
 

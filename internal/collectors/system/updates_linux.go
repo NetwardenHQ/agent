@@ -5,16 +5,22 @@ package system
 import (
 	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/host"
 )
 
+// errNoPackageManager: none of the package managers the agent can read is
+// installed, so there is no count to report (and zero would be a guess).
+var errNoPackageManager = errors.New("no supported package manager (apt, dnf/yum, pacman) found")
+
 // GetAvailableUpdates returns the number of available system updates on Linux.
-// It safely checks package manager databases without executing commands.
 func (c *Collector) GetAvailableUpdates(ctx context.Context) (int, error) {
 	// Try different package managers in order of prevalence
 
@@ -28,18 +34,12 @@ func (c *Collector) GetAvailableUpdates(ctx context.Context) (int, error) {
 		return count, nil
 	}
 
-	// Check for Zypper (openSUSE)
-	if count, err := getZypperUpdates(); err == nil {
-		return count, nil
-	}
-
 	// Check for Pacman (Arch)
 	if count, err := getPacmanUpdates(); err == nil {
 		return count, nil
 	}
 
-	// No supported package manager found or couldn't read update info
-	return 0, nil
+	return 0, errNoPackageManager
 }
 
 // getAPTUpdates checks for available updates on APT-based systems.
@@ -105,16 +105,14 @@ func getYumDnfUpdates() (int, error) {
 	cmd := exec.CommandContext(ctx, "/usr/bin/yum", "check-update", "--quiet", "--assumeyes")
 	// Set XDG_STATE_HOME to redirect dnf5 logs to a writable directory
 	cmd.Env = append(os.Environ(), "XDG_STATE_HOME=/var/log/netwarden/.dnf-state")
-	output, err := cmd.CombinedOutput()
-	// check-update returns exit code 100 if updates are available
-	// This is expected behavior, not an error
+	output, err := cmd.Output()
+	// check-update exits 100 when updates are available and 0 when there are
+	// none. Anything else is a failure, whatever it printed: counting the
+	// lines of an error message would report them as updates.
 	if err != nil {
-		// Only fail if it's not exit code 100
-		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 100 {
-			// Try to continue anyway if we got output
-			if len(output) == 0 {
-				return 0, err
-			}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 100 {
+			return 0, fmt.Errorf("yum check-update: %w", err)
 		}
 	}
 
@@ -148,28 +146,6 @@ func getYumDnfUpdates() (int, error) {
 	return count, nil
 }
 
-// getZypperUpdates checks for available updates on Zypper-based systems.
-func getZypperUpdates() (int, error) {
-	// Check if this is a Zypper-based system
-	if _, err := os.Stat("/usr/bin/zypper"); os.IsNotExist(err) {
-		return 0, err
-	}
-
-	// Zypper stores update information in XML files
-	cacheDir := "/var/cache/zypp"
-	if _, err := os.Stat(cacheDir); err == nil {
-		// Look for update metadata
-		updateFile := filepath.Join(cacheDir, "solv", "@System", "cookie")
-		if _, err := os.Stat(updateFile); err == nil {
-			// System has zypper but we can't easily determine update count
-			// without parsing complex solver files
-			return 0, nil
-		}
-	}
-
-	return 0, os.ErrNotExist
-}
-
 // getPacmanUpdates checks for available updates on Pacman-based systems.
 func getPacmanUpdates() (int, error) {
 	// Check if this is a Pacman-based system
@@ -177,24 +153,19 @@ func getPacmanUpdates() (int, error) {
 		return 0, err
 	}
 
-	// Check if checkupdates cache exists (created by pacman hooks)
-	cacheFile := "/var/cache/pacman/updates.cache"
-	if data, err := os.ReadFile(cacheFile); err == nil {
-		// Each line is a package update
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		if len(lines) > 0 && lines[0] != "" {
-			return len(lines), nil
+	// A pacman hook can leave checkupdates' output here, one update a line.
+	// Without it there is no count: pacman itself keeps none offline.
+	data, err := os.ReadFile("/var/cache/pacman/updates.cache")
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
 		}
 	}
-
-	// Check the pacman log for pending updates
-	logFile := "/var/log/pacman.log"
-	if _, err := os.Stat(logFile); err == nil {
-		// System has pacman but we can't determine update count easily
-		return 0, nil
-	}
-
-	return 0, os.ErrNotExist
+	return n, nil
 }
 
 // GetSecurityUpdates returns the number of available security updates on Linux.
@@ -211,8 +182,7 @@ func (c *Collector) GetSecurityUpdates(ctx context.Context) (int, error) {
 		return count, nil
 	}
 
-	// No security update info available
-	return 0, nil
+	return 0, errors.New("no security update information (apt or dnf/yum updateinfo) available")
 }
 
 // getAPTSecurityUpdates checks for available security updates on APT-based systems.
@@ -279,8 +249,7 @@ func getYumDnfSecurityUpdates() (int, error) {
 	cmd.Env = append(os.Environ(), "XDG_STATE_HOME=/var/log/netwarden/.dnf-state")
 	output, err := cmd.Output()
 	if err != nil {
-		// If command fails, return 0 (no security updates)
-		return 0, nil
+		return 0, fmt.Errorf("yum updateinfo: %w", err)
 	}
 
 	// Count security update lines
@@ -298,4 +267,45 @@ func getYumDnfSecurityUpdates() (int, error) {
 	}
 
 	return count, nil
+}
+
+// rebootRequired: Debian and Ubuntu flag a pending reboot in
+// /run/reboot-required (any package may ask for one). Beyond that, and on
+// every other distribution, a kernel installed since boot needs a reboot.
+func (c *Collector) rebootRequired(ctx context.Context) (bool, error) {
+	for _, p := range []string{"/run/reboot-required", "/var/run/reboot-required"} {
+		if _, err := os.Stat(p); err == nil {
+			return true, nil
+		}
+	}
+	boot, err := host.BootTimeWithContext(ctx)
+	if err != nil {
+		return false, err
+	}
+	release, err := host.KernelVersionWithContext(ctx)
+	if err != nil {
+		return false, err
+	}
+	return kernelInstalledSinceBoot("/boot/vmlinuz*", "vmlinuz-"+release, time.Unix(int64(boot), 0))
+}
+
+// updatesCheckedAt returns when the package catalogue was last checked. apt
+// records it in its lists. dnf and yum keep no such record (a failed refresh
+// touches the same files as a successful one), but they refresh expired
+// metadata themselves during the agent's check-update, so that check's time
+// is the answer there.
+func (c *Collector) updatesCheckedAt(counts *UpdateCounts) (time.Time, error) {
+	if _, err := os.Stat("/usr/bin/apt"); err == nil {
+		return aptCheckedAt("/var/lib/apt/lists")
+	}
+	if _, err := os.Stat("/usr/bin/yum"); err == nil && counts != nil && !counts.CheckedAt.IsZero() {
+		return counts.CheckedAt, nil
+	}
+	return time.Time{}, errNotReported
+}
+
+// releaseUpgrade reports a new distribution release. Only Ubuntu records one
+// locally; elsewhere it is not reported.
+func (c *Collector) releaseUpgrade(now time.Time) (bool, string, error) {
+	return ubuntuReleaseUpgrade("/var/lib/ubuntu-release-upgrader/release-upgrade-available", now)
 }

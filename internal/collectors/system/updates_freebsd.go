@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os/exec"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/host"
 )
 
 // pkgTimeout bounds each pkg(8) call; both read only local databases.
@@ -76,4 +78,27 @@ func countLines(b []byte) int {
 		}
 	}
 	return n
+}
+
+// rebootRequired: freebsd-update and OPNsense's kernel sets replace
+// /boot/kernel/kernel, so a kernel written since boot is waiting for one.
+func (c *Collector) rebootRequired(ctx context.Context) (bool, error) {
+	boot, err := host.BootTimeWithContext(ctx)
+	if err != nil {
+		return false, err
+	}
+	return kernelInstalledSinceBoot("/boot/kernel/kernel", "", time.Unix(int64(boot), 0))
+}
+
+// updatesCheckedAt: pkg stamps its catalogue with the repository's own time,
+// not the time of the check, and leaves it alone when nothing changed, so
+// when it last checked is not recorded. (OPNsense records it; the opnsense
+// collector reports that.)
+func (c *Collector) updatesCheckedAt(*UpdateCounts) (time.Time, error) {
+	return time.Time{}, errNotReported
+}
+
+// releaseUpgrade: a new FreeBSD release is only known by asking the mirrors.
+func (c *Collector) releaseUpgrade(time.Time) (bool, string, error) {
+	return false, "", errNotReported
 }

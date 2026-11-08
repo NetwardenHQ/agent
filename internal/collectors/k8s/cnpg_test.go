@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -466,6 +467,50 @@ func TestScrapeExporterIsBoundedAndDoesNotRedirect(t *testing.T) {
 	host, port = splitHostPort(t, big.URL)
 	if _, err := c.scrapeExporter(t.Context(), host, port, cnpgWantedInstance); err == nil {
 		t.Fatal("a page over maxExporterBytes must be an error")
+	}
+}
+
+// ingress-nginx publishes a histogram per ingress, path and method, so a busy
+// controller's page runs past 13 MiB (measured on 2026-11-08) while the series
+// the agent reads are a few hundred lines of it. The page size is not the
+// limit; the samples kept are.
+func TestScrapeExporterReadsALargePageOfUnwantedSeries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bucket := `nginx_ingress_controller_request_duration_seconds_bucket{ingress="app",le="0.5",path="/",status="200"} 1` + "\n"
+		for written := 0; written <= 16<<20; written += len(bucket) {
+			if _, err := io.WriteString(w, bucket); err != nil {
+				return
+			}
+		}
+		io.WriteString(w, `nginx_ingress_controller_requests{ingress="app",namespace="web",status="500"} 7`+"\n")
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.URL)
+
+	c := NewCollector("prod-cluster")
+	samples, err := c.scrapeExporter(t.Context(), host, port, ingressWanted)
+	if err != nil {
+		t.Fatalf("a 16 MiB page of unwanted series must scrape: %v", err)
+	}
+	if len(samples) != 1 || samples[0].Value != 7 {
+		t.Fatalf("want the one wanted sample, got %+v", samples)
+	}
+}
+
+func TestScrapeExporterRefusesTooManyWantedSamples(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i <= maxExporterSamples; i++ {
+			if _, err := fmt.Fprintf(w, "nginx_ingress_controller_requests{ingress=\"i%d\",status=\"200\"} 1\n", i); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.URL)
+
+	c := NewCollector("prod-cluster")
+	if _, err := c.scrapeExporter(t.Context(), host, port, ingressWanted); err == nil {
+		t.Fatal("more than maxExporterSamples wanted samples must be an error")
 	}
 }
 

@@ -193,6 +193,37 @@ func (c *Client) Watch(ctx context.Context, path, resourceVersion string) (*Stre
 	return &Stream{resp: resp, dec: json.NewDecoder(bufio.NewReader(resp.Body)), cancel: cancel}, nil
 }
 
+// FollowLog streams a container's log from since on (the whole log when since
+// is zero), each line prefixed with its kubelet timestamp. sinceTime has
+// one-second resolution, so a resumed stream repeats the lines of its first
+// second; the caller drops them by request id. The caller closes the stream.
+func (c *Client) FollowLog(ctx context.Context, namespace, pod, container string, since time.Time) (io.ReadCloser, error) {
+	q := url.Values{}
+	q.Set("follow", "true")
+	q.Set("timestamps", "true")
+	if container != "" {
+		q.Set("container", container)
+	}
+	if !since.IsZero() {
+		q.Set("sinceTime", since.UTC().Format(time.RFC3339))
+	}
+	path := "/api/v1/namespaces/" + url.PathEscape(namespace) + "/pods/" + url.PathEscape(pod) + "/log"
+	req, err := c.newRequest(ctx, path, q)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.stream.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		resp.Body.Close()
+		return nil, apiError(path, resp.StatusCode, body)
+	}
+	return resp.Body, nil
+}
+
 // Stream is an open watch connection yielding decoded events.
 type Stream struct {
 	resp   *http.Response

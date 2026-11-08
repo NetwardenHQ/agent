@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -29,7 +30,7 @@ type promSample struct {
 // without allocating, because an exporter emits thousands of lines and only a
 // dozen are needed. A read error, including a line too long to buffer, fails
 // the whole page: a partial page would look like a complete one with series
-// missing.
+// missing. So does a page with more than maxExporterSamples wanted samples.
 func parsePromText(r io.Reader, want map[string]bool) ([]promSample, error) {
 	var out []promSample
 	sc := bufio.NewScanner(r)
@@ -55,6 +56,9 @@ func parsePromText(r io.Reader, want map[string]bool) ([]promSample, error) {
 		v, err := strconv.ParseFloat(fields[0], 64)
 		if err != nil {
 			continue
+		}
+		if len(out) == maxExporterSamples {
+			return nil, fmt.Errorf("more than %d wanted samples", maxExporterSamples)
 		}
 		out = append(out, promSample{Name: name, Labels: parsePromLabels(labelPart), Value: v})
 	}

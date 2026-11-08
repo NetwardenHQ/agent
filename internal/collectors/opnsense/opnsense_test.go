@@ -73,6 +73,43 @@ func TestFirmwareMissingFileIsError(t *testing.T) {
 	}
 }
 
+func TestFirmwareMissingFileIsReportedAsNotChecked(t *testing.T) {
+	// OPNsense deletes and rewrites its status file on every update check and
+	// keeps it in /tmp, so after a reboot there is none until the next check.
+	// That is a state the page can explain, not a silent gap.
+	c := NewCollector("fw")
+	c.firmwareJSON = filepath.Join(t.TempDir(), "absent.json")
+	e := &emitter{c: c, ts: time.Now()}
+	_ = c.collectFirmware(context.Background(), e)
+	if m, ok := find(e.out, "opnsense_firmware_check_present", nil); !ok || m.Value != 0 {
+		t.Fatal("a missing status file must be reported as opnsense_firmware_check_present=0")
+	}
+	if _, ok := find(e.out, "opnsense_firmware_upgrade_packages", nil); ok {
+		t.Fatal("no package counts without a status file")
+	}
+}
+
+func TestVersionComesFromTheInstalledVersionFile(t *testing.T) {
+	// The version must not depend on the update check having run.
+	c := NewCollector("fw")
+	c.versionMarker = filepath.Join(t.TempDir(), "core")
+	c.firmwareOwner = uint32(os.Getuid())
+	os.WriteFile(c.versionMarker, []byte("{\n  \"product_id\": \"opnsense\",\n  \"product_name\": \"OPNsense\",\n  \"product_version\": \"26.7.7\"\n}\n"), 0o644)
+	e := &emitter{c: c, ts: time.Now()}
+	if err := c.collectVersion(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := find(e.out, "opnsense_info", nil)
+	if !ok || m.Labels["product_version"] != "26.7.7" || m.Labels["product_id"] != "opnsense" {
+		t.Fatalf("opnsense_info = %+v", m)
+	}
+
+	os.WriteFile(c.versionMarker, []byte(`{"product_id":"opnsense"}`), 0o644)
+	if err := c.collectVersion(context.Background(), &emitter{c: c, ts: time.Now()}); err == nil {
+		t.Fatal("a version file without product_version must be an error")
+	}
+}
+
 func TestGateways(t *testing.T) {
 	data := []byte(`{"WAN_DHCP":{"name":"WAN_DHCP","address":"203.0.113.1","status":"none","loss":"0.0 %","delay":"8.4 ms","stddev":"0.6 ms","monitor":"203.0.113.1"},
 "BACKUP":{"name":"BACKUP","address":"198.51.100.1","status":"down","loss":"100.0 %","delay":"~","stddev":"~","monitor":"198.51.100.1"},

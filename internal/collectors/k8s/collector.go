@@ -59,6 +59,16 @@ type Collector struct {
 	capResources    bool
 	capCNPG         bool
 	capIngress      bool
+	capIngressLogs  bool
+
+	// Ingress log reading (ingresslog.go); see WithIngressLogs.
+	ingressLogNamespace string
+	spoolDir            string
+	urgent              func()
+	edge                *edgeTracker
+	logs                *logFollowers
+	ownHostsCache       atomic.Pointer[[]string]
+	edgeWarned          map[string]bool
 
 	// CloudNativePG. The exporters live on the pod network, not behind the API
 	// server, so they need an ordinary HTTP client of their own.
@@ -213,6 +223,10 @@ type Capabilities struct {
 	Resources    bool
 	CNPG         bool
 	Ingress      bool
+	// IngressLogs reads the ingress-nginx controller's access log. It needs
+	// pods/log in the controller's namespace, which the manifest grants only
+	// when asked, so unlike the others it is off unless set.
+	IngressLogs bool
 }
 
 // WithCapabilities restricts what the collector watches, mirroring the RBAC the
@@ -226,8 +240,28 @@ func WithCapabilities(caps Capabilities) Option {
 		c.capResources = caps.Resources
 		c.capCNPG = caps.CNPG
 		c.capIngress = caps.Ingress
+		c.capIngressLogs = caps.IngressLogs
 	}
 }
+
+// WithIngressLogs sets the namespace of the ingress-nginx controller whose
+// access log is read when the IngressLogs capability is on.
+func WithIngressLogs(namespace string) Option {
+	return func(c *Collector) {
+		if namespace != "" {
+			c.ingressLogNamespace = namespace
+		}
+	}
+}
+
+// WithSpoolDir sets the spool the ingress log events are written to. Without
+// one, the log is not read.
+func WithSpoolDir(dir string) Option { return func(c *Collector) { c.spoolDir = dir } }
+
+// WithUrgent sets what to call when an event should be reported without
+// waiting for the next cycle (a secret file served). It is called at most
+// once every urgentMinInterval and must not block.
+func WithUrgent(fn func()) Option { return func(c *Collector) { c.urgent = fn } }
 
 // WithClusterName labels the cluster in emitted snapshots. Optional: it
 // defaults to the agent hostname, which the install manifest sets to the
@@ -254,6 +288,9 @@ func NewCollector(hostname string, opts ...Option) *Collector {
 		capIngress:      true,
 		cnpgLast:        map[string]cnpgCounters{},
 		ingressLast:     map[string]ingressCounters{},
+		// The namespace ingress-nginx installs into by default.
+		ingressLogNamespace: "ingress-nginx",
+		edgeWarned:          map[string]bool{},
 		// Not the default client: no proxy, a hard timeout, kept-alive
 		// connections so a 3-instance cluster does not reopen six sockets a
 		// minute, and no redirects. An exporter is scraped at the pod IP the
@@ -369,6 +406,12 @@ func (c *Collector) Close() error {
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	c.mu.Lock()
+	logs := c.logs
+	c.mu.Unlock()
+	if logs != nil {
+		logs.Stop()
 	}
 	c.watchers.Wait()
 	if c.scraper != nil {
@@ -577,7 +620,10 @@ func (c *Collector) ensureWatchers() bool {
 			"resources", strings.Join(started, ","),
 			"jobs", c.capJobs, "availability", c.capAvailability,
 			"resources_usage", c.capResources, "cloudnativepg", c.capCNPG,
-			"ingress", c.capIngress)
+			"ingress", c.capIngress, "ingress_logs", c.capIngressLogs)
+		if c.capIngressLogs {
+			c.startIngressLogs()
+		}
 	})
 	return started
 }
@@ -778,7 +824,8 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 	}
 
-	return c.emitMetrics(reachable, counts, usage, cronReport, cnpg, ingress, now), nil
+	out := c.emitMetrics(reachable, counts, usage, cronReport, cnpg, ingress, now)
+	return append(out, c.collectEdge(fresh, allPods, now)...), nil
 }
 
 // inScope drops the objects that live in an excluded namespace.

@@ -5,6 +5,34 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Update state beyond the counts, read from the OS every cycle:
+  - `system_reboot_required`: on Linux, `/run/reboot-required` or a kernel image other than the
+    running one installed since boot; on FreeBSD, `/boot/kernel/kernel` replaced since boot; on
+    Windows, the `RebootRequired` (Windows Update) and `RebootPending` (servicing) keys.
+  - `system_updates_check_age_seconds`: apt's last successful refresh (the newest change time of
+    the `*Release` files in `/var/lib/apt/lists`), the agent's last successful `check-update` on
+    dnf and yum, and its last successful Windows Update scan.
+  - `system_release_upgrade_available` (label `version`): Ubuntu's own release check, while it
+    is less than eight days old.
+  Facts a system does not record are not sent: FreeBSD keeps no check time and macOS none of the
+  three.
+- OPNsense: `opnsense_info` now comes from `/usr/local/opnsense/version/core`, so the version is
+  known before the first update check. `opnsense_firmware_check_present` is 0 while OPNsense has
+  not run its update check since boot (its status file lives in `/tmp`).
+
+### Fixed
+- Kubernetes: ingress traffic is reported again on busy clusters. ingress-nginx publishes a
+  histogram per ingress, path and method, and its metrics page passed the 8 MiB limit on one
+  exporter page (13 MiB on our own cluster), so every controller was reported unreachable and no
+  `k8s_ingress_*` series were sent. Only the wanted series are kept while the page streams past,
+  so the limit is now 20,000 kept samples per page; the page itself may run to 64 MiB.
+- Linux no longer reports zero updates when it cannot tell: no supported package manager, zypper,
+  pacman without a `checkupdates` cache, and a failed `yum updateinfo` now send no count at all.
+  `yum check-update` failing with output is a failure, not a list of updates.
+
 ## [3.3.0] - 2026-10-23
 
 ### Added

@@ -4,12 +4,15 @@ package system
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 // Cache update count for 6 hours to avoid repeated checks
@@ -22,6 +25,9 @@ var (
 	updateCacheExpiry      time.Time
 	updateCacheMutex       sync.Mutex
 	updateCacheInitialized bool
+	// lastScanSucceeded is when Windows Update last answered a scan. A failed
+	// scan returns the previous counts, so this is what says how old they are.
+	lastScanSucceeded time.Time
 )
 
 // updateResult represents a single Windows Update
@@ -138,6 +144,7 @@ func (c *Collector) GetAvailableUpdates(ctx context.Context) (int, error) {
 		cachedSecurityCount = res.securityCount
 		updateCacheExpiry = time.Now().Add(6 * time.Hour)
 		updateCacheInitialized = true
+		lastScanSucceeded = time.Now()
 
 		c.logger.Info("Windows Update check completed via PowerShell CIM",
 			"total_updates", cachedUpdateCount,
@@ -195,4 +202,44 @@ func (c *Collector) GetSecurityUpdates(ctx context.Context) (int, error) {
 	}
 
 	return cachedSecurityCount, nil
+}
+
+// rebootPendingKeys are the keys Windows creates while an installed update
+// waits for a restart: Windows Update's own, and the servicing stack's.
+// (PendingFileRenameOperations is left out: ordinary installers set it.)
+var rebootPendingKeys = []string{
+	`SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired`,
+	`SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending`,
+}
+
+func (c *Collector) rebootRequired(context.Context) (bool, error) {
+	for _, path := range rebootPendingKeys {
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE|registry.WOW64_64KEY)
+		if err == nil {
+			k.Close()
+			return true, nil
+		}
+		// Access denied is not "no reboot": only an absent key is.
+		if !errors.Is(err, registry.ErrNotExist) {
+			return false, fmt.Errorf("read %s: %w", path, err)
+		}
+	}
+	return false, nil
+}
+
+// updatesCheckedAt is when the agent's last Windows Update scan, an online
+// search, succeeded.
+func (c *Collector) updatesCheckedAt(*UpdateCounts) (time.Time, error) {
+	updateCacheMutex.Lock()
+	defer updateCacheMutex.Unlock()
+	if lastScanSucceeded.IsZero() {
+		return time.Time{}, errNotReported
+	}
+	return lastScanSucceeded, nil
+}
+
+// releaseUpgrade: feature updates arrive as ordinary updates (counted above)
+// or through Windows Update's own offer, which it does not expose locally.
+func (c *Collector) releaseUpgrade(time.Time) (bool, string, error) {
+	return false, "", errNotReported
 }

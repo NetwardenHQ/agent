@@ -124,6 +124,19 @@ type Config struct {
 	FIMManifestPath string
 	FIMRoots        []string
 
+	// K8sIngressLogsNamespace is where the ingress-nginx controller runs: the
+	// one namespace whose pod logs K8sIngressLogs reads.
+	// Default ingress-nginx (k8s_ingress_logs_namespace).
+	K8sIngressLogsNamespace string
+
+	// SpoolVolume, when set, is a volume only this container can write (a
+	// Kubernetes emptyDir), with SpoolDir inside it. The agent then keeps the
+	// spool as its own user instead of requiring root ownership, which a
+	// non-root container cannot have, and does not check the volume
+	// directory itself, which the kubelet creates world-writable
+	// (spool_volume).
+	SpoolVolume string
+
 	// SpoolDir is the directory local producers (for example an OPNsense UI
 	// plugin) write events and exposure files into for the agent to forward;
 	// the agent's own security events (logins, account changes) go there too.
@@ -313,6 +326,12 @@ type CollectorToggles struct {
 	K8sCNPG         bool
 	K8sIngress      bool
 
+	// K8sIngressLogs follows the ingress-nginx controller's access log and
+	// reports the addresses that probe. Default off: it needs a RoleBinding
+	// for pods/log that the install manifest grants only when the capability
+	// is ticked (k8s_enable_ingress_logs).
+	K8sIngressLogs bool
+
 	// Kubernetes enables cluster monitoring from inside a pod. Default on:
 	// the collector activates only when it finds an in-cluster ServiceAccount
 	// token, so on an ordinary host it stays inert. Disable with
@@ -448,6 +467,7 @@ func LoadConfig(filename string) (*Config, error) {
 	config.Collectors.K8sResources = true
 	config.Collectors.K8sCNPG = true
 	config.Collectors.K8sIngress = true
+	config.K8sIngressLogsNamespace = "ingress-nginx"
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -517,6 +537,12 @@ func LoadConfig(filename string) (*Config, error) {
 			config.Collectors.K8sCNPG = isTruthy(value)
 		case "k8s_enable_ingress":
 			config.Collectors.K8sIngress = isTruthy(value)
+		case "k8s_enable_ingress_logs":
+			config.Collectors.K8sIngressLogs = isTruthy(value)
+		case "k8s_ingress_logs_namespace":
+			if v := strings.TrimSpace(value); v != "" {
+				config.K8sIngressLogsNamespace = v
+			}
 		case "enable_fim", "enable_file_integrity":
 			config.FIMExplicit = true
 			config.Collectors.FIM = isTruthy(value)
@@ -531,6 +557,8 @@ func LoadConfig(filename string) (*Config, error) {
 				v = ""
 			}
 			config.SpoolDir = v
+		case "spool_volume":
+			config.SpoolVolume = strings.TrimSpace(value)
 		case "fim_manifest_path":
 			config.FIMManifestPath = strings.TrimSpace(value)
 		case "fim_roots", "file_integrity_roots":

@@ -145,6 +145,7 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		// command sources follow, each command under commandTimeout, so a
 		// hung configctl cannot starve the rest of the cycle's budget.
 		{"config", c.collectConfig},
+		{"version", c.collectVersion},
 		{"firmware", c.collectFirmware},
 		{"ids", c.collectIDS},
 		{"filterlog", c.collectFilterLog},

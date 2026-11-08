@@ -48,7 +48,10 @@ func parseFirmware(data []byte) (firmwareStatus, error) {
 func (c *Collector) collectFirmware(_ context.Context, e *emitter) error {
 	data, info, err := readTrustedFile(c.firmwareJSON, c.firmwareOwner, maxFirmwareJSON)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("no firmware status file (has the OPNsense update check ever run?): %w", err)
+		// check.sh deletes the file before each check and it lives in /tmp,
+		// so a firewall that has not run a check since it booted has none.
+		e.gauge("opnsense_firmware_check_present", 0, nil)
+		return fmt.Errorf("no firmware status file (has the OPNsense update check run since boot?): %w", err)
 	}
 	if err != nil {
 		return err
@@ -59,13 +62,11 @@ func (c *Collector) collectFirmware(_ context.Context, e *emitter) error {
 	}
 
 	ok := f.Connection == "ok" && f.Repository == "ok"
+	e.gauge("opnsense_firmware_check_present", 1, nil)
 	e.gauge("opnsense_firmware_check_ok", b2f(ok), map[string]string{
 		"connection": f.Connection, "repository": f.Repository,
 	})
 	e.gauge("opnsense_firmware_check_age_seconds", e.ts.Sub(info.ModTime()).Seconds(), nil)
-	e.gauge("opnsense_info", 1, map[string]string{
-		"product_id": f.ProductID, "product_version": f.ProductVersion,
-	})
 
 	// Package counts are only meaningful when the check reached the mirrors.
 	if ok {
@@ -80,5 +81,34 @@ func (c *Collector) collectFirmware(_ context.Context, e *emitter) error {
 			map[string]string{"version": strings.TrimSpace(f.UpgradeMajorVer)})
 	}
 	e.gauge("opnsense_reboot_required", b2f(f.NeedsReboot == "1" || f.UpgradeNeedsReboot == "1"), nil)
+	return nil
+}
+
+// versionFile is /usr/local/opnsense/version/core, which opnsense-version(8)
+// reads: the installed release, whether or not an update check has run.
+type versionFile struct {
+	ProductID      string `json:"product_id"`
+	ProductName    string `json:"product_name"`
+	ProductVersion string `json:"product_version"`
+}
+
+const maxVersionJSON = 64 << 10
+
+// collectVersion reports the installed OPNsense release.
+func (c *Collector) collectVersion(_ context.Context, e *emitter) error {
+	data, _, err := readTrustedFile(c.versionMarker, c.firmwareOwner, maxVersionJSON)
+	if err != nil {
+		return err
+	}
+	var v versionFile
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("version file is not valid JSON: %w", err)
+	}
+	if strings.TrimSpace(v.ProductVersion) == "" {
+		return fmt.Errorf("version file has no product_version")
+	}
+	e.gauge("opnsense_info", 1, map[string]string{
+		"product_id": v.ProductID, "product_name": v.ProductName, "product_version": v.ProductVersion,
+	})
 	return nil
 }

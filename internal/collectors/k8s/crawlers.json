@@ -1,0 +1,126 @@
+{
+  "version": "2026-10-23.1",
+  "crawlers": [
+    {
+      "operator": "google-common",
+      "claims": [
+        "Googlebot",
+        "Google-InspectionTool",
+        "GoogleOther"
+      ]
+    },
+    {
+      "operator": "google-special",
+      "claims": [
+        "AdsBot-Google",
+        "Mediapartners-Google",
+        "APIs-Google"
+      ]
+    },
+    {
+      "operator": "google-user-triggered",
+      "claims": [
+        "FeedFetcher-Google",
+        "Google-Read-Aloud",
+        "Google-Site-Verification"
+      ]
+    },
+    {
+      "operator": "bing",
+      "claims": [
+        "bingbot"
+      ]
+    },
+    {
+      "operator": "apple",
+      "claims": [
+        "Applebot"
+      ]
+    },
+    {
+      "operator": "openai-gptbot",
+      "claims": [
+        "GPTBot"
+      ]
+    },
+    {
+      "operator": "openai-chatgpt-user",
+      "claims": [
+        "ChatGPT-User"
+      ]
+    },
+    {
+      "operator": "openai-searchbot",
+      "claims": [
+        "OAI-SearchBot"
+      ]
+    },
+    {
+      "operator": "perplexity-bot",
+      "claims": [
+        "PerplexityBot"
+      ]
+    },
+    {
+      "operator": "perplexity-user",
+      "claims": [
+        "Perplexity-User"
+      ]
+    },
+    {
+      "operator": "duckduckgo",
+      "claims": [
+        "DuckDuckBot"
+      ]
+    },
+    {
+      "operator": "commoncrawl",
+      "claims": [
+        "CCBot"
+      ]
+    },
+    {
+      "operator": "yandex",
+      "claims": [
+        "YandexBot"
+      ]
+    },
+    {
+      "operator": "baidu",
+      "claims": [
+        "Baiduspider"
+      ]
+    },
+    {
+      "operator": "anthropic",
+      "claims": [
+        "ClaudeBot",
+        "Claude-User"
+      ]
+    },
+    {
+      "operator": "amazon",
+      "claims": [
+        "Amazonbot"
+      ]
+    },
+    {
+      "operator": "cohere",
+      "claims": [
+        "cohere-ai"
+      ]
+    },
+    {
+      "operator": "tencent",
+      "claims": [
+        "Hunyuan"
+      ]
+    },
+    {
+      "operator": "bytedance",
+      "claims": [
+        "Bytespider"
+      ]
+    }
+  ]
+}

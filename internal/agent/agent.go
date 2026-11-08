@@ -112,6 +112,11 @@ type Agent struct {
 	stopChan chan struct{}
 	stopOnce sync.Once
 
+	// urgent asks the report loop for a cycle now (a collector saw something
+	// that should not wait for the interval). Buffered by one: a request
+	// made while one is pending is the same request.
+	urgent chan struct{}
+
 	cacheCleanupStop chan struct{}
 
 	mu                  sync.Mutex
@@ -191,14 +196,21 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		httpClient: sharedhttp.GetClient(),
 
 		stopChan:          make(chan struct{}),
+		urgent:            make(chan struct{}, 1),
 		cacheCleanupStop:  cache.StartGlobalCleanup(5 * time.Minute),
 		reportingInterval: defaultReportingInterval,
 	}
 
 	a.identityEnabled = true
 	if cfg.SpoolDir != "" {
-		a.spool = spool.New(cfg.SpoolDir, spool.WithLogger(logger.With("component", "spool")))
-		if !spool.CanCreateDirs() {
+		opts := []spool.Option{spool.WithLogger(logger.With("component", "spool"))}
+		if cfg.SpoolVolume != "" {
+			// In a pod the agent is not root; the spool is its own, inside an
+			// emptyDir no other container mounts.
+			opts = append(opts, spool.WithOwnVolume(cfg.SpoolVolume))
+		}
+		a.spool = spool.New(cfg.SpoolDir, opts...)
+		if cfg.SpoolVolume == "" && !spool.CanCreateDirs() {
 			logger.Info("not running as root; spool directories are not created", "dir", cfg.SpoolDir)
 		} else if err := a.spool.EnsureDirs(); err != nil {
 			logger.Warn("could not create spool directories", "dir", cfg.SpoolDir, "error", err)
@@ -288,7 +300,11 @@ func (a *Agent) registerCollectors() error {
 				Resources:    a.config.Collectors.K8sResources,
 				CNPG:         a.config.Collectors.K8sCNPG,
 				Ingress:      a.config.Collectors.K8sIngress,
+				IngressLogs:  a.config.Collectors.K8sIngressLogs,
 			}),
+			k8s.WithIngressLogs(a.config.K8sIngressLogsNamespace),
+			k8s.WithSpoolDir(a.config.SpoolDir),
+			k8s.WithUrgent(a.requestReport),
 		)
 		if err := register("kubernetes", c); err != nil {
 			return err
@@ -559,6 +575,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.logger.Error("collection and transmission failed", "error", err)
 			}
 
+		case <-a.urgent:
+			if err := a.collectAndTransmit(ctx); err != nil {
+				a.logger.Error("early collection and transmission failed", "error", err)
+			}
+
 		case <-cleanupTicker.C:
 			if removed := a.deltaTracker.Cleanup(24 * time.Hour); removed > 0 {
 				a.logger.Debug("delta tracker cleanup completed", "removed_metrics", removed)
@@ -578,6 +599,15 @@ func (a *Agent) Run(ctx context.Context) error {
 				ticker.Reset(interval)
 			}
 		}
+	}
+}
+
+// requestReport asks the report loop for a cycle now. It never blocks: a
+// request made while one is already pending is the same request.
+func (a *Agent) requestReport() {
+	select {
+	case a.urgent <- struct{}{}:
+	default:
 	}
 }
 
@@ -637,6 +667,7 @@ func (a *Agent) performUpdateCheck(ctx context.Context) {
 		Available:       updateCount,
 		Security:        securityCount,
 		SecurityUnknown: securityUnknown,
+		CheckedAt:       time.Now(),
 	}, updateCheckInterval)
 
 	a.logger.Info("background update check completed",

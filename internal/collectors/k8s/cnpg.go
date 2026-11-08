@@ -323,11 +323,19 @@ func (c *Collector) scrapeExporter(ctx context.Context, ip string, port int, wan
 	return samples, nil
 }
 
-// maxExporterBytes caps one exporter page. A real CNPG or ingress-nginx page is
-// well under 1 MiB even on a busy cluster; anything past this is not a
-// recognized exporter, and reading it unbounded would let any pod on the
-// network grow the agent's memory.
-const maxExporterBytes = 8 << 20
+// maxExporterBytes bounds how long one page is read, not memory: the parser
+// streams it and keeps only the wanted series (see maxExporterSamples). A CNPG
+// page is well under 1 MiB, but ingress-nginx publishes a histogram per
+// ingress, path and method, and a busy controller's page is past 13 MiB
+// (measured 2026-11-08). At 8 MiB every controller read as unreachable and the
+// cluster reported no ingress traffic at all.
+const maxExporterBytes = 64 << 20
+
+// maxExporterSamples caps the wanted samples kept from one page. This is what
+// stops a pod on the network from growing the agent's memory: an ingress-nginx
+// page carries a few hundred wanted lines per controller, a CNPG page a few
+// dozen.
+const maxExporterSamples = 20000
 
 // countingReader counts the bytes read through it.
 type countingReader struct {

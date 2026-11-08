@@ -27,6 +27,8 @@ type UpdateCounts struct {
 	// SecurityUnknown is set when the security check could not run, so the
 	// count is not reported: an unreadable audit must not read as "none".
 	SecurityUnknown bool
+	// CheckedAt is when the check that produced these counts succeeded.
+	CheckedAt time.Time
 }
 
 // UpdatesCacheKey is the cache key under which the agent stores UpdateCounts.
@@ -106,11 +108,14 @@ func (c *Collector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 		}
 	}
 
-	// Update counts come from the agent's background check, via the cache.
+	// Update counts come from the agent's background check, via the cache;
+	// the rest of the update state is read from the OS each cycle.
 	if runtime.GOOS == "linux" || runtime.GOOS == "windows" || runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
-		if err := c.collectUpdateInfoFromCache(&collectedMetrics); err != nil {
+		counts, err := c.collectUpdateInfoFromCache(&collectedMetrics)
+		if err != nil {
 			c.logger.Debug("no cached update info available", "error", err)
 		}
+		c.collectUpdateStatus(ctx, counts, &collectedMetrics)
 	}
 
 	// Collect user count
@@ -162,20 +167,20 @@ func (c *Collector) collectLoadAverage(ctx context.Context, metrics *[]metrics.M
 // collectUpdateInfoFromCache reports the update counts the agent's
 // background check cached. Before the first check has run there is nothing
 // to report and the metrics are absent.
-func (c *Collector) collectUpdateInfoFromCache(metrics *[]metrics.Metric) error {
+func (c *Collector) collectUpdateInfoFromCache(metrics *[]metrics.Metric) (*UpdateCounts, error) {
 	cached, ok := cache.Get(UpdatesCacheKey(c.hostname))
 	if !ok {
-		return fmt.Errorf("update cache not populated yet")
+		return nil, fmt.Errorf("update cache not populated yet")
 	}
 	counts, ok := cached.(UpdateCounts)
 	if !ok {
-		return fmt.Errorf("unexpected update cache type %T", cached)
+		return nil, fmt.Errorf("unexpected update cache type %T", cached)
 	}
 	c.addGauge(metrics, "system_updates_available_count", float64(counts.Available))
 	if !counts.SecurityUnknown {
 		c.addGauge(metrics, "system_security_updates_count", float64(counts.Security))
 	}
-	return nil
+	return &counts, nil
 }
 
 // collectUserCount gathers the number of currently logged-in users

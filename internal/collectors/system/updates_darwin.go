@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // GetAvailableUpdates returns the number of available system updates on macOS.
@@ -145,4 +146,15 @@ func (c *Collector) GetSecurityUpdates(ctx context.Context) (int, error) {
 	// macOS doesn't provide separate security update counts
 	// Return 0 as security updates are included in general updates
 	return 0, nil
+}
+
+// macOS keeps none of these where the agent can read them unprivileged.
+func (c *Collector) rebootRequired(context.Context) (bool, error) { return false, errNotReported }
+
+func (c *Collector) updatesCheckedAt(*UpdateCounts) (time.Time, error) {
+	return time.Time{}, errNotReported
+}
+
+func (c *Collector) releaseUpgrade(time.Time) (bool, string, error) {
+	return false, "", errNotReported
 }

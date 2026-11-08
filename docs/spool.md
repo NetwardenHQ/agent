@@ -104,6 +104,26 @@ the platform raises findings from them, so they never notify on their own.
 - A failed login is never an event, only a count (`security_failed_logins`):
   the username of a failed login is sometimes a mistyped password.
 
+The in-cluster agent, with `k8s_enable_ingress_logs`, reads the ingress-nginx
+access log and writes `events/edge-<nanoseconds>.jsonl` (probes, once per
+reporting cycle) and `events/edge-exposure-<nanoseconds>.jsonl` (exposures, at
+once, followed by an early report). Only addresses that matched a signature
+leave the agent; normal traffic, query strings and referrers never do. Lists
+in labels are comma-separated and cut to 300 characters.
+
+| `type` | When | `labels` |
+|---|---|---|
+| `web.probe` | an address matched at least one signature class during the cycle (at most 100 per cycle, busiest first) | `source_ip`, `requests`, `not_found`, `hosts`, `hosts_count`, `classes`, `paths` (matched paths only), `paths_total`, `statuses` (`404:31,200:1`), `crawler_claims`, `ua_count`, `ua_sample`, `format` (`json` or `default`), `signature_version`, `window_start` (Unix seconds) |
+| `web.exposure` | a secret-file path answered 2xx, and the reply does not look like the site's not-found page | `source_ip`, `host` (the upstream in the default format), `path`, `status`, `response_type`, `bytes`, `not_found_type`, `not_found_bytes`, `verdict` (`likely` when the response type is not a web page, `possible` when only the size differs by more than 10%), `format` |
+
+- `classes`: `secret_file`, `admin_probe`, `exploit_path`, `server_action`,
+  `graphql_probe`, `crawler_claim`, `targeted_path`.
+- `dedupe_key`: `probe:<source_ip>:<window_start>` and `exposure:<request_id>`.
+- What the reader learns across cycles (each ingress's not-found shape, and
+  whether it serves Next.js server actions) is kept in `edge/state.json`
+  under the spool directory, with client addresses hashed. The spool reader
+  never reads that directory.
+
 ## `exposure.json`
 
 A full replacement each time it is written:
@@ -169,6 +189,22 @@ the open descriptor:
   ```
 
 A spool that fails a check is ignored and the reason is logged once.
+
+In a Kubernetes pod the agent is not root, and the only writable place is an
+`emptyDir`, which the kubelet creates root-owned and world-writable. There,
+`spool_volume` names the volume and `spool_dir` a directory inside it; the
+agent creates that directory itself (mode 0700) and trusts it when it, and
+everything in it, is owned by the agent's own user and not writable by group
+or others. The volume directory itself is not checked; the directories above
+it are, as usual. The generated install manifest sets both:
+
+```
+spool_dir: /var/lib/netwarden/spool/agent
+spool_volume: /var/lib/netwarden/spool
+```
+
+No other container mounts the volume, so nothing but the agent can write to
+it. On a host, leave `spool_volume` unset.
 
 ## Agent state file
 
