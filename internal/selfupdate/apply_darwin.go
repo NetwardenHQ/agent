@@ -71,3 +71,7 @@ func applyUpdate(ctx context.Context, target Target, signers []string, logger *s
 	}
 	return awaitReplacement(ctx, target, 2*time.Minute, "launchctl print system/com.netwarden.agent")
 }
+
+// attemptsFile: the agent survives a failed update here, so the attempts it
+// remembers in memory are enough.
+func attemptsFile() string { return "" }

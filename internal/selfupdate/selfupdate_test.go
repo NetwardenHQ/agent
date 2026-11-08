@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"context"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -318,5 +319,77 @@ func TestCloseAbandonsAScheduledUpdate(t *testing.T) {
 			t.Fatal("the scheduled update did not stop on Close")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// In Kubernetes an update is a restart, and a Deployment pinned to a version
+// tag restarts into the same version. The attempt has to outlive the process,
+// or the agent restarts for the same release every night, forever.
+func TestAnAttemptSurvivesARestart(t *testing.T) {
+	file := t.TempDir() + "/attempts.json"
+	first := newTestUpdater("3.3.0", 2)
+	first.cfg.AttemptsFile = file
+	if ok, why := first.decide("3.4.0", true); !ok {
+		t.Fatalf("first attempt refused: %s", why)
+	}
+
+	restarted := New(Config{Enabled: true, CurrentVersion: "3.3.0", WindowStartHour: 1, WindowEndHour: 5, AttemptsFile: file},
+		slog.New(slog.DiscardHandler))
+	restarted.support = supported
+	restarted.now = first.now
+	if ok, why := restarted.ShouldApply("3.4.0"); ok || why != "recently attempted" {
+		t.Fatalf("after a restart that did not upgrade: ok=%v why=%q", ok, why)
+	}
+	if got := restarted.State(); got != StateUnsupported {
+		t.Fatalf("an agent its restart did not upgrade must say so: got %q", got)
+	}
+}
+
+func TestASuccessfulUpgradeLeavesNoMark(t *testing.T) {
+	file := t.TempDir() + "/attempts.json"
+	before := newTestUpdater("3.3.0", 2)
+	before.cfg.AttemptsFile = file
+	if ok, _ := before.decide("3.4.0", true); !ok {
+		t.Fatal("attempt refused")
+	}
+	after := New(Config{Enabled: true, CurrentVersion: "3.4.0", WindowStartHour: 1, WindowEndHour: 5, AttemptsFile: file},
+		slog.New(slog.DiscardHandler))
+	after.support = supported
+	after.now = before.now
+	if got := after.State(); got != StateEnabled {
+		t.Fatalf("upgraded agent: got %q", got)
+	}
+}
+
+func TestAStaleAttemptIsRetriedAfterTheBackoff(t *testing.T) {
+	file := t.TempDir() + "/attempts.json"
+	u := newTestUpdater("3.3.0", 2)
+	u.cfg.AttemptsFile = file
+	if ok, _ := u.decide("3.4.0", true); !ok {
+		t.Fatal("attempt refused")
+	}
+	later := New(Config{Enabled: true, CurrentVersion: "3.3.0", WindowStartHour: 1, WindowEndHour: 5, AttemptsFile: file},
+		slog.New(slog.DiscardHandler))
+	later.support = supported
+	later.now = func() time.Time { return u.now().Add(retryBackoff + time.Hour) }
+	if got := later.State(); got != StateEnabled {
+		t.Fatalf("a day later the Deployment may have been fixed: got %q", got)
+	}
+	if ok, why := later.ShouldApply("3.4.0"); !ok {
+		t.Fatalf("a day later it tries once more: %s", why)
+	}
+}
+
+func TestAnUnreadableAttemptsFileIsNotFatal(t *testing.T) {
+	file := t.TempDir() + "/attempts.json"
+	if err := os.WriteFile(file, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{Enabled: true, CurrentVersion: "3.3.0", WindowStartHour: 1, WindowEndHour: 5, AttemptsFile: file},
+		slog.New(slog.DiscardHandler))
+	u.support = supported
+	u.now = func() time.Time { return time.Date(2026, 9, 19, 2, 0, 0, 0, time.Local) }
+	if ok, why := u.ShouldApply("3.4.0"); !ok {
+		t.Fatalf("a corrupt file must not block updates: %s", why)
 	}
 }

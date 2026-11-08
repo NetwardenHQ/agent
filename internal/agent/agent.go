@@ -174,6 +174,7 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 			CurrentVersion:  version,
 			URLTemplate:     cfg.SelfUpdate.URLTemplate,
 			Signers:         cfg.SelfUpdate.Signers,
+			AttemptsFile:    selfupdate.AttemptsFile(),
 		}, logger.With("component", "selfupdate"))
 		httpTx.SetUpdateHintHandler(updater.HandleHint)
 		httpTx.SetSelfUpdateState(updater.State)

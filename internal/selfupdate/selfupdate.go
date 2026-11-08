@@ -43,9 +43,13 @@ package selfupdate
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"time"
 )
@@ -99,6 +103,11 @@ type Config struct {
 	// anchor and is deliberately local-only: the server may say where to
 	// download from, never whom to trust.
 	Signers []string
+
+	// AttemptsFile keeps the attempts across restarts. Only Kubernetes needs
+	// it: there the update is the restart, and a Deployment pinned to a
+	// version restarts into the same version. Empty keeps them in memory.
+	AttemptsFile string
 }
 
 // Updater holds the state between a hint arriving and an update being applied.
@@ -140,16 +149,75 @@ func New(cfg Config, logger *slog.Logger) *Updater {
 		cfg.WindowEndHour = defaultWindowEndHour
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Updater{
+	u := &Updater{
 		cfg:         cfg,
 		logger:      logger,
-		lastAttempt: make(map[string]time.Time),
+		lastAttempt: loadAttempts(cfg.AttemptsFile, logger),
 		ctx:         ctx,
 		cancel:      cancel,
 		support:     platformSupport,
 		now:         time.Now,
 		apply:       applyUpdate,
 	}
+	for version, at := range u.lastAttempt {
+		if CompareVersions(version, cfg.CurrentVersion) > 0 {
+			logger.Warn("restarted to update but still running the old version; the Deployment's image does not follow releases (use the :latest tag with imagePullPolicy: Always)",
+				"wanted", version, "running", cfg.CurrentVersion, "attempted", at.Format(time.RFC3339))
+		}
+	}
+	return u
+}
+
+// AttemptsFile is where this platform keeps update attempts across restarts,
+// or "" where memory is enough.
+func AttemptsFile() string { return attemptsFile() }
+
+// loadAttempts reads the attempts a previous run of this agent recorded. A
+// missing or unreadable file means none: it only ever delays a retry.
+func loadAttempts(path string, logger *slog.Logger) map[string]time.Time {
+	attempts := make(map[string]time.Time)
+	if path == "" {
+		return attempts
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("self-update: cannot read past attempts", "path", path, "error", err)
+		}
+		return attempts
+	}
+	if err := json.Unmarshal(data, &attempts); err != nil {
+		logger.Warn("self-update: ignoring unreadable past attempts", "path", path, "error", err)
+		return make(map[string]time.Time)
+	}
+	return attempts
+}
+
+// saveAttempts records the attempts for the next run. Called with u.mu held.
+func (u *Updater) saveAttempts() {
+	if u.cfg.AttemptsFile == "" {
+		return
+	}
+	data, err := json.Marshal(u.lastAttempt)
+	if err == nil {
+		err = os.WriteFile(u.cfg.AttemptsFile, data, 0o600)
+	}
+	if err != nil {
+		u.logger.Warn("self-update: cannot record the attempt", "path", u.cfg.AttemptsFile, "error", err)
+	}
+}
+
+// stuck reports whether this agent already restarted for a newer release in
+// the last retryBackoff and came back on its old version.
+func (u *Updater) stuck() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for version, at := range u.lastAttempt {
+		if CompareVersions(version, u.cfg.CurrentVersion) > 0 && u.now().Sub(at) < retryBackoff {
+			return true
+		}
+	}
+	return false
 }
 
 // State reports whether this agent will apply updates on its own.
@@ -161,6 +229,11 @@ func (u *Updater) State() string {
 		return StateDisabled
 	}
 	if !u.support().Available {
+		return StateUnsupported
+	}
+	// Tried, restarted, and still old: whatever installs updates here did
+	// not. Saying "enabled" would hide an agent that will stay behind.
+	if u.cfg.AttemptsFile != "" && u.stuck() {
 		return StateUnsupported
 	}
 	return StateEnabled
@@ -216,6 +289,7 @@ func (u *Updater) decide(hinted string, claim bool) (bool, string) {
 	if claim {
 		u.inProgress = true
 		u.lastAttempt[hinted] = u.now()
+		u.saveAttempts()
 	}
 	return true, ""
 }

@@ -98,3 +98,7 @@ func rootOnly(dir string) error {
 	}
 	return nil
 }
+
+// attemptsFile: the agent survives a failed update here, so the attempts it
+// remembers in memory are enough.
+func attemptsFile() string { return "" }

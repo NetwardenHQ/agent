@@ -247,3 +247,7 @@ func installerVersion(path string) (string, error) {
 	}
 	return "", fmt.Errorf("installer version resource has no FileVersion")
 }
+
+// attemptsFile: the agent survives a failed update here, so the attempts it
+// remembers in memory are enough.
+func attemptsFile() string { return "" }

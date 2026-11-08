@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Kubernetes: an agent whose Deployment pins a version tag no longer restarts for the same release
+  every night. An update in Kubernetes is a restart, and a pinned image restarts into the old
+  version; the attempt used to live only in memory, so the restarted agent tried again, up to
+  every 30 minutes through the maintenance window. The attempt is now kept in `/tmp` (the emptyDir
+  the generated Deployment mounts), and an agent that restarted without upgrading reports
+  self-update as `unsupported` for a day and logs why. The generated Deployment uses `:latest` with
+  `imagePullPolicy: Always`, which updates normally.
+
+## [3.4.0] - 2026-11-08
+
 ### Added
 - Update state beyond the counts, read from the OS every cycle:
   - `system_reboot_required`: on Linux, `/run/reboot-required` or a kernel image other than the

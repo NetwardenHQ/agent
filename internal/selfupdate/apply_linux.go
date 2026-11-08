@@ -41,6 +41,16 @@ func platformSupport() Support {
 	return Support{Available: true}
 }
 
+// attemptsFile is in /tmp because the Deployment Netwarden generates mounts
+// an emptyDir there: it outlives the container restart that an update is,
+// and is gone with the pod.
+func attemptsFile() string {
+	if inKubernetes() {
+		return "/tmp/netwarden-update-attempts.json"
+	}
+	return ""
+}
+
 func inKubernetes() bool {
 	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
 		return false
@@ -54,7 +64,9 @@ func applyUpdate(ctx context.Context, target Target, _ []string, logger *slog.Lo
 		// The Deployment Netwarden generates runs the latest tag with
 		// imagePullPolicy Always, so the restarted container is the new
 		// release. A Deployment pinned to a tag restarts into the same
-		// version; set self_update: false there.
+		// version: the attempt is recorded in attemptsFile first, so the
+		// restarted agent reports self-update as unsupported and waits a day
+		// instead of restarting again.
 		logger.Info("restarting to pick up the new agent image", "version", target.Version)
 		if err := restartSelf(); err != nil {
 			return fmt.Errorf("restart: %w", err)
