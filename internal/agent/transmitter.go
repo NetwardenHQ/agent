@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,10 @@ const maxRetryAfter = 5 * time.Minute
 
 // rateLimitSleep is sleep, replaceable in tests.
 var rateLimitSleep = sleep
+
+// errPayloadRejected marks a post the server refused with a 4xx other than
+// 401, 408, 425 or 429. What it carried is not worth keeping for a retry.
+var errPayloadRejected = errors.New("payload rejected")
 
 // errBackingOff is returned when Send skipped the request entirely because
 // of recent failures. No request was made, so it is not an attempt.
@@ -103,6 +108,13 @@ type serverResponse struct {
 			Signature   string `json:"signature"`
 			Certificate string `json:"certificate"`
 		} `json:"agent_update,omitempty"`
+
+		// ConfigRev identifies the settings the server holds for this
+		// host. When it changes the agent fetches its config.
+		ConfigRev string `json:"config_rev"`
+
+		// AcceptsGzip says the server reads gzip-compressed reports.
+		AcceptsGzip bool `json:"accepts_gzip"`
 	} `json:"data"`
 }
 
@@ -134,6 +146,16 @@ type HTTPTransmitter struct {
 
 	// selfUpdateState, when set, reports the updater's state in each payload.
 	selfUpdateState func() string
+
+	// configRev is the settings revision from the last reply that named one.
+	configRev atomic.Value // string
+
+	// gzipOK is set once the server has said it reads compressed reports.
+	// gzipRefused is set when a compressed report was refused all the same
+	// (a proxy on the way, a server that changed its mind); compression then
+	// stays off for the life of the process.
+	gzipOK      atomic.Bool
+	gzipRefused atomic.Bool
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -185,9 +207,14 @@ func (t *HTTPTransmitter) Send(ctx context.Context, metricList []metrics.Metric,
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
+	// Compressed once here, not once per attempt.
+	var compressed []byte
+	if t.gzipOK.Load() && len(body) >= minGzipBytes {
+		compressed = gzipBytes(body)
+	}
 
 	err = resilience.Retry(ctx, func() error {
-		return t.sendWithRateLimit(ctx, body)
+		return t.sendWithRateLimit(ctx, body, compressed)
 	})
 	t.recordOutcome(err)
 
@@ -260,9 +287,9 @@ func (e *rateLimitedError) Error() string {
 // maxRetryAfter) at most maxRateLimitRetries times. Running out of retries is
 // a permanent error for this Send, so resilience.Retry's attempts do not each
 // honor another round of 429s.
-func (t *HTTPTransmitter) sendWithRateLimit(ctx context.Context, body []byte) error {
+func (t *HTTPTransmitter) sendWithRateLimit(ctx context.Context, body, compressed []byte) error {
 	for retries := 0; ; retries++ {
-		err := t.sendRequest(ctx, body)
+		err := t.post(ctx, body, compressed)
 		var rl *rateLimitedError
 		if !errors.As(err, &rl) {
 			return err
@@ -276,13 +303,71 @@ func (t *HTTPTransmitter) sendWithRateLimit(ctx context.Context, body []byte) er
 	}
 }
 
-// sendRequest performs one POST and records its latency.
-func (t *HTTPTransmitter) sendRequest(ctx context.Context, body []byte) error {
+// minGzipBytes is the smallest report worth compressing. Below it the gzip
+// framing and the CPU cost more than the bytes saved.
+const minGzipBytes = 1024
+
+// gzipBytes compresses a report body, or returns nil when it cannot.
+func gzipBytes(body []byte) []byte {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil
+	}
+	if _, err := zw.Write(body); err != nil {
+		return nil
+	}
+	if err := zw.Close(); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// post sends one report, compressed when compressed is non-nil and
+// compression has not been refused.
+//
+// The server says in its replies whether it reads gzip, and only then is a
+// compressed body prepared. If one is refused all the same, the same report
+// is sent plain at once and compression stays off: the report matters more
+// than its size.
+func (t *HTTPTransmitter) post(ctx context.Context, body, compressed []byte) error {
+	if compressed == nil || t.gzipRefused.Load() {
+		return t.sendRequest(ctx, body, "")
+	}
+	err := t.sendRequest(ctx, compressed, "gzip")
+	if !errors.Is(err, errPayloadRejected) {
+		return err
+	}
+	t.gzipRefused.Store(true)
+	t.gzipOK.Store(false)
+	t.logger.Warn("a compressed report was refused; sending uncompressed from now on", "error", err)
+	return t.sendRequest(ctx, body, "")
+}
+
+// AllowGzip records that the server reads compressed reports.
+func (t *HTTPTransmitter) AllowGzip() {
+	if !t.gzipRefused.Load() {
+		t.gzipOK.Store(true)
+	}
+}
+
+// ConfigRev returns the settings revision the server last named, or "".
+func (t *HTTPTransmitter) ConfigRev() string {
+	rev, _ := t.configRev.Load().(string)
+	return rev
+}
+
+// sendRequest performs one POST and records its latency. encoding is the
+// Content-Encoding of body, empty for plain JSON.
+func (t *HTTPTransmitter) sendRequest(ctx context.Context, body []byte, encoding string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.config.ServerURL+apiDataPath, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if encoding != "" {
+		req.Header.Set("Content-Encoding", encoding)
+	}
 	req.Header.Set("Authorization", "Bearer "+t.config.APIKey)
 	req.Header.Set("User-Agent", "Netwarden-Agent/"+t.version)
 
@@ -321,7 +406,7 @@ func (t *HTTPTransmitter) sendRequest(ctx context.Context, body []byte) error {
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// The server rejected this payload; sending the same bytes again
 		// cannot succeed.
-		return resilience.Permanent(fmt.Errorf("server rejected payload: status %d", resp.StatusCode))
+		return resilience.Permanent(fmt.Errorf("server rejected payload: status %d: %w", resp.StatusCode, errPayloadRejected))
 
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return fmt.Errorf("server returned status %d", resp.StatusCode)
@@ -348,6 +433,12 @@ func (t *HTTPTransmitter) handleResponse(body io.Reader) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		t.logger.Debug("could not parse server response", "error", err)
 		return
+	}
+	if parsed.Data.ConfigRev != "" {
+		t.configRev.Store(parsed.Data.ConfigRev)
+	}
+	if parsed.Data.AcceptsGzip {
+		t.AllowGzip()
 	}
 	if parsed.Data.AgentUpdate == nil || parsed.Data.AgentUpdate.Version == "" {
 		return

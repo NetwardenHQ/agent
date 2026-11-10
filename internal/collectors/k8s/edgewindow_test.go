@@ -282,7 +282,7 @@ func TestCostAtTenTimesToday(t *testing.T) {
 		}
 	})
 	t.Logf("%d ns and %d allocations per line", res.NsPerOp(), res.AllocsPerOp())
-	if per := res.NsPerOp(); per > 20_000 {
+	if per := res.NsPerOp(); per > 20_000 && !raceEnabled {
 		t.Errorf("%d ns per line", per)
 	}
 

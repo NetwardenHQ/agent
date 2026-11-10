@@ -6,14 +6,13 @@ package postgresql
 import (
 	"fmt"
 	"os"
-	"os/exec"
+
+	"github.com/NetwardenHQ/agent/internal/procscan"
 )
 
 // detectPostgreSQL checks if PostgreSQL is running on Unix/Linux.
 func (c *Collector) detectPostgreSQL() bool {
-	// Check for running PostgreSQL process
-	cmd := exec.Command("pgrep", "-x", "postgres")
-	if err := cmd.Run(); err != nil {
+	if !procscan.Running("postgres") {
 		c.logger.Debug("no PostgreSQL process found")
 		return false
 	}
@@ -45,6 +44,5 @@ func (c *Collector) detectPostgreSQL() bool {
 
 // checkProcess checks if PostgreSQL process is running on Unix/Linux.
 func (c *Collector) checkProcess() bool {
-	cmd := exec.Command("pgrep", "-x", "postgres")
-	return cmd.Run() == nil
+	return procscan.Running("postgres")
 }

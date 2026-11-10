@@ -336,14 +336,29 @@ func TestCollectWritesEdgeEventsAndMetrics(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the exposure did not ask for an early report")
 	}
-	ms, err := c.Collect(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := gauges(ms)
 	want := map[string]float64{
 		"k8s_ingress_log_reading": 1, "k8s_ingress_log_full_format": 1, "k8s_ingress_log_unparsed": 1,
 		"k8s_ingress_log_sources_flagged": 1, "k8s_ingress_log_sources_dropped": 0,
+	}
+	// The early report is requested at the exposure line, two lines before
+	// the end of the stream; collect until the reader has finished the rest.
+	var ms []metrics.Metric
+	var got map[string]float64
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		var err error
+		ms, err = c.Collect(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = gauges(ms)
+		settled := true
+		for name, v := range want {
+			settled = settled && got[name] == v
+		}
+		if settled || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	for name, v := range want {
 		if got[name] != v {

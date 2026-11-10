@@ -21,9 +21,6 @@ import (
 //	4732  a member was added to a local group   only Administrators (S-1-5-32-544)
 //	1102  the audit log was cleared
 
-// winSecurityQuery selects the events above from the Security channel.
-const winSecurityQuery = "*[System[(EventID=4624 or EventID=4625 or EventID=4720 or EventID=4732 or EventID=1102)]]"
-
 const administratorsSID = "S-1-5-32-544"
 
 // winRecord is the part of a rendered event the classifier reads.

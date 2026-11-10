@@ -63,11 +63,15 @@ type Collector struct {
 	db       *sql.DB
 	cache    *mysqlCache
 
-	// active is set once, at construction, when MySQL is enabled in the
-	// config or a server process was found. It does not depend on the
-	// connection: a server the agent cannot reach still reports mysql_up and
+	// active is set when MySQL is enabled in the config or a server process
+	// was found, and never cleared. It does not depend on the connection: a
+	// server the agent cannot reach still reports mysql_up and
 	// mysql_connection_failed, which is the point of watching it.
-	active bool
+	active     bool
+	detectMu   sync.Mutex
+	lastDetect time.Time
+	// detect replaces detectMySQL in tests.
+	detect func() bool
 	// processRunning replaces checkProcess in tests.
 	processRunning func() bool
 	// connFailing remembers that the last connection attempt failed, so the
@@ -117,6 +121,7 @@ func NewCollector(cfg config.DatabaseConfig, hostname string, opts ...CollectorO
 	}
 
 	// Monitor when enabled in the config or when a local server is running.
+	collector.lastDetect = time.Now()
 	if collector.detectMySQL() {
 		collector.logger.Info("MySQL/MariaDB process detected, enabling monitoring")
 		collector.active = true
@@ -140,7 +145,7 @@ func (c *Collector) connect() error {
 	// Open database connection
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		c.logger.Warn("failed to open MySQL connection", "error", err)
+		c.logger.Debug("failed to open MySQL connection", "error", err)
 		return err
 	}
 
@@ -154,7 +159,7 @@ func (c *Collector) connect() error {
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		c.logger.Warn("failed to ping MySQL", "error", err)
+		c.logger.Debug("failed to ping MySQL", "error", err)
 		return err
 	}
 
@@ -213,11 +218,34 @@ func (c *Collector) Name() string {
 	return "mysql"
 }
 
+// redetectEvery is how often a collector that found no server looks again.
+// Detection starts a process on Windows, so it is rarer there.
+func redetectEvery() time.Duration {
+	if runtime.GOOS == "windows" {
+		return time.Hour
+	}
+	return 10 * time.Minute
+}
+
 // Enabled reports whether MySQL is monitored on this host: configured, or
-// detected at startup. Reachability is reported by Collect, not here; a
-// collector that disabled itself on a failed ping could never say the
-// database is down.
+// detected. A collector that found no server looks again every
+// redetectEvery, so a database installed after the agent is picked up without
+// a restart. Reachability is reported by Collect, not here; a collector that
+// disabled itself on a failed ping could never say the database is down.
 func (c *Collector) Enabled() bool {
+	c.detectMu.Lock()
+	defer c.detectMu.Unlock()
+	if !c.active && time.Since(c.lastDetect) >= redetectEvery() {
+		c.lastDetect = time.Now()
+		detect := c.detectMySQL
+		if c.detect != nil {
+			detect = c.detect
+		}
+		if detect() {
+			c.logger.Info("MySQL/MariaDB process detected, enabling monitoring")
+			c.active = true
+		}
+	}
 	return c.active
 }
 

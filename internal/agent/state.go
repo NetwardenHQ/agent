@@ -2,6 +2,8 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -137,12 +139,29 @@ func (s *stateFile) writeLocked() {
 	if err == nil {
 		err = writeAtomic(s.path, raw, 0o644)
 	}
-	if err != nil && err.Error() != s.lastWarn {
-		s.lastWarn = err.Error()
-		s.logger.Warn("could not write agent state file", "path", s.path, "error", err)
-	} else if err == nil {
+	if err == nil {
 		s.lastWarn = ""
+		return
 	}
+	if key := writeErrorKey(err); key != s.lastWarn {
+		s.lastWarn = key
+		s.logger.Warn("could not write agent state file", "path", s.path, "error", err)
+	}
+}
+
+// writeErrorKey is the part of a write error that repeats from one attempt to
+// the next. The message itself names the temporary file, which is random, so
+// comparing messages would log the same failure on every cycle.
+func writeErrorKey(err error) string {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Op + ": " + pathErr.Err.Error()
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Op + ": " + linkErr.Err.Error()
+	}
+	return err.Error()
 }
 
 // writeAtomic writes via a temporary file in the same directory and renames.

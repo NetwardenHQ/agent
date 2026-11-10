@@ -14,7 +14,7 @@ all: clean build
 # Build for current platform
 .PHONY: build
 build:
-	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/netwarden
+	CGO_ENABLED=0 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/netwarden
 
 # Cross-compile for all platforms
 .PHONY: build-all
@@ -22,51 +22,51 @@ build-all: clean
 	@echo "Building for all platforms..."
 	
 	# Linux AMD64
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-amd64 ./cmd/netwarden
 	
 	# Linux ARM64
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm64 ./cmd/netwarden
 	
 	# Linux ARM (32-bit)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm ./cmd/netwarden
 	
 	# Windows AMD64
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-amd64.exe ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-amd64.exe ./cmd/netwarden
 	
 	# Windows ARM64
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-arm64.exe ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-arm64.exe ./cmd/netwarden
 	
 	# macOS AMD64
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-amd64 ./cmd/netwarden
 	
 	# macOS ARM64 (Apple Silicon)
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-arm64 ./cmd/netwarden
 
 	# FreeBSD (OPNsense, pfSense, plain FreeBSD)
-	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-amd64 ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-arm64 ./cmd/netwarden
 
 # Individual platform builds
 .PHONY: linux
 linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-amd64 ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm64 ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm ./cmd/netwarden
 
 .PHONY: windows
 windows:
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-amd64.exe ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-arm64.exe ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-amd64.exe ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-windows-arm64.exe ./cmd/netwarden
 
 .PHONY: freebsd
 freebsd:
-	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-amd64 ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-freebsd-arm64 ./cmd/netwarden
 
 .PHONY: macos
 macos:
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-amd64 ./cmd/netwarden
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-arm64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-amd64 ./cmd/netwarden
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME)-darwin-arm64 ./cmd/netwarden
 
 # Development build with the race detector (needs cgo and a C compiler)
 .PHONY: dev
@@ -77,6 +77,19 @@ dev:
 .PHONY: test
 test:
 	go test -v ./...
+
+# Everything a change should pass before release: vet for each OS family,
+# static analysis, known vulnerabilities in the code paths actually used, and
+# the tests under the race detector.
+.PHONY: check
+check:
+	go vet ./...
+	GOOS=windows go vet ./...
+	GOOS=darwin go vet ./...
+	GOOS=freebsd go vet ./...
+	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	go test -race -count=1 ./...
 
 # Run the agent (development)
 .PHONY: run
@@ -135,6 +148,7 @@ help:
 	@echo "  macos      - Build for macOS amd64 and arm64"
 	@echo "  dev        - Development build with race detection"
 	@echo "  test       - Run tests"
+	@echo "  check      - Vet, static analysis, vulnerability scan and race tests"
 	@echo "  run        - Build and run agent"
 	@echo "  clean      - Clean build artifacts"
 	@echo "  deps       - Install/update dependencies"

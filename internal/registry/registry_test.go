@@ -253,3 +253,53 @@ func TestCollectAll_QueuedCollectorGivesUpAtTheCycleDeadline(t *testing.T) {
 	}
 	t.Skip("scheduler never queued the fourth collector")
 }
+
+func TestLastCycleReportsHowEachCollectorFared(t *testing.T) {
+	old := cycleDeadline
+	cycleDeadline = func() time.Duration { return 80 * time.Millisecond }
+	defer func() { cycleDeadline = old }()
+
+	r := NewRegistry(quiet())
+	release := make(chan struct{})
+	defer close(release)
+	_ = r.Register(&fakeCollector{name: "fine", enabled: true, collect: func(context.Context) ([]metrics.Metric, error) {
+		return one("m"), nil
+	}})
+	_ = r.Register(&fakeCollector{name: "failing", enabled: true, collect: func(context.Context) ([]metrics.Metric, error) {
+		return nil, errors.New("no such device")
+	}})
+	_ = r.Register(&fakeCollector{name: "hung", enabled: true, collect: func(context.Context) ([]metrics.Metric, error) {
+		<-release
+		return nil, nil
+	}})
+	_ = r.Register(&fakeCollector{name: "off", enabled: false, collect: func(context.Context) ([]metrics.Metric, error) {
+		return nil, nil
+	}})
+
+	if got := r.LastCycle(); len(got) != 0 {
+		t.Fatalf("status before any cycle: %+v", got)
+	}
+	_, _ = r.CollectAll(context.Background())
+
+	status := map[string]bool{}
+	for _, s := range r.LastCycle() {
+		status[s.Name] = s.OK
+	}
+	want := map[string]bool{"fine": true, "failing": false, "hung": false}
+	if len(status) != len(want) {
+		t.Fatalf("statuses %v, want %v (a disabled collector has none)", status, want)
+	}
+	for name, ok := range want {
+		if status[name] != ok {
+			t.Fatalf("%s: OK=%v, want %v (all: %v)", name, status[name], ok, status)
+		}
+	}
+
+	// The hung collector is skipped on the next cycle and still counts as failing.
+	_, _ = r.CollectAll(context.Background())
+	for _, s := range r.LastCycle() {
+		if s.Name == "hung" && s.OK {
+			t.Fatal("a collector still running from an earlier cycle was reported as fine")
+		}
+	}
+}

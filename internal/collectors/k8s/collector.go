@@ -1559,7 +1559,22 @@ func (c *Collector) emitUsage(u usageSnapshot, now time.Time) []metrics.Metric {
 	if u.Storage.Collected {
 		add("k8s_storage_nodes_unreachable", float64(u.Storage.FailedNodes), nil)
 		add("k8s_storage_forecast_ready", float64(u.Storage.ForecastReady), nil)
-		add("k8s_storage_exhaustion_within_7d", float64(u.Storage.ForecastAtRisk), nil)
+		// The count keeps its name for the alerts built on it. It covers node
+		// disks under pressure as well as volumes on course to fill.
+		add("k8s_storage_exhaustion_within_7d", float64(len(u.Storage.AtRisk)), nil)
+		// Which filesystems, and the numbers behind the judgement: a count
+		// alone cannot say which disk, how full or how fast. Sent only while
+		// a filesystem is at risk, so the series ends when the risk does.
+		for i, risk := range u.Storage.AtRisk {
+			if i == maxReportedAtRisk {
+				break
+			}
+			labels := storageRiskLabels(risk, u.Storage.VolumePods)
+			add("k8s_storage_risk_capacity_bytes", risk.Capacity, labels)
+			add("k8s_storage_risk_available_bytes", risk.Available, labels)
+			add("k8s_storage_risk_change_bytes_per_hour", risk.ChangePerHour, labels)
+			add("k8s_storage_risk_history_hours", risk.HistoryHours, labels)
+		}
 	}
 	if u.Storage.NodePercent != nil {
 		add("k8s_node_max_disk_percent", *u.Storage.NodePercent, nil)

@@ -19,6 +19,10 @@ import (
 // handed on, so a restart neither repeats nor skips events. Without one the
 // first read starts 60 seconds back, like the Linux collector: no backfill.
 
+// winSecurityQuery selects the events listed in winlog_parse.go from the
+// Security channel.
+const winSecurityQuery = "*[System[(EventID=4624 or EventID=4625 or EventID=4720 or EventID=4732 or EventID=1102)]]"
+
 var (
 	modwevtapi            = windows.NewLazySystemDLL("wevtapi.dll")
 	procEvtQuery          = modwevtapi.NewProc("EvtQuery")

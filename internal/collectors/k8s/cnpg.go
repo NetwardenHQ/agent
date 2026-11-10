@@ -503,7 +503,13 @@ func (c *Collector) collectCNPG(ctx context.Context, pods []Pod, now time.Time) 
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i], errs[i] = c.scrapeExporter(ctx, t.ip, t.port, t.want)
+			// One retry: a single lost request must not report the exporter
+			// as unreachable. The slot is held through the pause, so a fleet
+			// that really is unreachable costs twice the timeout plus the
+			// pause per slot, still inside the interval.
+			results[i], errs[i] = retryOnce(ctx, func() ([]promSample, error) {
+				return c.scrapeExporter(ctx, t.ip, t.port, t.want)
+			})
 		}(i, t)
 	}
 	wg.Wait()

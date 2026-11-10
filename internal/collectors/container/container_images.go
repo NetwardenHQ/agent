@@ -1,8 +1,11 @@
 package container
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
@@ -13,7 +16,16 @@ import (
 type imageInventory struct {
 	mu      sync.Mutex
 	pending *metrics.Snapshot
+
+	// lastDigest and lastStaged identify the inventory last handed to the
+	// agent, which redelivers a snapshot whose post failed.
+	lastDigest [sha256.Size]byte
+	lastStaged time.Time
 }
+
+// imagesRefreshInterval is how often an unchanged inventory is sent again, so
+// a platform that lost it (a restored database, a re-created host) recovers.
+var imagesRefreshInterval = time.Hour
 
 // imageEntry is one distinct image the host is running, as reported to the
 // platform as part of the container-images snapshot; its JSON shape is part of
@@ -112,6 +124,22 @@ func (c *Collector) stageImages(containers []Container) {
 		c.images.pending = nil
 		return
 	}
+
+	// The inventory is state, not a time series. It is staged when it differs
+	// from the last one staged and refreshed every imagesRefreshInterval;
+	// staging it with every collection would have the platform store and
+	// re-evaluate an identical inventory each cycle.
+	encoded, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	digest := sha256.Sum256(encoded)
+	now := time.Now()
+	if digest == c.images.lastDigest && now.Sub(c.images.lastStaged) < imagesRefreshInterval {
+		return
+	}
+	c.images.lastDigest = digest
+	c.images.lastStaged = now
 
 	runtimeName := ""
 	if c.monitor != nil {

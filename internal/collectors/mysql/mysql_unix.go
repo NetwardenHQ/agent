@@ -5,20 +5,15 @@ package mysql
 
 import (
 	"os"
-	"os/exec"
+
+	"github.com/NetwardenHQ/agent/internal/procscan"
 )
 
 // detectMySQL checks if MySQL/MariaDB is running on Unix/Linux.
 func (c *Collector) detectMySQL() bool {
-	// Check for running MySQL/MariaDB processes
-	cmd := exec.Command("pgrep", "-x", "mysqld")
-	if err := cmd.Run(); err != nil {
-		// Also check for mariadb process name
-		cmd = exec.Command("pgrep", "-x", "mariadbd")
-		if err := cmd.Run(); err != nil {
-			c.logger.Debug("no MySQL/MariaDB process found")
-			return false
-		}
+	if !procscan.Running("mysqld", "mariadbd") {
+		c.logger.Debug("no MySQL/MariaDB process found")
+		return false
 	}
 
 	// Process is running, now find the socket
@@ -46,10 +41,5 @@ func (c *Collector) detectMySQL() bool {
 
 // checkProcess checks if MySQL/MariaDB process is running on Unix/Linux.
 func (c *Collector) checkProcess() bool {
-	cmd := exec.Command("pgrep", "-x", "mysqld")
-	if err := cmd.Run(); err == nil {
-		return true
-	}
-	cmd = exec.Command("pgrep", "-x", "mariadbd")
-	return cmd.Run() == nil
+	return procscan.Running("mysqld", "mariadbd")
 }

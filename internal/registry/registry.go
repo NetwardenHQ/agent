@@ -40,6 +40,27 @@ type Registry struct {
 	flightMu sync.Mutex
 	inFlight map[string]bool
 	stuck    map[string]bool // skipped at least once since it last returned
+
+	statusMu  sync.Mutex
+	lastCycle []CollectorStatus
+}
+
+// CollectorStatus is how one enabled collector fared in a collection cycle.
+type CollectorStatus struct {
+	Name string
+	// OK is false when the collector returned an error, did not finish
+	// before the cycle's deadline, or was still running from an earlier
+	// cycle and was skipped.
+	OK       bool
+	Duration time.Duration
+}
+
+// LastCycle returns the status of every collector that was enabled in the
+// most recent CollectAll. It is empty before the first cycle.
+func (r *Registry) LastCycle() []CollectorStatus {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	return append([]CollectorStatus(nil), r.lastCycle...)
 }
 
 // NewRegistry creates an empty registry.
@@ -194,6 +215,19 @@ func (r *Registry) CollectAll(ctx context.Context) ([]metrics.Metric, error) {
 	finished := make([]result, len(results))
 	copy(finished, results)
 	resultsMu.Unlock()
+
+	statuses := make([]CollectorStatus, len(enabled))
+	for i, c := range enabled {
+		res := finished[i]
+		statuses[i] = CollectorStatus{
+			Name:     c.Name(),
+			OK:       res.name != "" && res.err == nil,
+			Duration: res.duration,
+		}
+	}
+	r.statusMu.Lock()
+	r.lastCycle = statuses
+	r.statusMu.Unlock()
 
 	var all []metrics.Metric
 	var failures []string

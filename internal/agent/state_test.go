@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,4 +87,26 @@ func TestStateFileDisabledSpoolAndNil(t *testing.T) {
 	var nilState *stateFile
 	nilState.Update(attempt{})
 	nilState.Init(time.Second)
+}
+
+// An agent that is not root (a pod, a NAS package) cannot write next to its
+// spool. That is reported once, not on every cycle.
+func TestStateFileWriteFailureIsLoggedOnce(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write anywhere")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	var logged bytes.Buffer
+	s := newStateFile(filepath.Join(dir, "spool"), "1.0.0", time.Now(), slog.New(slog.NewTextHandler(&logged, nil)))
+	for i := 0; i < 5; i++ {
+		s.Update(attempt{At: time.Now(), Interval: time.Minute})
+	}
+	if n := strings.Count(logged.String(), "could not write agent state file"); n != 1 {
+		t.Fatalf("the same failure was logged %d times:\n%s", n, logged.String())
+	}
 }

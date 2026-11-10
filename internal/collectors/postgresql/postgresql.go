@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL driver
@@ -25,11 +26,15 @@ type Collector struct {
 	logger   *slog.Logger
 	db       *sql.DB
 
-	// active is set once, at construction, when PostgreSQL is enabled in the
-	// config or a server process was found. It does not depend on the
+	// active is set when PostgreSQL is enabled in the config or a server
+	// process was found, and never cleared. It does not depend on the
 	// connection: a server the agent cannot reach still reports
 	// postgresql_up and postgresql_connection_failed.
-	active bool
+	active     bool
+	detectMu   sync.Mutex
+	lastDetect time.Time
+	// detect replaces detectPostgreSQL in tests.
+	detect func() bool
 	// processRunning replaces checkProcess in tests.
 	processRunning func() bool
 	// connFailing remembers that the last connection attempt failed, so the
@@ -73,6 +78,7 @@ func NewCollector(cfg config.DatabaseConfig, hostname string, opts ...CollectorO
 	}
 
 	// Monitor when enabled in the config or when a local server is running.
+	collector.lastDetect = time.Now()
 	if collector.detectPostgreSQL() {
 		collector.logger.Info("PostgreSQL process detected, enabling monitoring")
 		collector.active = true
@@ -84,6 +90,15 @@ func NewCollector(cfg config.DatabaseConfig, hostname string, opts ...CollectorO
 	}
 
 	return collector
+}
+
+// redetectEvery is how often a collector that found no server looks again.
+// Detection starts a process on Windows, so it is rarer there.
+func redetectEvery() time.Duration {
+	if runtime.GOOS == "windows" {
+		return time.Hour
+	}
+	return 10 * time.Minute
 }
 
 // detectPostgreSQL is implemented in postgresql_unix.go and postgresql_windows.go
@@ -99,7 +114,7 @@ func (c *Collector) connect() error {
 	// Open database connection
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		c.logger.Warn("failed to open PostgreSQL connection", "error", err)
+		c.logger.Debug("failed to open PostgreSQL connection", "error", err)
 		return err
 	}
 
@@ -113,7 +128,7 @@ func (c *Collector) connect() error {
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		c.logger.Warn("failed to ping PostgreSQL", "error", err)
+		c.logger.Debug("failed to ping PostgreSQL", "error", err)
 		return err
 	}
 
@@ -197,10 +212,24 @@ func (c *Collector) Name() string {
 }
 
 // Enabled reports whether PostgreSQL is monitored on this host: configured,
-// or detected at startup. Reachability is reported by Collect, not here; a
-// collector that disabled itself on a failed ping could never say the
-// database is down.
+// or detected. A collector that found no server looks again every
+// redetectEvery, so a database installed after the agent is picked up without
+// a restart. Reachability is reported by Collect, not here; a collector that
+// disabled itself on a failed ping could never say the database is down.
 func (c *Collector) Enabled() bool {
+	c.detectMu.Lock()
+	defer c.detectMu.Unlock()
+	if !c.active && time.Since(c.lastDetect) >= redetectEvery() {
+		c.lastDetect = time.Now()
+		detect := c.detectPostgreSQL
+		if c.detect != nil {
+			detect = c.detect
+		}
+		if detect() {
+			c.logger.Info("PostgreSQL process detected, enabling monitoring")
+			c.active = true
+		}
+	}
 	return c.active
 }
 

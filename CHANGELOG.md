@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Readings taken while the server cannot be reached are kept (up to 10,000, for up to two hours)
+  and delivered once it answers again, each at the time it was taken, so an outage leaves no hole
+  in a host's history. They ride in the same requests as fresh readings. Nothing is kept from a
+  report the server refuses outright.
+- Settings changed on the server (reporting interval, CIS profile, Kubernetes scope) are applied
+  within a cycle or two. Every report reply names a revision of the host's settings
+  (`config_rev`); when it changes the agent fetches its config. The hourly refresh remains for
+  servers that name no revision. An agent whose config fetch failed at startup fetches as soon as
+  the server answers a report.
+- The agent reports its own health: `agent_collector_up{collector}` (0 when a collector failed,
+  timed out or hung), `agent_collectors_failing` (how many are at 0), `agent_collection_seconds`
+  and `agent_backlog_metrics`. A collector failing
+  on one host used to be visible only in that host's log.
+- Reports are gzip-compressed once the server has said it reads them (`accepts_gzip` in
+  `/agent/config` and in report replies). A first report with the package inventory goes from
+  about 230 KB to about 28 KB. If a compressed report is refused it is sent uncompressed at once
+  and compression stays off.
+- For each filesystem at risk: `k8s_storage_risk_capacity_bytes`, `_available_bytes`,
+  `_change_bytes_per_hour` and `_history_hours`, labelled `kind` (`volume` or `node`),
+  `namespace`, `name`, `pod` and `reason` (`filling` or `pressure`). Sent only while the risk
+  lasts. The count alone could not say which disk, how full or how fast.
+
+### Changed
+- A local MySQL or PostgreSQL server is looked for every ten minutes (hourly on Windows) while
+  none is monitored, so a database installed after the agent is picked up without a restart.
+- On Linux a database process inside a container is not treated as a local server. It used to be
+  reported as running but unreachable, because the host's process table shows it while its
+  socket and loopback do not. Detection reads `/proc` and no longer starts `pgrep` every cycle.
+- Release binaries are built with `-trimpath`.
+- Kubernetes storage forecast: a data volume is reported as filling only when the fall is a
+  trend. It needs a day of history (up to three are kept, sampled every 15 minutes), free space
+  falling across the whole window and across each half of it, and at least 1% of the volume lost.
+  The previous forecast fitted a line through as little as six hours, so one busy morning on a
+  database volume read as "full within a week".
+- Node disks are no longer forecast. They hold container images, which the kubelet deletes once
+  the disk is 85% full, so they fill and empty by design. A node is reported when it reaches the
+  eviction line (90% used) or stays above 85% for 30 minutes, which means reclaiming images is
+  not bringing it down. `k8s_storage_exhaustion_within_7d` counts both cases.
+
+- A PostgreSQL or pooler exporter, or a kubelet, that fails to answer is asked once more two
+  seconds later before it is counted in `k8s_cnpg_instances_unreachable`,
+  `k8s_cnpg_poolers_unreachable` or `k8s_storage_nodes_unreachable`. A network interruption of a
+  few seconds used to report every exporter as unreachable for that round.
+
+### Fixed
+- A gauge that moved slowly was not sent until the five-minute refresh. Each reading was compared
+  with the previous reading, not with the value last sent, so a value creeping by less than 1%
+  per cycle never crossed the threshold however far it had moved. Readings are compared with the
+  value the server has.
+- A failed post lost what it carried. Its metrics were already marked as sent, so unchanged values
+  stayed unsent for up to five minutes after the server came back, and an inventory snapshot
+  (installed packages, SSH configuration, listening ports) was not offered again until its next
+  collection, up to six hours later. Metrics from a failed post are due again on the next cycle
+  and its snapshots ride with the next post.
+- The container image inventory was sent with every report. It is sent when it changes and
+  refreshed hourly.
+- An agent that cannot write its state file (not running as root) logged the failure on every
+  cycle, because the message names a random temporary file and never compared equal. It is
+  logged once.
+- A database server the agent can see but not reach logged a failed ping on every cycle in
+  addition to the one warning that marks the transition.
+
+### Security
+- Built with Go 1.27.4 (was 1.27.0), which fixes ten standard-library issues reachable from the
+  agent, among them GO-2026-6809 (crypto/x509), GO-2026-6607 (crypto/tls) and HTTP/1 and HTTP/2
+  client fixes in net/http. `go.mod` pins the toolchain, so every build uses it.
+- Dependencies: gopsutil 4.26.10, go-winio 0.6.4, golang.org/x/sys 0.50.0, golang.org/x/net
+  0.62.0, purego 0.11.3.
+
+## [3.4.1] - 2026-11-08
+
 ### Fixed
 - Kubernetes: an agent whose Deployment pins a version tag no longer restarts for the same release
   every night. An update in Kubernetes is a restart, and a pinned image restarts into the old

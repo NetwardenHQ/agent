@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -104,6 +105,22 @@ type Agent struct {
 	identityEnabled bool
 	state           *stateFile
 	lastIdentityErr string
+
+	// undelivered holds the snapshots of a post that failed. They ride with
+	// the next cycle's post; see mergeSnapshots. Only the report loop
+	// touches it.
+	undelivered []metrics.Snapshot
+
+	// backlog keeps the metrics of posts that failed until they can be
+	// delivered. Nil keeps nothing.
+	backlog *backlog
+
+	// The settings revision last seen in a report reply, whether the config
+	// has been fetched since start, and when it was last asked for. See
+	// configChanged. Only the report loop touches them.
+	seenConfigRev   string
+	configFetched   bool
+	lastConfigFetch time.Time
 
 	// updater is closed on shutdown so a scheduled update is abandoned
 	// rather than started mid-shutdown. Nil when self-update is not wired.
@@ -196,6 +213,7 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		}),
 		httpClient: sharedhttp.GetClient(),
 
+		backlog:           newBacklog(),
 		stopChan:          make(chan struct{}),
 		urgent:            make(chan struct{}, 1),
 		cacheCleanupStop:  cache.StartGlobalCleanup(5 * time.Minute),
@@ -326,20 +344,18 @@ func (a *Agent) registerCollectors() error {
 	// enable_security_* in the config file.
 	a.registerSecurityCollectors(collectorLogger)
 
-	// Database collectors register when explicitly enabled or when they
-	// auto-detect a local server they can reach.
+	// Database collectors are always registered. One that is neither enabled
+	// in the config nor finds a local server reports Enabled() == false and
+	// is skipped; it looks again periodically, so a database installed after
+	// the agent is monitored without a restart.
 	mysqlCollector := mysql.NewCollector(a.config.Database, a.hostname, mysql.WithLogger(collectorLogger.With("type", "mysql")))
-	if a.config.Database.EnableMySQL || mysqlCollector.Enabled() {
-		if err := a.registry.Register(mysqlCollector); err != nil {
-			a.logger.Debug("MySQL collector not registered", "error", err)
-		}
+	if err := a.registry.Register(mysqlCollector); err != nil {
+		a.logger.Debug("MySQL collector not registered", "error", err)
 	}
 
 	postgresqlCollector := postgresql.NewCollector(a.config.Database, a.hostname, postgresql.WithLogger(collectorLogger.With("type", "postgresql")))
-	if a.config.Database.EnablePostgreSQL || postgresqlCollector.Enabled() {
-		if err := a.registry.Register(postgresqlCollector); err != nil {
-			a.logger.Debug("PostgreSQL collector not registered", "error", err)
-		}
+	if err := a.registry.Register(postgresqlCollector); err != nil {
+		a.logger.Debug("PostgreSQL collector not registered", "error", err)
 	}
 
 	if a.config.Process.EnableProcessMonitoring {
@@ -377,6 +393,9 @@ type remoteConfig struct {
 		// UI. Absent or null means CIS evaluation stays off for this host.
 		CISProfile *cis.Profile `json:"cis_profile"`
 
+		// AcceptsGzip says the server reads gzip-compressed reports.
+		AcceptsGzip bool `json:"accepts_gzip"`
+
 		// K8sConfig carries the cluster scope configured in the UI. Absent
 		// means no scoping: watch every namespace.
 		K8sConfig *struct {
@@ -390,6 +409,7 @@ type remoteConfig struct {
 // FetchRemoteConfig retrieves the reporting interval and collector settings
 // the server holds for this host, and applies them.
 func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
+	a.lastConfigFetch = time.Now()
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -421,6 +441,12 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 		return fmt.Errorf("API returned success=false")
 	}
 
+	if body.Data.AcceptsGzip {
+		if tx, ok := a.transmitter.(interface{ AllowGzip() }); ok {
+			tx.AllowGzip()
+		}
+	}
+
 	// Apply the collector settings before validating the interval: a server
 	// that returns a nonsensical interval should not also silently discard a
 	// profile change the operator just made.
@@ -449,6 +475,7 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 	old := a.reportingInterval
 	a.reportingInterval = interval
 	a.mu.Unlock()
+	a.configFetched = true
 
 	if old != interval {
 		a.logger.Info("reporting interval updated",
@@ -457,6 +484,40 @@ func (a *Agent) FetchRemoteConfig(ctx context.Context) error {
 			"plan_id", body.Data.PlanID)
 	}
 	return nil
+}
+
+// minConfigRefetchGap bounds how often a changed revision makes the agent
+// fetch its config. Two servers can name different revisions for up to a
+// minute after a change; without the bound each reply would cost a fetch.
+const minConfigRefetchGap = 30 * time.Second
+
+// configChanged reports whether the settings revision in the last report
+// reply means the config should be fetched now.
+//
+// Every reply names the revision of the settings the server holds for this
+// host. A change made in the UI changes it, and the agent applies the change
+// within a cycle or two; the hourly refresh is the fallback for a server that
+// names no revision. An agent whose startup fetch failed fetches as soon as
+// the server answers a report.
+func (a *Agent) configChanged(now time.Time) bool {
+	tx, ok := a.transmitter.(interface{ ConfigRev() string })
+	if !ok {
+		return false
+	}
+	rev := tx.ConfigRev()
+	if rev == "" || rev == a.seenConfigRev {
+		return false
+	}
+	if a.seenConfigRev == "" && a.configFetched {
+		// The config fetched at startup is this revision.
+		a.seenConfigRev = rev
+		return false
+	}
+	if now.Sub(a.lastConfigFetch) < minConfigRefetchGap {
+		return false
+	}
+	a.seenConfigRev = rev
+	return true
 }
 
 // currentInterval returns the reporting interval in effect.
@@ -575,11 +636,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			if err := a.collectAndTransmit(ctx); err != nil {
 				a.logger.Error("collection and transmission failed", "error", err)
 			}
+			a.applyChangedConfig(ctx, ticker)
 
 		case <-a.urgent:
 			if err := a.collectAndTransmit(ctx); err != nil {
 				a.logger.Error("early collection and transmission failed", "error", err)
 			}
+			a.applyChangedConfig(ctx, ticker)
 
 		case <-cleanupTicker.C:
 			if removed := a.deltaTracker.Cleanup(24 * time.Hour); removed > 0 {
@@ -600,6 +663,23 @@ func (a *Agent) Run(ctx context.Context) error {
 				ticker.Reset(interval)
 			}
 		}
+	}
+}
+
+// applyChangedConfig fetches the config when the last reply named a new
+// settings revision, and moves the report ticker to a changed interval.
+func (a *Agent) applyChangedConfig(ctx context.Context, ticker *time.Ticker) {
+	if !a.configChanged(time.Now()) {
+		return
+	}
+	old := a.currentInterval()
+	if err := a.FetchRemoteConfig(ctx); err != nil {
+		a.logger.Warn("settings changed on the server but the config could not be fetched; the next refresh retries", "error", err)
+		return
+	}
+	a.logger.Info("applied settings changed on the server")
+	if interval := a.currentInterval(); interval != old {
+		ticker.Reset(interval)
 	}
 }
 
@@ -678,14 +758,18 @@ func (a *Agent) performUpdateCheck(ctx context.Context) {
 
 // collectAndTransmit performs one collection cycle and ships the result.
 func (a *Agent) collectAndTransmit(ctx context.Context) error {
+	started := time.Now()
 	collected, err := a.registry.CollectAll(ctx)
 	if err != nil {
 		// A partial failure still leaves metrics worth sending.
 		a.logger.Warn("partial collection failure", "error", err)
 	}
+	collected = append(collected, a.selfMetrics(time.Since(started))...)
 
 	// Snapshots are staged by collectors during CollectAll and drained here.
-	snapshots := a.registry.Snapshots()
+	// A collector stages an inventory once per collection interval, which can
+	// be hours, so the ones a failed post was carrying are offered again.
+	snapshots := mergeSnapshots(a.undelivered, a.registry.Snapshots())
 
 	if len(collected) == 0 && len(snapshots) == 0 {
 		if err != nil {
@@ -712,11 +796,69 @@ func (a *Agent) collectAndTransmit(ctx context.Context) error {
 	return nil
 }
 
+// cycleReporter is implemented by registries that record how each collector
+// fared in the last cycle.
+type cycleReporter interface {
+	LastCycle() []registry.CollectorStatus
+}
+
+// selfMetrics describes the agent's own health for this cycle, so that a
+// collector that fails or hangs on one host is visible on the platform and
+// not only in that host's log:
+//
+//	agent_collector_up{collector}  1 when the collector returned in time
+//	                               without an error, else 0
+//	agent_collectors_failing       how many collectors are at 0: one number
+//	                               per host for an alert to read
+//	agent_collection_seconds       how long the cycle's collection took
+//	agent_backlog_metrics          readings kept from failed posts, waiting
+//	                               to be delivered
+//
+// The delta filter keeps an unchanged status from being sent every cycle.
+func (a *Agent) selfMetrics(collection time.Duration) []metrics.Metric {
+	reporter, ok := a.registry.(cycleReporter)
+	if !ok {
+		return nil
+	}
+	statuses := reporter.LastCycle()
+	if len(statuses) == 0 {
+		return nil
+	}
+	out := make([]metrics.Metric, 0, len(statuses)+3)
+	failing := 0.0
+	for _, s := range statuses {
+		up := 0.0
+		if s.OK {
+			up = 1
+		} else {
+			failing++
+		}
+		out = append(out, metrics.QuickGaugeWithLabels(a.hostname, "agent_collector_up", up, map[string]string{"collector": s.Name}))
+	}
+	out = append(out, metrics.QuickGauge(a.hostname, "agent_collectors_failing", failing))
+	// Tenths of a second: finer than that is noise the server would store.
+	seconds := math.Round(collection.Seconds()*10) / 10
+	return append(out,
+		metrics.QuickGauge(a.hostname, "agent_collection_seconds", seconds),
+		metrics.QuickGauge(a.hostname, "agent_backlog_metrics", float64(a.backlog.len())))
+}
+
 // transmitMetrics applies delta filtering and sends the result in batches.
 //
 // Snapshots bypass delta filtering (they are not time series) and ride along
 // with the first batch only, so the server upserts each snapshot type once
 // per cycle and runs its findings evaluator once rather than once per batch.
+//
+// Nothing a failed post carried is treated as delivered: its snapshots wait
+// in a.undelivered, the delta filter forgets its metrics so that their next
+// reading is sent whether or not the value moved, and the readings themselves
+// wait in a.backlog.
+//
+// Kept readings ride in the same requests as fresh ones, filling the last
+// batch, so catching up costs no extra request per cycle. They are not
+// attached while posts are failing: an outage would otherwise be probed with
+// an ever larger body. The first post that gets through is followed by one
+// batch of kept readings, and the rest drain with the cycles after it.
 func (a *Agent) transmitMetrics(ctx context.Context, all []metrics.Metric, snapshots []metrics.Snapshot) error {
 	filtered := a.deltaTracker.FilterMetrics(all)
 	a.logger.Debug("delta filtering completed",
@@ -724,11 +866,29 @@ func (a *Agent) transmitMetrics(ctx context.Context, all []metrics.Metric, snaps
 		"filtered_metrics", len(filtered),
 		"snapshots", len(snapshots))
 
-	if len(filtered) == 0 && len(snapshots) == 0 && !a.identityEnabled {
+	a.mu.Lock()
+	healthy := a.consecutiveFailures == 0
+	a.mu.Unlock()
+
+	var replayed []metrics.Metric
+	switch {
+	case healthy:
+		replayed = a.backlog.take(replayRoom(len(filtered)), time.Now())
+	case len(filtered) == 0 && len(snapshots) == 0 && !a.identityEnabled:
+		// Nothing fresh to try the server with: kept readings are the probe.
+		replayed = a.backlog.take(batchSize, time.Now())
+	}
+	if len(filtered) == 0 && len(replayed) == 0 && len(snapshots) == 0 && !a.identityEnabled {
 		return nil
 	}
 
-	batches := batch(filtered, batchSize)
+	// Fresh readings first, so that when a post fails partway the split
+	// between what was fresh and what was replayed is one index.
+	sending := filtered
+	if len(replayed) > 0 {
+		sending = append(append(make([]metrics.Metric, 0, len(filtered)+len(replayed)), filtered...), replayed...)
+	}
+	batches := batch(sending, batchSize)
 	if len(batches) == 0 {
 		batches = [][]metrics.Metric{nil} // a snapshot-only cycle still needs one request
 	}
@@ -750,7 +910,23 @@ func (a *Agent) transmitMetrics(ctx context.Context, all []metrics.Metric, snaps
 			a.ackSnapshots()
 		}
 		a.recordAttempt(start, sendErr)
+		if i == 0 {
+			if sendErr == nil {
+				a.undelivered = nil
+			} else {
+				a.undelivered = snapshots
+			}
+		}
 		if err := sendErr; err != nil {
+			unsent := sending[min(i*batchSize, len(sending)):]
+			fresh := unsent[:max(0, len(filtered)-i*batchSize)]
+			a.deltaTracker.Forget(fresh)
+			// A payload the server refuses would be refused again, and kept
+			// readings ride with every later post. It is dropped.
+			if !errors.Is(err, errPayloadRejected) {
+				a.backlog.restore(unsent[len(fresh):])
+				a.backlog.add(fresh)
+			}
 			return fmt.Errorf("failed to send batch %d of %d (%d metrics): %w", i+1, len(batches), len(b), err)
 		}
 		a.logger.Debug("batch sent",
@@ -759,7 +935,84 @@ func (a *Agent) transmitMetrics(ctx context.Context, all []metrics.Metric, snaps
 			"metrics", len(b),
 			"latency_ms", time.Since(start).Milliseconds())
 	}
+	if len(replayed) > 0 {
+		a.logger.Info("delivered readings kept from failed posts",
+			"delivered", len(replayed), "still_kept", a.backlog.len())
+	} else if !healthy {
+		a.deliverKept(ctx)
+	}
 	return nil
+}
+
+// deliverKept sends one batch of kept readings by itself, right after the
+// first post that got through following failures. Its failure is not the
+// cycle's: the cycle's own readings were delivered.
+func (a *Agent) deliverKept(ctx context.Context) {
+	kept := a.backlog.take(batchSize, time.Now())
+	if len(kept) == 0 {
+		return
+	}
+	if err := a.transmitter.Send(ctx, kept, nil); err != nil {
+		if !errors.Is(err, errPayloadRejected) {
+			a.backlog.restore(kept)
+		}
+		a.logger.Warn("could not deliver readings kept from failed posts; the next cycle retries",
+			"readings", len(kept), "error", err)
+		return
+	}
+	a.logger.Info("delivered readings kept from failed posts",
+		"delivered", len(kept), "still_kept", a.backlog.len())
+}
+
+// replayRoom is how many kept readings ride with fresh ones this cycle: as
+// many as fill the last batch. With no fresh readings that is one batch, so
+// a quiet host still catches up.
+func replayRoom(fresh int) int {
+	return batchSize - fresh%batchSize
+}
+
+// maxWaitingDeltas bounds how many undelivered delta snapshots are kept, so a
+// long outage cannot crowd everything else out of the 16-snapshot post.
+const maxWaitingDeltas = 8
+
+// mergeSnapshots returns the snapshots for this cycle: those still waiting
+// from a failed post, then the freshly staged ones.
+//
+// Most snapshot types describe current state, so a fresh one supersedes a
+// waiting one of the same type. k8s_health_delta is a list of transitions:
+// each one counts, and they are kept in order.
+func mergeSnapshots(waiting, fresh []metrics.Snapshot) []metrics.Snapshot {
+	if len(waiting) == 0 {
+		return fresh
+	}
+	staged := make(map[string]bool, len(fresh))
+	for _, s := range fresh {
+		staged[s.Type] = true
+	}
+	out := make([]metrics.Snapshot, 0, len(waiting)+len(fresh))
+	deltas := 0
+	for _, s := range waiting {
+		if s.Type == metrics.SnapshotK8sHealthDelta {
+			deltas++
+			continue
+		}
+		if !staged[s.Type] {
+			out = append(out, s)
+		}
+	}
+	// The newest deltas win when there are more than the bound.
+	skip := max(0, deltas-maxWaitingDeltas)
+	for _, s := range waiting {
+		if s.Type != metrics.SnapshotK8sHealthDelta {
+			continue
+		}
+		if skip > 0 {
+			skip--
+			continue
+		}
+		out = append(out, s)
+	}
+	return append(out, fresh...)
 }
 
 // batch splits metrics into slices of at most size.

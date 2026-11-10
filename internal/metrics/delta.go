@@ -29,8 +29,9 @@ type DeltaTracker struct {
 	statsMu        sync.RWMutex
 }
 
-// MetricState represents the previous state of a metric for delta comparison.
+// MetricState is what the tracker remembers about one series.
 type MetricState struct {
+	// Value is the value last sent, the baseline every reading is compared to.
 	Value        float64
 	Timestamp    time.Time
 	LastSent     time.Time
@@ -342,11 +343,10 @@ func (dt *DeltaTracker) updateMetricStateNoSend(key string, metric Metric, now t
 		return
 	}
 
-	// Update values atomically
-	state.Value = metric.Value
+	// Value and LastSent stay as they were at the last send: the next
+	// reading is compared against what the server has, not against this one.
 	state.Timestamp = now
-	state.LastAccessed = now // Update access time for LRU
-	// Don't update LastSent - keep the previous send time
+	state.LastAccessed = now
 
 	// Update labels if they changed - create new map to avoid mutation issues
 	if len(metric.Labels) != len(state.Labels) || !dt.labelsEqual(state.Labels, metric.Labels) {
@@ -359,6 +359,17 @@ func (dt *DeltaTracker) updateMetricStateNoSend(key string, metric Metric, now t
 
 	// Check if eviction is needed when adding new entries
 	dt.evictLRU()
+}
+
+// Forget drops what the tracker remembers about the given metrics, so the
+// next reading of each is sent whatever its value. Call it for metrics that
+// passed the filter but did not reach the server.
+func (dt *DeltaTracker) Forget(metrics []Metric) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	for _, m := range metrics {
+		delete(dt.previous, dt.createMetricKey(m))
+	}
 }
 
 // labelsEqual compares two label maps for equality.

@@ -1,6 +1,9 @@
 package container
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func find(t *testing.T, inv []imageEntry, ref string) imageEntry {
 	t.Helper()
@@ -97,5 +100,64 @@ func TestBuildImageInventory_SkipsEmpty(t *testing.T) {
 func TestBuildImageInventory_Empty(t *testing.T) {
 	if inv := buildImageInventory(nil); len(inv) != 0 {
 		t.Errorf("nil input should yield empty inventory, got %+v", inv)
+	}
+}
+
+// The inventory is state, not a time series: it is sent when it changes and
+// refreshed on a slow interval, not with every collection.
+func TestImageInventoryIsStagedOnChangeOrRefresh(t *testing.T) {
+	old := imagesRefreshInterval
+	defer func() { imagesRefreshInterval = old }()
+	imagesRefreshInterval = time.Hour
+
+	c := &Collector{}
+	running := []Container{
+		{Image: "nginx:1.27", ImageID: "sha256:aaa", Status: "running"},
+		{Image: "redis:7", ImageID: "sha256:bbb", Status: "running"},
+	}
+
+	c.stageImages(running)
+	if got := c.Snapshots(); len(got) != 1 {
+		t.Fatalf("first inventory: %d snapshots, want 1", len(got))
+	}
+	for i := 0; i < 3; i++ {
+		c.stageImages(running)
+		if got := c.Snapshots(); len(got) != 0 {
+			t.Fatalf("an unchanged inventory was staged again on collection %d", i+2)
+		}
+	}
+
+	// A container stopping changes the counts the platform shows.
+	stopped := []Container{running[0], {Image: "redis:7", ImageID: "sha256:bbb", Status: "exited"}}
+	c.stageImages(stopped)
+	if got := c.Snapshots(); len(got) != 1 {
+		t.Fatal("a changed inventory was not staged")
+	}
+
+	imagesRefreshInterval = 0
+	c.stageImages(stopped)
+	if got := c.Snapshots(); len(got) != 1 {
+		t.Fatal("an unchanged inventory was not refreshed after the interval")
+	}
+}
+
+// A host that lists no containers for a moment must not have its inventory
+// sent again, unchanged, when they reappear in the same cycle or the next.
+func TestImageInventoryEmptyListingDoesNotResetChangeDetection(t *testing.T) {
+	old := imagesRefreshInterval
+	defer func() { imagesRefreshInterval = old }()
+	imagesRefreshInterval = time.Hour
+
+	c := &Collector{}
+	running := []Container{{Image: "nginx:1.27", ImageID: "sha256:aaa", Status: "running"}}
+	c.stageImages(running)
+	c.Snapshots()
+	c.stageImages(nil)
+	if got := c.Snapshots(); len(got) != 0 {
+		t.Fatal("an empty listing shipped a snapshot")
+	}
+	c.stageImages(running)
+	if got := c.Snapshots(); len(got) != 0 {
+		t.Fatal("the same inventory was staged again after an empty listing")
 	}
 }
