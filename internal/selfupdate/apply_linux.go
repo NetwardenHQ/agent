@@ -61,17 +61,7 @@ func inKubernetes() bool {
 
 func applyUpdate(ctx context.Context, target Target, _ []string, logger *slog.Logger) error {
 	if inKubernetes() {
-		// The Deployment Netwarden generates runs the latest tag with
-		// imagePullPolicy Always, so the restarted container is the new
-		// release. A Deployment pinned to a tag restarts into the same
-		// version: the attempt is recorded in attemptsFile first, so the
-		// restarted agent reports self-update as unsupported and waits a day
-		// instead of restarting again.
-		logger.Info("restarting to pick up the new agent image", "version", target.Version)
-		if err := restartSelf(); err != nil {
-			return fmt.Errorf("restart: %w", err)
-		}
-		return awaitReplacement(ctx, target, 2*time.Minute, "the Deployment's image tag and pull policy")
+		return applyInKubernetes(ctx, target, logger)
 	}
 
 	if err := writeUpgradeRequest(upgradeRequest, target.Version); err != nil {
@@ -102,4 +92,33 @@ func writeUpgradeRequest(path, version string) error {
 		return fmt.Errorf("write upgrade request: %w", err)
 	}
 	return nil
+}
+
+// applyInKubernetes asks Kubernetes for a new pod, which pulls the new image:
+// the same as `kubectl rollout restart` on the agent's Deployment, so the pod
+// is replaced rather than its container restarted in place, and its restart
+// count stays a count of failures.
+//
+// An install from before the agent was allowed to restart its Deployment
+// gets the container restart it always had: the kubelet starts it again and
+// pulls the image. The attempt is recorded in attemptsFile first, so a
+// Deployment pinned to another tag reports self-update as unsupported for a
+// day instead of restarting every night.
+func applyInKubernetes(ctx context.Context, target Target, logger *slog.Logger) error {
+	api, err := inClusterAPI()
+	if err == nil {
+		err = api.replacePod(ctx, target.Version, time.Now())
+		if err == nil {
+			logger.Info("asked Kubernetes to replace this pod with the new agent image", "version", target.Version)
+			return awaitReplacement(ctx, target, 5*time.Minute, "kubectl rollout status deployment/netwarden-agent")
+		}
+		if errors.Is(err, errWouldNotUpdate) {
+			return err
+		}
+	}
+	logger.Info("restarting to pick up the new agent image", "version", target.Version, "why_not_a_new_pod", err)
+	if err := restartSelf(); err != nil {
+		return fmt.Errorf("restart: %w", err)
+	}
+	return awaitReplacement(ctx, target, 2*time.Minute, "the Deployment's image tag and pull policy")
 }

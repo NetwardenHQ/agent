@@ -5,6 +5,19 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Kubernetes: a self-update replaces the agent's pod instead of restarting its container, the way
+  `kubectl rollout restart` does: the agent patches its own Deployment's pod template
+  (`kubectl.kubernetes.io/restartedAt`, plus `netwarden.com/update-to` naming the release), so a
+  self-update does not add to the pod's restart count. It checks first that a new pod would run
+  the release (the `latest` tag with `imagePullPolicy: Always`, or a tag naming the release), and
+  otherwise leaves the pod alone and says why. This needs the `netwarden-agent-self-update` Role
+  from the current install manifest: get on pods and ReplicaSets, and get and patch on the
+  `netwarden-agent` Deployment only, in the agent's own namespace. An install without it gets a
+  container restart, as before.
+
 ## [3.5.0] - 2026-11-10
 
 ### Added
