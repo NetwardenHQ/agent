@@ -5,7 +5,7 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.5.1] - 2026-11-11
 
 ### Changed
 - Kubernetes: a self-update replaces the agent's pod instead of restarting its container, the way
