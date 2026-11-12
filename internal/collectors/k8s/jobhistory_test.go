@@ -22,8 +22,9 @@ func TestFailedJobSupersededByLaterSuccessIsHistory(t *testing.T) {
 	if counts.jobsFailing != 1 {
 		t.Errorf("jobsFailing = %d, want 1 (only nudge's latest run)", counts.jobsFailing)
 	}
-	if len(counts.degraded) != 1 || counts.degraded[0] != "app/CronJob/nudge" {
-		t.Errorf("degraded = %v, want [app/CronJob/nudge]", counts.degraded)
+	// A CronJob's failed run is the scheduled-job alert's, not a degraded workload.
+	if len(counts.degraded) != 0 {
+		t.Errorf("degraded = %v, want none", counts.degraded)
 	}
 	for _, o := range obs {
 		if o.kind == "job" && o.owner == "CronJob/reaper" && !o.healthy {
@@ -41,8 +42,8 @@ func TestRunningJobDoesNotSupersedeFailure(t *testing.T) {
 		ownedJob("app", "reaper", "2026-10-20T16:30:00Z", ""),
 	}
 	_, counts := c.observe(nil, nil, jobs, nil, nil, nil, time.Now())
-	if counts.jobsFailing != 1 || len(counts.degraded) != 1 {
-		t.Errorf("jobsFailing = %d, degraded = %v; want the failure to stand", counts.jobsFailing, counts.degraded)
+	if counts.jobsFailing != 1 {
+		t.Errorf("jobsFailing = %d; want the failure to stand", counts.jobsFailing)
 	}
 }
 

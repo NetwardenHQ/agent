@@ -194,6 +194,9 @@ type JobCondition struct {
 	Status  string `json:"status"`
 	Reason  string `json:"reason,omitempty"`
 	Message string `json:"message,omitempty"`
+	// LastTransitionTime is when the condition took its status: for Failed,
+	// when the Job gave up.
+	LastTransitionTime string `json:"lastTransitionTime,omitempty"`
 }
 
 // ---- Workloads (apps/v1) ------------------------------------------------

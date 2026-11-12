@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `netwarden-agent` Deployment only, in the agent's own namespace. An install without it gets a
   container restart, as before.
 
+### Added
+- Kubernetes: for each CronJob whose last run failed, a `k8s_cronjob_failed` series labelled with
+  the namespace, the CronJob, the failed run (Job), Kubernetes' reason and message, when it gave up,
+  how many attempts failed, and whether the run was started by hand (`kubectl create job
+  --from=cronjob/...`). The same details are in the CronJob report as `last_failure`. An alert on
+  failing scheduled jobs can then say which job failed and why, not only how many.
+- Kubernetes: one `k8s_workload_degraded` series per degraded workload, labelled with its namespace,
+  `Kind/name`, its verdict ("1 of 3 replicas available"), desired and available replicas, and its
+  first failing pod with that pod's reason (CrashLoopBackOff, ImagePullBackOff...).
+
+### Fixed
+- Kubernetes: a failed run of a CronJob no longer counts as a degraded workload. It was reported
+  twice, as a failing scheduled job and as a degraded workload; the scheduled-job report carries the
+  run and the reason.
+
 ## [3.5.0] - 2026-11-10
 
 ### Added

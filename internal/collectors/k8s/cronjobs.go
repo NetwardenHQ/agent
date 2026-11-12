@@ -2,6 +2,8 @@ package k8s
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 	// The agent often runs in a scratch image with no /usr/share/zoneinfo,
 	// where named CronJob timezones would fail to load. The embedded database
@@ -44,6 +46,49 @@ type cronJobState struct {
 	// Outcome of the most recent finished Job this CronJob owns.
 	LastOutcome string `json:"last_outcome,omitempty"` // succeeded | failed | (empty: never run)
 	FailedRuns  int    `json:"failed_runs"`
+	// LastFailure describes the most recent run when it failed.
+	LastFailure *cronJobFailure `json:"last_failure,omitempty"`
+}
+
+// cronJobFailure is what Kubernetes says about a failed run.
+type cronJobFailure struct {
+	// Job is the failed run's name, which `kubectl logs job/<name>` takes
+	// while the Job is kept.
+	Job string `json:"job"`
+	// Reason and Message are the Job's Failed condition, for example
+	// BackoffLimitExceeded, "Job has reached the specified backoff limit".
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+	// At is when the Job gave up, RFC3339.
+	At string `json:"at,omitempty"`
+	// Attempts is how many of its pods failed.
+	Attempts int `json:"attempts"`
+	// Manual is true for a run started by hand (kubectl create job
+	// --from=cronjob/...), not by the schedule.
+	Manual bool `json:"manual,omitempty"`
+}
+
+// scheduledRunName reports whether a Job name is one the CronJob controller
+// gives a scheduled run: the CronJob's name, a dash, and the scheduled time
+// in minutes since the epoch. Anything else was created by hand.
+func scheduledRunName(cronJob, job string) bool {
+	suffix, ok := strings.CutPrefix(job, cronJob+"-")
+	if !ok || len(suffix) < 8 {
+		return false
+	}
+	_, err := strconv.ParseUint(suffix, 10, 64)
+	return err == nil
+}
+
+// failureOf describes a failed Job.
+func failureOf(cronJob string, j Job) *cronJobFailure {
+	f := &cronJobFailure{Job: j.Metadata.Name, Attempts: j.Status.Failed, Manual: !scheduledRunName(cronJob, j.Metadata.Name)}
+	for _, c := range j.Status.Conditions {
+		if c.Type == "Failed" && c.Status == "True" {
+			f.Reason, f.Message, f.At = c.Reason, c.Message, c.LastTransitionTime
+		}
+	}
+	return f
 }
 
 // cronJobReport is what the agent ships and the UI renders.
@@ -58,6 +103,7 @@ func buildCronJobReport(cluster string, cronJobs []CronJob, jobs []Job, now time
 	type jobOutcome struct {
 		when   time.Time
 		failed bool
+		job    Job
 	}
 	latest := map[string]jobOutcome{}
 	failures := map[string]int{}
@@ -83,7 +129,7 @@ func buildCronJobReport(cluster string, cronJobs []CronJob, jobs []Job, now time
 			continue
 		}
 		if prev, ok := latest[key]; !ok || when.After(prev.when) {
-			latest[key] = jobOutcome{when: when, failed: failed}
+			latest[key] = jobOutcome{when: when, failed: failed, job: j}
 		}
 	}
 
@@ -109,6 +155,7 @@ func buildCronJobReport(cluster string, cronJobs []CronJob, jobs []Job, now time
 		if o, ok := latest[key]; ok {
 			if o.failed {
 				st.LastOutcome = "failed"
+				st.LastFailure = failureOf(cj.Metadata.Name, o.job)
 			} else {
 				st.LastOutcome = "succeeded"
 			}
@@ -174,4 +221,36 @@ func countCronJobs(r cronJobReport) cronJobCounts {
 		c.active += cj.Active
 	}
 	return c
+}
+
+// maxFailedCronJobSeries bounds the per-CronJob series one report carries.
+const maxFailedCronJobSeries = 20
+
+// failedCronJobSeries labels one k8s_cronjob_failed series per CronJob whose
+// last run failed, so an alert can say which job, in which namespace, and
+// what Kubernetes said, not only how many. The message is cut to 200
+// characters.
+func failedCronJobSeries(r cronJobReport) []map[string]string {
+	var out []map[string]string
+	for _, cj := range r.CronJobs {
+		if cj.LastOutcome != "failed" || cj.LastFailure == nil || len(out) == maxFailedCronJobSeries {
+			continue
+		}
+		f := cj.LastFailure
+		message := f.Message
+		if len(message) > 200 {
+			message = message[:200]
+		}
+		out = append(out, map[string]string{
+			"namespace": cj.Namespace,
+			"cronjob":   cj.Name,
+			"job":       f.Job,
+			"reason":    f.Reason,
+			"message":   message,
+			"failed_at": f.At,
+			"attempts":  strconv.Itoa(f.Attempts),
+			"manual":    strconv.FormatBool(f.Manual),
+		})
+	}
+	return out
 }

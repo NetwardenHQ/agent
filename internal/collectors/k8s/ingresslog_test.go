@@ -328,9 +328,25 @@ func TestCollectWritesEdgeEventsAndMetrics(t *testing.T) {
 		WithSpoolDir(spoolDir), WithUrgent(func() { urgent <- struct{}{} }))
 	t.Cleanup(func() { _ = c.Close() })
 
-	if _, err := c.Collect(t.Context()); err != nil {
-		t.Fatal(err)
+	// The line counts are per report: whichever collection follows a line
+	// takes it, and on a busy machine the reader can finish every line before
+	// the first collection below. So every collection counts, each value
+	// kept at the highest any of them reported.
+	got := map[string]float64{}
+	lines := 0.0
+	var ms []metrics.Metric
+	collect := func() {
+		var err error
+		ms, err = c.Collect(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, v := range gauges(ms) {
+			got[name] = max(got[name], v)
+		}
+		lines += gauges(ms)["k8s_ingress_log_lines"]
 	}
+	collect()
 	select {
 	case <-urgent:
 	case <-time.After(5 * time.Second):
@@ -342,15 +358,8 @@ func TestCollectWritesEdgeEventsAndMetrics(t *testing.T) {
 	}
 	// The early report is requested at the exposure line, two lines before
 	// the end of the stream; collect until the reader has finished the rest.
-	var ms []metrics.Metric
-	var got map[string]float64
 	for deadline := time.Now().Add(10 * time.Second); ; {
-		var err error
-		ms, err = c.Collect(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		got = gauges(ms)
+		collect()
 		settled := true
 		for name, v := range want {
 			settled = settled && got[name] == v
@@ -365,8 +374,8 @@ func TestCollectWritesEdgeEventsAndMetrics(t *testing.T) {
 			t.Errorf("%s = %v, want %v", name, got[name], v)
 		}
 	}
-	if got["k8s_ingress_log_lines"] < 3 {
-		t.Errorf("lines %v", got["k8s_ingress_log_lines"])
+	if lines < 3 {
+		t.Errorf("lines %v", lines)
 	}
 	blind := false
 	for _, m := range ms {

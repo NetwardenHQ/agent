@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -171,7 +172,21 @@ type clusterCounts struct {
 	restarts                               int
 	workloadsTotal                         int
 	degraded                               []string
-	suppressed                             int
+	// degradedDetail says how and why each entry of degraded is degraded,
+	// keyed like it.
+	degradedDetail map[string]degradedWorkload
+	suppressed     int
+}
+
+// degradedWorkload is one degraded workload as an alert can describe it.
+type degradedWorkload struct {
+	namespace          string
+	workload           string // Kind/name
+	reason, message    string // the workload's own verdict: "Degraded", "1 of 3 replicas available"
+	desired, available int
+	// The first failing pod of the workload, when one is known: usually the
+	// reason it is degraded (CrashLoopBackOff, ImagePullBackOff, OOMKilled).
+	pod, podReason, podMessage string
 }
 
 // Option configures the collector.
@@ -883,6 +898,14 @@ func (c *Collector) observe(
 	// being down must not un-demote the other's pods.
 	owners := map[string]bool{}
 	degraded := map[string]bool{}
+	detail := map[string]degradedWorkload{}
+	markDegraded := func(target, namespace, ref string, hs healthState, desired, available int) {
+		degraded[target] = true
+		if _, ok := detail[target]; !ok {
+			detail[target] = degradedWorkload{namespace: namespace, workload: ref, reason: hs.reason,
+				message: hs.message, desired: desired, available: available}
+		}
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -912,6 +935,9 @@ func (c *Collector) observe(
 		return c.noise.surface(hs.reason, now.Sub(since), reclaimOpen)
 	}
 
+	type podFault struct{ target, pod, reason, message string }
+	var podFaults []podFault
+
 	// Workloads first: they decide what a pod fault means.
 	impacted := map[string]bool{}
 	for _, w := range workloads {
@@ -939,7 +965,7 @@ func (c *Collector) observe(
 			ns(w.namespace).workloadsDegraded++
 		}
 		if surface {
-			degraded[target] = true
+			markDegraded(target, w.namespace, w.ref(), hs, w.desired, w.available)
 		}
 		obs = append(obs, observation{
 			key: w.key(), kind: "workload", namespace: w.namespace, name: w.name,
@@ -965,7 +991,7 @@ func (c *Collector) observe(
 			counts.suppressed++
 		}
 		if surface {
-			degraded[target] = true
+			markDegraded(target, p.Metadata.Namespace, ref, hs, p.Status.DesiredHealthy, p.Status.CurrentHealthy)
 		}
 		obs = append(obs, observation{
 			key: p.key(), kind: "pdb", namespace: p.Metadata.Namespace, name: p.Metadata.Name,
@@ -986,7 +1012,7 @@ func (c *Collector) observe(
 			counts.suppressed++
 		}
 		if surface {
-			degraded[qualify(sv.namespace, sv.ref())] = true
+			markDegraded(qualify(sv.namespace, sv.ref()), sv.namespace, sv.ref(), hs, sv.total, sv.ready)
 		}
 		obs = append(obs, observation{
 			key: sv.key(), kind: "service", namespace: sv.namespace, name: sv.name,
@@ -1042,6 +1068,9 @@ func (c *Collector) observe(
 		}
 
 		surface := surfaceOf(p.key(), hs)
+		if !hs.healthy && owner != "" {
+			podFaults = append(podFaults, podFault{target: target, pod: p.Metadata.Name, reason: hs.reason, message: hs.message})
+		}
 		// A pod fault only surfaces when its workload is impacted. If the
 		// workload still has every replica available, the pod is being
 		// replaced. A pod with no controller has no availability to fall back
@@ -1081,8 +1110,11 @@ func (c *Collector) observe(
 		if owner != "" {
 			target := qualify(j.Metadata.Namespace, owner)
 			owners[target] = true
-			if surface {
-				degraded[target] = true
+			// A CronJob's failed run is reported by the scheduled-job alert,
+			// with the run and the reason: as a degraded workload too it
+			// raised a second, vaguer alert for the same failure.
+			if surface && !strings.HasPrefix(owner, "CronJob/") {
+				markDegraded(target, j.Metadata.Namespace, owner, hs, 0, 0)
 			}
 		}
 		obs = append(obs, observation{
@@ -1091,6 +1123,14 @@ func (c *Collector) observe(
 			owner: owner,
 		})
 	}
+
+	for _, f := range podFaults {
+		if d, ok := detail[f.target]; ok && d.pod == "" {
+			d.pod, d.podReason, d.podMessage = f.pod, f.reason, f.message
+			detail[f.target] = d
+		}
+	}
+	counts.degradedDetail = detail
 
 	counts.workloadsTotal = len(owners)
 	for w := range degraded {
@@ -1342,6 +1382,11 @@ func (c *Collector) emitMetrics(reachable float64, counts clusterCounts, usage u
 		if f.core {
 			add("k8s_workloads_total", float64(counts.workloadsTotal))
 			add("k8s_workloads_degraded", float64(len(counts.degraded)))
+			for _, labels := range degradedWorkloadSeries(counts) {
+				if m, e := c.builder.WithTimestamp(now).GaugeWithLabels("k8s_workload_degraded", 1, labels); e == nil {
+					out = append(out, m)
+				}
+			}
 			add("k8s_findings_suppressed", float64(counts.suppressed))
 		}
 
@@ -1377,6 +1422,11 @@ func (c *Collector) emitMetrics(reachable float64, counts clusterCounts, usage u
 			add("k8s_cronjobs_total", float64(cc.total))
 			add("k8s_cronjobs_suspended", float64(cc.suspended))
 			add("k8s_cronjobs_failing", float64(cc.failing))
+			for _, labels := range failedCronJobSeries(cron) {
+				if m, e := c.builder.WithTimestamp(now).GaugeWithLabels("k8s_cronjob_failed", 1, labels); e == nil {
+					out = append(out, m)
+				}
+			}
 			add("k8s_cronjobs_active", float64(cc.active))
 			// Only explicitly labeled database backups count; hourly and weekly
 			// application jobs must not inherit a daily-backup age threshold. A
@@ -1728,3 +1778,40 @@ var (
 	_ metrics.Collector        = (*Collector)(nil)
 	_ metrics.SnapshotProvider = (*Collector)(nil)
 )
+
+// maxDegradedSeries bounds the per-workload series one report carries.
+const maxDegradedSeries = 20
+
+// degradedWorkloadSeries labels one k8s_workload_degraded series per degraded
+// workload, so an alert can say which workloads, how degraded and why, not
+// only how many. Messages are cut to 200 characters.
+func degradedWorkloadSeries(counts clusterCounts) []map[string]string {
+	cut := func(s string) string {
+		if len(s) > 200 {
+			return s[:200]
+		}
+		return s
+	}
+	out := make([]map[string]string, 0, len(counts.degraded))
+	for _, target := range counts.degraded {
+		d, ok := counts.degradedDetail[target]
+		if !ok || len(out) == maxDegradedSeries {
+			continue
+		}
+		labels := map[string]string{
+			"namespace": d.namespace,
+			"workload":  d.workload,
+			"reason":    d.reason,
+			"message":   cut(d.message),
+			"desired":   strconv.Itoa(d.desired),
+			"available": strconv.Itoa(d.available),
+		}
+		if d.pod != "" {
+			labels["pod"] = d.pod
+			labels["pod_reason"] = d.podReason
+			labels["pod_message"] = cut(d.podMessage)
+		}
+		out = append(out, labels)
+	}
+	return out
+}
