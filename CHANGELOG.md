@@ -5,7 +5,7 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.6.1] - 2026-11-13
+## [Unreleased]
 
 ### Added
 - Brute-force levels, on every platform with failed-login monitoring: failures in the last five
@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with ten or more (`security_failed_logins_ip_10m{ip}`). They are rolling levels rather than
   per-window counts, so they stay correct when the transmitter skips a value that did not change.
   The platform alerts on the burst and on one address making 50 or more attempts.
+
+## [3.6.1] - 2026-11-13
+
+### Added
 - FreeBSD: failed-login monitoring and login events, read from `/var/log/auth.log` as on Linux. On
   OPNsense the generic collector stays off, since the OPNsense collector already reports failed
   logins from its own logs.
