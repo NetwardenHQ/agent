@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- FreeBSD: failed-login monitoring and login events, read from `/var/log/auth.log` as on Linux. On
+  OPNsense the generic collector stays off, since the OPNsense collector already reports failed
+  logins from its own logs.
+
+### Fixed
+- Failed SSH logins through PAM's keyboard-interactive method ("Failed keyboard-interactive/pam
+  for ..."), the default on FreeBSD and common on Linux hosts with password logins handled by PAM,
+  were not counted.
+- Synology DSM: the agent state file, the event spool and the file integrity baseline now live in
+  the package's data folder, beside `netwarden.conf`. The package user cannot create
+  `/var/lib/netwarden`, so the state file was never written and the file integrity baseline was
+  rebuilt on every restart. Explicit `spool_dir` and `fim_manifest_path` settings still win.
+- Synology DSM: the PostgreSQL DSM runs for its own apps is no longer reported as a database the
+  agent cannot connect to. On DSM a PostgreSQL is monitored only when `postgresql_host`,
+  `postgresql_socket` or `postgresql_user` names one.
+- Synology DSM: the installed-packages inventory reads DSM's version from `/etc.defaults/VERSION`
+  (distro `dsm`) instead of warning that `/etc/os-release` is missing.
+- Failed-login monitoring treated a `journalctl` that could not read the journal as a readable
+  source with no failures: a non-zero exit, "insufficient permissions", or, on systemd 219 as DSM
+  ships it, "No journal files were found." with exit 0. It now falls back to the log files, and
+  reports `security_auth_log_readable` 0 when those are unreadable too.
+- Synology DSM: failed SSH logins are read from `/var/log/auth.log` before the journal, which on
+  DSM is volatile and does not carry sshd's failures. The package user needs to be in group `log`
+  to read it.
+- Failed-login monitoring on systemd before 232 (CentOS and RHEL 7, Synology DSM 7): those versions
+  have no `short-unix` output, so the journal could not be read at all. The agent now reads it as
+  JSON there.
+
+## [3.6.0] - 2026-11-13
+
+### Added
 - Synology DSM collector (`enable_synology`, on by default, inactive elsewhere), running as the
   unprivileged package user with nothing to set up: drive health from DSM's own per-drive verdicts
   (SMART, unrecoverable errors, timeouts, resets, wear, bad blocks and sectors), drive temperature and

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || freebsd
 
 package security
 
@@ -6,15 +6,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NetwardenHQ/agent/internal/dsm"
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
@@ -47,15 +51,28 @@ var (
 	//   "Failed password for ubuntu from 192.0.2.1 port 22 ssh2"
 	//   "Invalid user admin from 192.0.2.5 port 33214"
 	//   "Failed publickey for foo from 192.0.2.5 port 22 ssh2"
-	failedPasswordRe = regexp.MustCompile(`Failed (?:password|publickey|none) for (?:invalid user )?(\S+) from (\S+)`)
+	//   "Failed keyboard-interactive/pam for root from 192.0.2.5 port 22 ssh2" (PAM, FreeBSD's default)
+	failedPasswordRe = regexp.MustCompile(`Failed (?:password|publickey|none|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+)`)
 	invalidUserRe    = regexp.MustCompile(`Invalid user (\S+) from (\S+)`)
 )
 
-// Enabled reports whether the auth collector should run. We're enabled on
-// Linux unconditionally; permission/source issues are handled at collect time.
+// Enabled reports whether the auth collector should run: on Linux and
+// FreeBSD always (a source it cannot read is reported at collect time), except
+// on OPNsense, whose own collector reports failed logins from its logs.
 func (c *AuthCollector) Enabled() bool {
+	if authGOOS == "freebsd" {
+		if _, err := os.Stat(opnsenseMarker); err == nil {
+			return false
+		}
+	}
 	return true
 }
+
+// opnsenseMarker exists only on OPNsense. Variables so tests can move them.
+var (
+	opnsenseMarker = "/usr/local/opnsense/version/core"
+	authGOOS       = runtime.GOOS
+)
 
 // Collect gathers failed-login statistics for the events since the previous
 // collection.
@@ -93,6 +110,13 @@ func (c *AuthCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 // collectAuthStats picks the best available data source and parses sshd
 // auth events from it. Order: journalctl -> /var/log/auth.log -> /var/log/secure.
 func (c *AuthCollector) collectAuthStats(ctx context.Context, since, until time.Time) (authStats, error) {
+	// On Synology DSM the journal is volatile (a couple of hours) and sshd's
+	// failures are written to auth.log, so the log file comes first there.
+	if dsm.Is() {
+		if stats, ok := c.statsFromLogFiles(ctx, since, until); ok {
+			return stats, nil
+		}
+	}
 	if _, err := os.Stat(journalctlPath); err == nil {
 		stats, err := c.statsFromJournal(ctx, since, until)
 		if err == nil {
@@ -101,20 +125,25 @@ func (c *AuthCollector) collectAuthStats(ctx context.Context, since, until time.
 		}
 		c.logger.Debug("journalctl path failed; trying log files", "error", err)
 	}
+	if stats, ok := c.statsFromLogFiles(ctx, since, until); ok {
+		return stats, nil
+	}
+	return authStats{}, errors.New("no readable failed-login data source")
+}
 
-	// Filesystem fallback.
+// statsFromLogFiles reads the first auth log file that can be read.
+func (c *AuthCollector) statsFromLogFiles(ctx context.Context, since, until time.Time) (authStats, bool) {
 	for _, candidate := range authLogFiles {
 		stats, err := c.statsFromLogFile(ctx, candidate.path, since, until)
 		if err == nil {
 			stats.Source = candidate.source
-			return stats, nil
+			return stats, true
 		}
 		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, os.ErrPermission) {
 			c.logger.Debug("log file path failed", "path", candidate.path, "error", err)
 		}
 	}
-
-	return authStats{}, errors.New("no readable failed-login data source")
+	return authStats{}, false
 }
 
 // statsFromJournal queries the systemd journal for sshd auth events in the
@@ -154,12 +183,21 @@ func (c *AuthCollector) scanJournal(ctx context.Context, matches []string, since
 	defer cancel()
 	// --since/--until take whole seconds in local time, so the query is
 	// widened by a second on each side and short-unix output gives every
-	// line its exact timestamp to filter on.
+	// line its exact timestamp to filter on. systemd before 232 (CentOS and
+	// RHEL 7, Synology DSM 7) has no short-unix; there the journal is read as
+	// JSON, which every version has, and turned into the same lines.
+	c.mu.Lock()
+	useJSON := c.journalJSON
+	c.mu.Unlock()
+	output := "--output=short-unix"
+	if useJSON {
+		output = "--output=json"
+	}
 	args := append(append([]string{}, matches...),
 		"--since", since.Add(-time.Second).Format("2006-01-02 15:04:05"),
 		"--until", until.Add(time.Second).Format("2006-01-02 15:04:05"),
 		"--no-pager",
-		"--output=short-unix",
+		output,
 	)
 	cmd := exec.CommandContext(cctx, journalctlPath, args...)
 	// Don't leak parent env; journalctl honors $SYSTEMD_COLORS etc.
@@ -176,26 +214,95 @@ func (c *AuthCollector) scanJournal(ctx context.Context, matches []string, since
 		c.logger.Debug("journalctl start failed", "matches", matches, "error", err)
 		return false
 	}
-	c.scanLines(stdout, journalTime, since, until, stats, users, ips)
+	// Lines go to a scratch tally first: what a journal the agent turns out
+	// not to be able to read said must not count.
+	var local authStats
+	localUsers := map[string]struct{}{}
+	localIPs := map[string]int{}
+	var src io.Reader = stdout
+	if useJSON {
+		src = journalJSONLines(stdout)
+	}
+	c.scanLines(src, journalTime, since, until, &local, localUsers, localIPs)
 
 	// Drain any remainder so Wait doesn't block indefinitely.
 	_, _ = io.Copy(io.Discard, stdout)
-	if err := cmd.Wait(); err != nil {
-		c.logger.Debug("journalctl exited non-zero", "matches", matches, "error", err)
+	waitErr := cmd.Wait()
+	errText := stderr.String()
+	if !useJSON && strings.Contains(errText, "Unknown output format") {
+		c.mu.Lock()
+		c.journalJSON = true
+		c.mu.Unlock()
+		return c.scanJournal(ctx, matches, since, until, stats, users, ips)
 	}
-	// A user outside adm/systemd-journal sees only its own entries, and
-	// journalctl says so on stderr. Such a journal holds no sshd lines at
-	// all, so it is not a source: reading it would report zero failures
-	// from a log the agent cannot see.
-	if journalOwnEntriesOnly(stderr.String()) {
-		c.logger.Debug("journalctl shows only the agent's own entries", "matches", matches)
+	// journalctl exits 0 with "-- No entries --" when nothing matches; a
+	// non-zero exit means it could not read the journal at all.
+	if waitErr != nil {
+		c.logger.Debug("journalctl exited non-zero", "matches", matches, "error", waitErr)
 		return false
+	}
+	if journalUnavailable(errText) {
+		c.logger.Debug("journalctl cannot see the system journal", "matches", matches)
+		return false
+	}
+	stats.FailedAttempts += local.FailedAttempts
+	stats.Events = append(stats.Events, local.Events...)
+	for u := range localUsers {
+		users[u] = struct{}{}
+	}
+	for ip, n := range localIPs {
+		ips[ip] += n
 	}
 	return true
 }
 
-func journalOwnEntriesOnly(stderr string) bool {
-	return strings.Contains(stderr, "not seeing messages from other users and the system")
+// journalUnavailable reports what journalctl prints, exit code 0 included,
+// when the agent's user cannot see the system journal: a user outside
+// adm/systemd-journal sees only its own entries, which hold no sshd lines,
+// and older systemd says it found no journal files at all. Reading such a
+// journal would report zero failures from a log the agent cannot see.
+func journalUnavailable(stderr string) bool {
+	return strings.Contains(stderr, "not seeing messages from other users and the system") ||
+		strings.Contains(stderr, "insufficient permissions") ||
+		strings.Contains(stderr, "No journal files were found")
+}
+
+// journalJSONLines turns journalctl's JSON output (one object per line) into
+// short-unix lines ("<sec>.<usec> <host> <ident>[<pid>]: <message>"), so
+// both outputs are scanned the same way. Entries whose MESSAGE is not text
+// (journald stores binary messages as byte arrays) are skipped.
+func journalJSONLines(r io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	go func() {
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			var e struct {
+				Realtime string          `json:"__REALTIME_TIMESTAMP"`
+				Host     string          `json:"_HOSTNAME"`
+				Ident    string          `json:"SYSLOG_IDENTIFIER"`
+				PID      string          `json:"_PID"`
+				Message  json.RawMessage `json:"MESSAGE"`
+			}
+			if json.Unmarshal(sc.Bytes(), &e) != nil {
+				continue
+			}
+			var msg string
+			if json.Unmarshal(e.Message, &msg) != nil {
+				continue
+			}
+			usec, err := strconv.ParseInt(e.Realtime, 10, 64)
+			if err != nil {
+				continue
+			}
+			line := fmt.Sprintf("%d.%06d %s %s[%s]: %s\n", usec/1e6, usec%1e6, e.Host, e.Ident, e.PID, msg)
+			if _, err := io.WriteString(pw, line); err != nil {
+				return
+			}
+		}
+		pw.CloseWithError(sc.Err())
+	}()
+	return pr
 }
 
 // limitWriter keeps at most n bytes and discards the rest.

@@ -13,7 +13,7 @@ The Netwarden agent is a small Go program that collects system, container,
 database, VM, Kubernetes and security-posture data and sends it to the
 Netwarden platform.
 
-[![Version](https://img.shields.io/badge/version-3.5.2-blue)](https://github.com/NetwardenHQ/agent/releases)
+[![Version](https://img.shields.io/badge/version-3.6.0-blue)](https://github.com/NetwardenHQ/agent/releases)
 [![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://golang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Code Signed](https://img.shields.io/badge/windows-code%20signed-blue?logo=windows)](https://github.com/NetwardenHQ/agent/releases)
@@ -256,7 +256,7 @@ log_level: info                               # debug, info, warn, error
 
 # ---- Security posture (on by default) ----
 # enable_security: true                       # master switch for the next four keys
-# enable_security_auth: true                  # failed-login counts (journald / auth.log)
+# enable_security_auth: true                  # failed-login counts (Linux: journald / auth.log; FreeBSD: auth.log; Windows: Security log)
 # enable_security_sshconfig: true             # sshd_config audit
 # enable_security_ports: true                 # listening sockets, every 5 minutes
 # enable_security_packages: true              # installed OS packages, every 6 hours

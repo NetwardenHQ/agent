@@ -30,6 +30,9 @@ type AuthCollector struct {
 	// whatever the collection interval. Zero until the first success.
 	mu        sync.Mutex
 	windowEnd time.Time
+	// journalJSON is set once journalctl turns out to predate short-unix
+	// output (systemd before 232); the journal is then read as JSON.
+	journalJSON bool
 
 	// spoolDir receives the security events (authevents.go); empty means
 	// the spool is off and so are the events, which the agent reports.

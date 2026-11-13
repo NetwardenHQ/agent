@@ -24,7 +24,7 @@ import (
 //
 //	security_ports      Linux (ss/netstat), macOS + Windows (gopsutil)
 //	security_sshconfig  Linux, macOS, Windows (OpenSSH config syntax is shared)
-//	security_auth       Linux (journald / auth.log / secure), Windows (Security event log)
+//	security_auth       Linux (journald / auth.log / secure), FreeBSD (auth.log; off on OPNsense, which has its own), Windows (Security event log)
 //	security_packages   Linux only (dpkg / rpm)
 //	cis                 Linux only, and only once a profile is defined in the UI
 //	fim                 Linux, macOS, Windows, FreeBSD; credential files by default, binaries with enable_fim: true

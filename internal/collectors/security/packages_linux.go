@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NetwardenHQ/agent/internal/dsm"
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
@@ -44,7 +45,7 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 	c.logger.Debug("collecting installed packages")
 	c.builder = c.builder.WithTimestamp(timestamp)
 
-	distro, err := readOSRelease("/etc/os-release")
+	distro, err := readDistro("/etc/os-release")
 	if err != nil {
 		c.logger.Warn("failed to read /etc/os-release", "error", err)
 		// Continue: emit zero-count snapshot with empty distro.
@@ -168,6 +169,18 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 		"distro_version_id", distro.VersionID)
 
 	return collected, nil
+}
+
+// readDistro reads the distro from path (/etc/os-release), or on Synology
+// DSM, which has none, from DSM's own version file. DSM packages have no
+// advisory feed, so "dsm" only names the system; no CVE matching follows.
+func readDistro(path string) (distroInfo, error) {
+	if dsm.Is() {
+		if version, _ := dsm.Version(); version != "" {
+			return distroInfo{ID: "dsm", VersionID: version}, nil
+		}
+	}
+	return readOSRelease(path)
 }
 
 // readOSRelease parses /etc/os-release, extracting ID, ID_LIKE, and

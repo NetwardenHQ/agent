@@ -1,15 +1,17 @@
-//go:build linux
+//go:build linux || freebsd
 
 package security
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/NetwardenHQ/agent/internal/dsm"
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
@@ -283,5 +285,158 @@ func TestJournalLimitedToOwnEntriesIsNotASource(t *testing.T) {
 	}
 	if _, ok := got["security_failed_logins"]; ok {
 		t.Fatal("a failed-login count was reported from a journal the agent cannot see")
+	}
+}
+
+// A journalctl that cannot open any journal file says so and exits non-zero
+// (older systemd, and DSM's). That is no source either.
+func TestJournalWithoutPermissionIsNotASource(t *testing.T) {
+	for name, script := range map[string]string{
+		"insufficient permissions": "#!/bin/sh\necho 'No journal files were opened due to insufficient permissions.' >&2\nexit 1\n",
+		"non-zero exit":            "#!/bin/sh\necho 'Failed to open journal' >&2\nexit 1\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "journalctl")
+			if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			useSources(t, fake, filepath.Join(dir, "missing.log"))
+			ms, err := NewAuthCollector("test").Collect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := metricValues(ms); got["security_auth_log_readable"] != 0 {
+				t.Errorf("reported readable: %v", got)
+			}
+		})
+	}
+}
+
+// DSM's journalctl (systemd 219), run by a user who cannot read the volatile
+// journal, prints "No journal files were found." and exits 0.
+func TestJournalWithNoFilesIsNotASource(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "journalctl")
+	script := "#!/bin/sh\necho 'No journal files were found.' >&2\necho '-- No entries --'\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	useSources(t, fake, filepath.Join(dir, "missing.log"))
+	ms, err := NewAuthCollector("test").Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metricValues(ms); got["security_auth_log_readable"] != 0 {
+		t.Errorf("reported readable: %v", got)
+	}
+}
+
+// systemd before 232 (CentOS/RHEL 7, DSM 7) has no short-unix output. The
+// journal is read as JSON there instead of being given up on.
+func TestOldSystemdIsReadAsJSON(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "journalctl")
+	usec := time.Now().Add(-30 * time.Second).UnixMicro()
+	script := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *short-unix*) echo "Unknown output format 'short-unix'." >&2; exit 1 ;;
+  *json*_SYSTEMD_UNIT=sshd.service*|*_SYSTEMD_UNIT=sshd.service*json*)
+    echo '{"__REALTIME_TIMESTAMP":"%d","_HOSTNAME":"old","SYSLOG_IDENTIFIER":"sshd","_PID":"812","MESSAGE":"Failed password for root from 203.0.113.9 port 22 ssh2"}'
+    echo '{"__REALTIME_TIMESTAMP":"%d","_HOSTNAME":"old","SYSLOG_IDENTIFIER":"sshd","_PID":"812","MESSAGE":[70,97,105,108]}'
+    ;;
+  *) echo '-- No entries --' ;;
+esac
+`, usec, usec)
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	useSources(t, fake, filepath.Join(dir, "missing.log"))
+	ms, err := NewAuthCollector("test").Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := metricValues(ms)
+	if got["security_auth_log_readable"] != 1 || got["security_failed_logins"] != 1 {
+		t.Errorf("old-systemd journal not read: %v", got)
+	}
+}
+
+// On DSM the journal is volatile and sshd's failures are in auth.log, which
+// the package user can read once it is in group "log". auth.log is read
+// first there, even when the journal is readable too.
+func TestDSMReadsAuthLogBeforeTheJournal(t *testing.T) {
+	dir := t.TempDir()
+	old := dsm.Marker
+	dsm.Marker = filepath.Join(dir, "synoinfo.conf")
+	t.Cleanup(func() { dsm.Marker = old })
+	if err := os.WriteFile(dsm.Marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A readable journal with no sshd failures in it.
+	fake := filepath.Join(dir, "journalctl")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho '-- No entries --'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "auth.log")
+	line := time.Now().Add(-10*time.Second).Format(time.RFC3339Nano) +
+		" nas sshd[9]: Failed password for admin from 192.0.2.1 port 22 ssh2\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	useSources(t, fake, path)
+	ms, err := NewAuthCollector("nas").Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metricValues(ms); got["security_failed_logins"] != 1 {
+		t.Errorf("DSM's auth.log was not read first: %v", got)
+	}
+}
+
+// FreeBSD's sshd authenticates through PAM by default, so a wrong password
+// is logged as "Failed keyboard-interactive/pam". PAM's own "error: PAM:"
+// line for the same attempt must not count it twice.
+func TestFreeBSDStyleFailures(t *testing.T) {
+	now := time.Now()
+	ts := now.Add(-20 * time.Second).Format("Jan _2 15:04:05")
+	lines := []string{
+		ts + " fw sshd[1201]: error: PAM: Authentication error for root from 203.0.113.5",
+		ts + " fw sshd[1201]: Failed keyboard-interactive/pam for root from 203.0.113.5 port 51122 ssh2",
+		ts + " fw sshd[1203]: Invalid user oracle from 203.0.113.6 port 40022",
+		ts + " fw sshd[1203]: Failed keyboard-interactive/pam for invalid user oracle from 203.0.113.6 port 40022 ssh2",
+		ts + " fw sshd[1205]: Accepted publickey for admin from 192.0.2.10 port 50000 ssh2",
+	}
+	path := filepath.Join(t.TempDir(), "auth.log")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := NewAuthCollector("fw").statsFromLogFile(context.Background(), path, now.Add(-time.Minute), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One failure from .5; .6 shows up as "Invalid user" and as a failed
+	// attempt, counted once each as the Linux lines are.
+	if stats.FailedAttempts != 3 || stats.UniqueIPs != 2 {
+		t.Errorf("attempts %d, IPs %d", stats.FailedAttempts, stats.UniqueIPs)
+	}
+}
+
+// OPNsense reports failed logins from its own logs (the opnsense collector);
+// the generic collector stays off there so nothing is counted twice.
+func TestOffOnOPNsense(t *testing.T) {
+	oldOS, oldMarker := authGOOS, opnsenseMarker
+	t.Cleanup(func() { authGOOS, opnsenseMarker = oldOS, oldMarker })
+	authGOOS = "freebsd"
+	opnsenseMarker = filepath.Join(t.TempDir(), "core")
+	c := NewAuthCollector("fw")
+	if !c.Enabled() {
+		t.Error("off on plain FreeBSD")
+	}
+	if err := os.WriteFile(opnsenseMarker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c.Enabled() {
+		t.Error("on, on OPNsense")
 	}
 }

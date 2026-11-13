@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/NetwardenHQ/agent/internal/dsm"
 )
 
 // DefaultServerURL is the SaaS endpoint used when no server_url is configured.
@@ -489,6 +491,7 @@ func LoadConfig(filename string) (*Config, error) {
 	config.Collectors.K8sIngress = true
 	config.K8sIngressLogsNamespace = "ingress-nginx"
 
+	spoolSet := false
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -577,6 +580,7 @@ func LoadConfig(filename string) (*Config, error) {
 				v = ""
 			}
 			config.SpoolDir = v
+			spoolSet = true
 		case "spool_volume":
 			config.SpoolVolume = strings.TrimSpace(value)
 		case "fim_manifest_path":
@@ -785,6 +789,19 @@ func LoadConfig(filename string) (*Config, error) {
 
 	if config.TripwireStatePath == "" {
 		config.TripwireStatePath = filepath.Join(filepath.Dir(filename), "tripwire.json")
+	}
+	// DSM runs the agent as the package user, which cannot create
+	// /var/lib/netwarden. Its state goes in the package's data folder, where
+	// the config file is (the spool, and state.json beside it, and the FIM
+	// baseline), unless set explicitly.
+	if dsm.Is() {
+		dir := filepath.Dir(filename)
+		if !spoolSet {
+			config.SpoolDir = filepath.Join(dir, "spool")
+		}
+		if config.FIMManifestPath == "" {
+			config.FIMManifestPath = filepath.Join(dir, "fim-manifest")
+		}
 	}
 	return config, nil
 }
