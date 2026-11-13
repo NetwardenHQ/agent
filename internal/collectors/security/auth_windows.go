@@ -48,8 +48,8 @@ func (c *AuthCollector) Collect(ctx context.Context) ([]metrics.Metric, error) {
 			}
 			if o.FailedIP != "" {
 				ips[o.FailedIP]++
-				c.failures.add(o.FailedIP, r.Time)
 			}
+			c.recordFailure(o.FailedIP, r.Time)
 			continue
 		}
 		stats.Events = append(stats.Events, *o.Event)

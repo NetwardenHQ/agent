@@ -397,14 +397,14 @@ func (c *AuthCollector) scanLines(r io.Reader, timeOf func(string) (time.Time, b
 			stats.FailedAttempts++
 			users[m[1]] = struct{}{}
 			ips[m[2]]++
-			c.failures.add(m[2], t)
+			c.recordFailure(m[2], t)
 			continue
 		}
 		if m := invalidUserRe.FindStringSubmatch(line); m != nil {
 			stats.FailedAttempts++
 			users[m[1]] = struct{}{}
 			ips[m[2]]++
-			c.failures.add(m[2], t)
+			c.recordFailure(m[2], t)
 			continue
 		}
 		if ev, ok := parseAuthMessage(messageOf(line)); ok {

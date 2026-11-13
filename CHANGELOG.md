@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.6.1] - 2026-11-13
 
 ### Added
+- Brute-force levels, on every platform with failed-login monitoring: failures in the last five
+  minutes (`security_failed_logins_5m`), the host's usual five-minute count over the last day
+  (`security_failed_logins_usual_5m`), a burst (`security_failed_logins_burst`: the five-minute count
+  when it is at least 50 and ten times the usual, else 0), the most failures from one address in ten
+  minutes (`security_failed_logins_max_ip_10m`), and per-address counts for the busiest addresses
+  with ten or more (`security_failed_logins_ip_10m{ip}`). They are rolling levels rather than
+  per-window counts, so they stay correct when the transmitter skips a value that did not change.
+  The platform alerts on the burst and on one address making 50 or more attempts.
 - FreeBSD: failed-login monitoring and login events, read from `/var/log/auth.log` as on Linux. On
   OPNsense the generic collector stays off, since the OPNsense collector already reports failed
   logins from its own logs.

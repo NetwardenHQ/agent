@@ -38,15 +38,24 @@ type AuthCollector struct {
 	// the spool is off and so are the events, which the agent reports.
 	spoolDir string
 	failures *failureLog
+
+	// perMinute counts failed logins per minute (Unix minute start) over the
+	// last day, for the brute-force levels (bruteforce.go). started and
+	// firstFailure bound how much of that day the agent has actually seen.
+	perMinute    map[int64]int
+	started      time.Time
+	firstFailure time.Time
 }
 
 // NewAuthCollector creates a new failed-login collector.
 func NewAuthCollector(hostname string, opts ...AuthOption) *AuthCollector {
 	c := &AuthCollector{
-		hostname: hostname,
-		logger:   slog.Default(),
-		builder:  metrics.NewBuilder().WithHostname(hostname),
-		failures: newFailureLog(10000),
+		hostname:  hostname,
+		logger:    slog.Default(),
+		builder:   metrics.NewBuilder().WithHostname(hostname),
+		failures:  newFailureLog(10000),
+		perMinute: map[int64]int{},
+		started:   time.Now(),
 	}
 
 	for _, opt := range opts {
@@ -145,6 +154,7 @@ func (c *AuthCollector) emitMetrics(stats authStats, ts time.Time) []metrics.Met
 	c.addGauge(&out, "security_failed_logins", float64(stats.FailedAttempts), ts)
 	c.addGauge(&out, "security_failed_logins_unique_users", float64(stats.UniqueUsers), ts)
 	c.addGauge(&out, "security_failed_logins_unique_ips", float64(stats.UniqueIPs), ts)
+	out = append(out, c.bruteForceMetrics(ts)...)
 
 	// Snapshot: top-5 source IPs as a single labeled gauge. We stay within
 	// label-cardinality sanity by capping at 5 IPs and only emitting one snapshot
