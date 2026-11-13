@@ -4,6 +4,7 @@ package security
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -164,6 +165,8 @@ func (c *AuthCollector) scanJournal(ctx context.Context, matches []string, since
 	// Don't leak parent env; journalctl honors $SYSTEMD_COLORS etc.
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin"}
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &limitWriter{w: &stderr, n: 4096}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		c.logger.Debug("journalctl pipe failed", "matches", matches, "error", err)
@@ -180,7 +183,39 @@ func (c *AuthCollector) scanJournal(ctx context.Context, matches []string, since
 	if err := cmd.Wait(); err != nil {
 		c.logger.Debug("journalctl exited non-zero", "matches", matches, "error", err)
 	}
+	// A user outside adm/systemd-journal sees only its own entries, and
+	// journalctl says so on stderr. Such a journal holds no sshd lines at
+	// all, so it is not a source: reading it would report zero failures
+	// from a log the agent cannot see.
+	if journalOwnEntriesOnly(stderr.String()) {
+		c.logger.Debug("journalctl shows only the agent's own entries", "matches", matches)
+		return false
+	}
 	return true
+}
+
+func journalOwnEntriesOnly(stderr string) bool {
+	return strings.Contains(stderr, "not seeing messages from other users and the system")
+}
+
+// limitWriter keeps at most n bytes and discards the rest.
+type limitWriter struct {
+	w io.Writer
+	n int
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if l.n > 0 {
+		k := len(p)
+		if k > l.n {
+			k = l.n
+		}
+		l.n -= k
+		if _, err := l.w.Write(p[:k]); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
 }
 
 // statsFromLogFile reads the tail of a sshd-style log file and aggregates

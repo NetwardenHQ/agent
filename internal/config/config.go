@@ -146,6 +146,20 @@ type Config struct {
 	// disables it explicitly, and with it the security events.
 	SpoolDir string
 
+	// Tripwire is the ransomware tripwire: canary files that must never
+	// change (TripwireCanaries, "path" or "path@sha256:<hex>"), folders whose
+	// changes are watched for bursts and encrypted files (TripwireFolders),
+	// and where the canaries' baseline is kept (TripwireStatePath, default
+	// tripwire.json beside the config file).
+	TripwireCanaries    []string
+	TripwireFolders     []string
+	TripwireStatePath   string
+	TripwireWalkMinutes int
+
+	// SynologyStatusDir is where the DSM status task writes its files
+	// (default /var/lib/netwarden-dsm).
+	SynologyStatusDir string
+
 	// FIMScope is the FIM ruleset: "credentials" by default, "full" (adds the
 	// binary directories) when enable_fim: true. FIMExplicit records that
 	// netwarden.conf set enable_fim at all; an agent inside a Kubernetes
@@ -296,6 +310,11 @@ type CollectorToggles struct {
 	// firewall and audit logs, CARP, config changes). It only runs on a host
 	// that is an OPNsense firewall; elsewhere it stays inactive.
 	OPNsense bool
+
+	// Synology enables the Synology DSM collector (drives, RAID, volumes,
+	// UPS; Security Advisor, updates, abnormal sign-ins and containers when
+	// the optional DSM status task exists). It only runs on DSM.
+	Synology bool
 
 	// SecurityLangPackages enables discovery of host-installed language
 	// packages: pip site-packages (auto-discovered, bounded walk) plus npm
@@ -458,6 +477,7 @@ func LoadConfig(filename string) (*Config, error) {
 	config.Collectors.SecurityPorts = true
 	config.Collectors.SecurityPackages = true
 	config.Collectors.OPNsense = true
+	config.Collectors.Synology = true
 	config.Collectors.SecurityLangPackages = true
 	config.FIMRealtime = runtime.GOOS != "darwin" && runtime.GOOS != "freebsd"
 	config.Collectors.CIS = true
@@ -575,6 +595,20 @@ func LoadConfig(filename string) (*Config, error) {
 			config.Collectors.SecurityPorts = isTruthy(value)
 		case "enable_opnsense":
 			config.Collectors.OPNsense = isTruthy(value)
+		case "enable_synology":
+			config.Collectors.Synology = isTruthy(value)
+		case "tripwire_canaries":
+			config.TripwireCanaries = append(config.TripwireCanaries, splitList(value)...)
+		case "tripwire_folders":
+			config.TripwireFolders = append(config.TripwireFolders, splitList(value)...)
+		case "tripwire_state_path":
+			config.TripwireStatePath = strings.TrimSpace(value)
+		case "tripwire_walk_minutes":
+			if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n > 0 {
+				config.TripwireWalkMinutes = n
+			}
+		case "synology_status_dir":
+			config.SynologyStatusDir = value
 		case "enable_security_packages":
 			config.Collectors.SecurityPackages = isTruthy(value)
 		case "enable_security":
@@ -749,6 +783,9 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
 
+	if config.TripwireStatePath == "" {
+		config.TripwireStatePath = filepath.Join(filepath.Dir(filename), "tripwire.json")
+	}
 	return config, nil
 }
 
@@ -871,6 +908,16 @@ log_level: info                           # debug|info|warn|error
 # enable_security_auth: true          # failed-login counts (journald, auth.log)
 # enable_security_sshconfig: true     # sshd_config audit
 # enable_opnsense: true               # OPNsense firewalls only: gateways, firmware, pf, IDS, logs, CARP
+# enable_synology: true               # Synology DSM only: drives, RAID, volumes, UPS; more with the status task (docs/synology.md)
+# synology_status_dir: /var/lib/netwarden-dsm
+
+# Ransomware tripwire (docs/tripwire.md). Canary files must never change:
+# any change, deletion, rename or loss of read access is reported at once.
+# Create decoys with: netwarden -plant-canaries /path/to/folder
+# tripwire_canaries: /home/alice/Documents/Finance/Passwords.txt
+# tripwire_folders: /home/alice/Documents,/srv/share      # watched for bursts and encrypted files
+# tripwire_walk_minutes: 15
+# tripwire_state_path: /etc/netwarden/tripwire.json
 # enable_security_ports: true         # listening sockets
 # enable_security_packages: true      # installed OS packages
 # enable_security_lang_packages: true # pip and npm packages installed on the host

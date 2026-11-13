@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"time"
+
 	"log/slog"
 
 	"github.com/NetwardenHQ/agent/internal/collectors/cis"
@@ -8,6 +10,7 @@ import (
 	"github.com/NetwardenHQ/agent/internal/collectors/k8s"
 	"github.com/NetwardenHQ/agent/internal/collectors/opnsense"
 	"github.com/NetwardenHQ/agent/internal/collectors/security"
+	"github.com/NetwardenHQ/agent/internal/collectors/tripwire"
 	"github.com/NetwardenHQ/agent/internal/metrics"
 )
 
@@ -71,6 +74,18 @@ func (a *Agent) registerSecurityCollectors(collectorLogger *slog.Logger) {
 			opts = append(opts, fim.WithRoots(a.config.FIMRoots))
 		}
 		a.registerSecurityCollector("fim", fim.NewCollector(a.hostname, opts...))
+	}
+
+	// The ransomware tripwire runs only when canaries or folders are set.
+	if len(a.config.TripwireCanaries)+len(a.config.TripwireFolders) > 0 {
+		a.registerSecurityCollector("tripwire", tripwire.NewCollector(
+			a.hostname,
+			tripwire.WithLogger(collectorLogger.With("type", "tripwire")),
+			tripwire.WithCanaries(a.config.TripwireCanaries),
+			tripwire.WithFolders(a.config.TripwireFolders),
+			tripwire.WithStatePath(a.config.TripwireStatePath),
+			tripwire.WithWalkInterval(time.Duration(a.config.TripwireWalkMinutes)*time.Minute),
+		))
 	}
 
 	if a.config.Collectors.OPNsense {

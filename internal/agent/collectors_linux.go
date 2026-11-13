@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/NetwardenHQ/agent/internal/collectors/synology"
 	"github.com/NetwardenHQ/agent/internal/collectors/vm"
 )
 
@@ -24,6 +25,18 @@ func (a *Agent) registerVMCollector(collectorLogger *slog.Logger) error {
 			return fmt.Errorf("failed to register VM collector: %w", err)
 		}
 		a.logger.Info("registered VM collector")
+	}
+
+	// Synology DSM. Inactive on any other Linux host.
+	if a.config.Collectors.Synology {
+		c := synology.NewCollector(
+			a.hostname,
+			synology.WithLogger(collectorLogger.With("type", "synology")),
+			synology.WithStatusDir(a.config.SynologyStatusDir),
+		)
+		if err := a.registry.Register(c); err != nil {
+			return fmt.Errorf("failed to register Synology collector: %w", err)
+		}
 	}
 
 	return nil

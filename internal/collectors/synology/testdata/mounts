@@ -1,0 +1,4 @@
+/dev/md0 / ext4 rw,relatime 0 0
+/dev/mapper/cachedev_0 /volume1 btrfs rw,nodev,relatime,space_cache=v2 0 0
+/dev/mapper/cachedev_1 /volume2 btrfs rw,nodev,relatime 0 0
+tmpfs /dev/shm tmpfs rw 0 0

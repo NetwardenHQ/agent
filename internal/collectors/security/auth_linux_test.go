@@ -255,3 +255,33 @@ func TestCollectWithoutASpoolSaysSo(t *testing.T) {
 		t.Fatalf("metrics %v", got)
 	}
 }
+
+// An unprivileged agent that can run journalctl sees only its own journal,
+// and journalctl says so on stderr. That is not a readable auth log: on a
+// Synology NAS the package user got an empty journal and reported "0 failed
+// logins" from a log it could not see.
+func TestJournalLimitedToOwnEntriesIsNotASource(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "journalctl")
+	script := "#!/bin/sh\n" +
+		"echo 'Hint: You are currently not seeing messages from other users and the system.' >&2\n" +
+		"echo '      Users in groups '\"'\"'adm'\"'\"', '\"'\"'systemd-journal'\"'\"' can see all messages.' >&2\n" +
+		"echo '-- No entries --'\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	useSources(t, fake, filepath.Join(dir, "missing.log"))
+
+	c := NewAuthCollector("test")
+	ms, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	got := metricValues(ms)
+	if got["security_auth_log_readable"] != 0 {
+		t.Fatalf("a journal limited to the agent's own entries was reported readable: %v", got)
+	}
+	if _, ok := got["security_failed_logins"]; ok {
+		t.Fatal("a failed-login count was reported from a journal the agent cannot see")
+	}
+}

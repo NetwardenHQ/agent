@@ -27,10 +27,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/NetwardenHQ/agent/internal/agent"
+	"github.com/NetwardenHQ/agent/internal/collectors/tripwire"
 	"github.com/NetwardenHQ/agent/internal/config"
 	sharedhttp "github.com/NetwardenHQ/agent/internal/http"
 )
@@ -78,6 +80,7 @@ func main() {
 		showVersion  = flag.Bool("version", false, "Show version information and exit")
 		createConfig = flag.Bool("create-config", false, "Create example configuration file and exit")
 		serviceDebug = flag.Bool("service-debug", false, "Run in Windows service debug mode (Windows only)")
+		plantDir     = flag.String("plant-canaries", "", "Write ransomware tripwire decoy files into this folder, print their config lines and exit")
 	)
 	flag.StringVar(&configFile, "config", defaultConfigPath, "Path to configuration file")
 	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to configuration file (shortcut)")
@@ -108,6 +111,21 @@ func main() {
 		fmt.Printf("Git Commit: %s\n", gitCommit)
 		fmt.Printf("Go Version: %s\n", runtime.Version())
 		fmt.Printf("Platform:   %s/%s\n", runtime.GOOS, runtime.GOARCH)
+		os.Exit(0)
+	}
+
+	if *plantDir != "" {
+		planted, err := tripwire.PlantCanaries(*plantDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Could not plant canaries: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Planted decoy files. Add them to netwarden.conf (one line, comma-separated):")
+		lines := make([]string, len(planted))
+		for i, p := range planted {
+			lines[i] = p.Config()
+		}
+		fmt.Println("tripwire_canaries: " + strings.Join(lines, ","))
 		os.Exit(0)
 	}
 

@@ -5,6 +5,44 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Synology DSM collector (`enable_synology`, on by default, inactive elsewhere), running as the
+  unprivileged package user with nothing to set up: drive health from DSM's own per-drive verdicts
+  (SMART, unrecoverable errors, timeouts, resets, wear, bad blocks and sectors), drive temperature and
+  SSD life left, RAID arrays running degraded and the drives that means are missing, volumes DSM has
+  remounted read-only, the CPU temperature, and the UPS through DSM's UPS service (on battery, low
+  battery, not answering). Security Advisor, abnormal sign-ins, the DSM update check and Container
+  Manager are root-only on DSM; they are reported when the owner creates an optional status task in
+  DSM's Task Scheduler, whose files the agent reads only when root owns them, nobody else can write
+  them and they are recent. See `docs/synology.md`.
+
+- Ransomware tripwire (`tripwire_canaries`, `tripwire_folders`, `tripwire_walk_minutes`,
+  `tripwire_state_path`; off until configured; `docs/tripwire.md`), on every platform:
+  - Canary files are hashed about every minute against a pinned SHA-256 or a baseline kept across
+    restarts. A canary that is changed, deleted, renamed, replaced by a link or no longer readable
+    is reported at once; unreadable is reported on its own, since it usually means a permissions
+    reset rather than an attack.
+  - Watched folders are walked on an interval, metadata only. A burst of changed files more than ten
+    times the folder's usual rate, or a fifth of the folder disappearing, is reported as a spike.
+    Changed files are judged for ransomware extensions appended to the file's own, ransom notes,
+    contents that no longer match the file type, and text turned to random bytes. macOS `._` files,
+    Office lock files, `Thumbs.db` and `.DS_Store` are never judged. A walk still running after ten
+    minutes, such as one on a hung network mount, is discarded rather than reported half done.
+  - On Synology, each canary's copy in its share's newest snapshot is checked as well.
+  - `netwarden -plant-canaries DIR` writes realistic decoys (a password list, a bank export, a tax
+    return PDF, a signed contract) that differ on every run, and prints their config line.
+  - The shipped `netwarden.conf` templates (Linux, Windows, Synology) describe the new keys.
+- Synology: Snapshot Replication freshness per share (`synology_snapshot_age_seconds`, the share's
+  usual interval, `synology_snapshot_stale`), read from the snapshot folder names without privileges.
+
+### Fixed
+- Failed-login monitoring reported a readable log and zero failures when the agent's user could run
+  `journalctl` but was outside the `adm` and `systemd-journal` groups, so it saw only its own
+  entries. Such a journal no longer counts as a source: the agent falls back to the auth log files
+  and reports `security_auth_log_readable` 0 when it cannot read those either.
+
 ## [3.5.2] - 2026-11-12
 
 ### Added

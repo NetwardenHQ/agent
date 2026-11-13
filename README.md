@@ -264,6 +264,8 @@ log_level: info                               # debug, info, warn, error
 # language_package_roots: /srv/app            # extra directories to scan for node_modules
 # enable_cis: true                            # runs only when a CIS profile is set in the UI
 # enable_opnsense: true                       # OPNsense only; inactive elsewhere
+# enable_synology: true                       # Synology DSM only; see docs/synology.md
+# tripwire_canaries: /path/Passwords.xls      # ransomware tripwire; see docs/tripwire.md
 
 # ---- File integrity (off by default) ----
 # enable_fim: false

@@ -1,0 +1,4 @@
+{"data":{"containers":[
+ {"name":"blog","status":"running","State":{"Status":"running"},"up_status":"Up 7 days"},
+ {"name":"vault","status":"running","State":{"Status":"running"},"up_status":"Up 7 days (healthy)"}
+],"limit":-1,"offset":0,"total":2},"success":true}
