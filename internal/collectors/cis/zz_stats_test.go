@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Minimum per-section coverage. These are floors, not targets — they exist so
+// Minimum per-section coverage. These are floors, not targets: they exist so
 // a refactor cannot silently drop a whole benchmark domain. Raise them as
 // coverage grows; never lower one to make a failing build pass.
 var minCoverage = map[string]struct{ l1, l2 int }{
@@ -14,7 +14,7 @@ var minCoverage = map[string]struct{ l1, l2 int }{
 	"3": {10, 8},  // Network
 	"4": {2, 0},   // Firewall
 	"5": {30, 12}, // Access control
-	"6": {4, 25},  // Logging and auditing — L2-heavy by nature
+	"6": {4, 25},  // Logging and auditing. L2-heavy by nature
 	"7": {20, 2},  // System maintenance
 }
 

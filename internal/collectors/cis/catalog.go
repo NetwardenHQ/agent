@@ -1,6 +1,6 @@
 package cis
 
-// CIS Red Hat Enterprise Linux 9 Benchmark — check catalog, Levels 1 and 2.
+// CIS Red Hat Enterprise Linux 9 Benchmark: check catalog, Levels 1 and 2.
 //
 // Checks are table data, not functions. Several hundred rules stay reviewable
 // that way, and every probe target below is a compile-time constant, which is
@@ -170,11 +170,11 @@ func auditRule(id, section, title string, level int, pattern, rationale string) 
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 1 — INITIAL SETUP
+// SECTION 1. INITIAL SETUP
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 1.1.1 — Unused filesystem kernel modules.
+	// 1.1.1. Unused filesystem kernel modules.
 	register(
 		modDisabled("cis_rhel9_1_1_1_1", "1.1.1.1", "Ensure cramfs kernel module is not available", 1, "cramfs",
 			"cramfs is an obsolete compressed filesystem. Leaving it loadable widens the kernel attack surface for no operational benefit on a server."),
@@ -187,14 +187,14 @@ func init() {
 		modDisabled("cis_rhel9_1_1_1_5", "1.1.1.5", "Ensure jffs2 kernel module is not available", 1, "jffs2",
 			"Flash filesystem for embedded devices; not used on server installs."),
 		modDisabled("cis_rhel9_1_1_1_6", "1.1.1.6", "Ensure squashfs kernel module is not available", 2, "squashfs",
-			"Squashfs is used by snap packages and some container images — verify nothing on the host depends on it before disabling."),
+			"Squashfs is used by snap packages and some container images: verify nothing on the host depends on it before disabling."),
 		modDisabled("cis_rhel9_1_1_1_7", "1.1.1.7", "Ensure udf kernel module is not available", 2, "udf",
 			"Optical media filesystem. Disabling blocks a parser reachable by inserting media."),
 		modDisabled("cis_rhel9_1_1_1_8", "1.1.1.8", "Ensure usb-storage kernel module is not available", 2, "usb-storage",
-			"Blocks USB mass storage entirely. Prevents data exfiltration to removable drives, but also breaks legitimate USB media use — a common waiver on workstations."),
+			"Blocks USB mass storage entirely. Prevents data exfiltration to removable drives, but also breaks legitimate USB media use, a common waiver on workstations."),
 	)
 
-	// 1.1.2 — Mount options on separate partitions.
+	// 1.1.2. Mount options on separate partitions.
 	register(
 		mountOpt("cis_rhel9_1_1_2_1_2", "1.1.2.1.2", "Ensure nodev option set on /tmp partition", 1, "/tmp", "nodev",
 			"Device nodes under /tmp are never legitimate and can be used to reach raw devices."),
@@ -242,37 +242,37 @@ func init() {
 			"Deny execution in the audit trail location."),
 	)
 
-	// 1.2 — Package management.
+	// 1.2. Package management.
 	register(
 		fileLacks("cis_rhel9_1_2_1_2", "1.2.1.2", "Ensure gpgcheck is globally activated", 1,
 			"/etc/dnf/dnf.conf", `(?m)^\s*gpgcheck\s*=\s*0`,
-			"With gpgcheck disabled, dnf installs unsigned packages — a compromised or spoofed mirror can deliver arbitrary code as root."),
+			"With gpgcheck disabled, dnf installs unsigned packages: a compromised or spoofed mirror can deliver arbitrary code as root."),
 		fileHas("cis_rhel9_1_2_1_3", "1.2.1.3", "Ensure repo_gpgcheck is activated", 2,
 			"/etc/dnf/dnf.conf", `(?m)^\s*repo_gpgcheck\s*=\s*1`,
 			"Validates repository metadata signatures, not just package signatures. Some third-party repos do not sign metadata and will need a waiver."),
 	)
 
-	// 1.3 — Filesystem integrity.
+	// 1.3. Filesystem integrity.
 	register(
 		pkgInstalled("cis_rhel9_1_3_1", "1.3.1", "Ensure AIDE is installed", 1, "aide",
 			"Filesystem integrity checking detects unauthorised modification of system binaries and configuration."),
 	)
 
-	// 1.4 — Bootloader.
+	// 1.4. Bootloader.
 	register(
 		fileMode("cis_rhel9_1_4_2", "1.4.2", "Ensure permissions on bootloader config are configured", 1,
 			"/boot/grub2/grub.cfg", "0600",
 			"A readable grub.cfg discloses boot parameters and any encrypted password hash; a writable one allows persistent boot-time compromise."),
 	)
 
-	// 1.5 — Process hardening.
+	// 1.5. Process hardening.
 	register(
 		sysctlIs("cis_rhel9_1_5_1", "1.5.1", "Ensure ASLR is enabled", 1,
 			"kernel.randomize_va_space", "2",
 			"Address space layout randomisation is a baseline mitigation against memory-corruption exploits. Value 2 randomises stack, heap and mmap."),
 		sysctlIs("cis_rhel9_1_5_2", "1.5.2", "Ensure ptrace_scope is restricted", 1,
 			"kernel.yama.ptrace_scope", "1",
-			"Restricts ptrace to child processes, blocking a compromised process from reading memory of other processes owned by the same user — where credentials commonly sit."),
+			"Restricts ptrace to child processes, blocking a compromised process from reading memory of other processes owned by the same user, where credentials commonly sit."),
 		fileHas("cis_rhel9_1_5_3", "1.5.3", "Ensure core dump backtraces are disabled", 1,
 			"/etc/systemd/coredump.conf", `(?m)^\s*ProcessSizeMax\s*=\s*0`,
 			"Core dumps can contain secrets held in process memory and are written to disk where they are rarely protected."),
@@ -281,7 +281,7 @@ func init() {
 			"Prevents setuid programs from dumping core, which would expose privileged memory contents to an unprivileged user."),
 	)
 
-	// 1.6 — Mandatory access control.
+	// 1.6. Mandatory access control.
 	register(
 		pkgInstalled("cis_rhel9_1_6_1_1", "1.6.1.1", "Ensure SELinux is installed", 1, "libselinux",
 			"SELinux is the primary mandatory access control on RHEL and constrains a compromised service to its policy domain."),
@@ -310,7 +310,7 @@ func init() {
 			"SETroubleshoot is a desktop diagnostic tool; on a server it adds an unnecessary privileged daemon."),
 	)
 
-	// 1.7 — Warning banners.
+	// 1.7. Warning banners.
 	register(
 		fileMode("cis_rhel9_1_7_4", "1.7.4", "Ensure access to /etc/motd is configured", 1, "/etc/motd", "0644",
 			"A writable motd lets any user with access present arbitrary text to everyone who logs in."),
@@ -322,11 +322,11 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 2 — SERVICES
+// SECTION 2. SERVICES
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 2.1 — Server services that should not run on a hardened host.
+	// 2.1. Server services that should not run on a hardened host.
 	register(
 		svcDisabled("cis_rhel9_2_1_1", "2.1.1", "Ensure autofs services are not in use", 2, "autofs.service",
 			"Automounting removable media allows an attacker with physical access to introduce a filesystem automatically."),
@@ -368,7 +368,7 @@ func init() {
 			"xinetd launches legacy network services, many of which are unauthenticated."),
 	)
 
-	// 2.2 — Client packages.
+	// 2.2. Client packages.
 	register(
 		pkgAbsent("cis_rhel9_2_2_1", "2.2.1", "Ensure ftp client is not installed", 2, "ftp",
 			"Removing cleartext clients prevents their casual use and denies an attacker a convenient transfer tool."),
@@ -382,7 +382,7 @@ func init() {
 			"TFTP clients are commonly used to stage payloads onto a compromised host."),
 	)
 
-	// 2.3 — Time synchronisation.
+	// 2.3. Time synchronisation.
 	register(
 		pkgInstalled("cis_rhel9_2_3_1", "2.3.1", "Ensure time synchronization is in use", 1, "chrony",
 			"Without synchronised clocks, log correlation across hosts becomes unreliable and certificate validation can fail unpredictably."),
@@ -390,7 +390,7 @@ func init() {
 			"An installed but disabled time daemon provides no synchronisation."),
 	)
 
-	// 2.4 — Job schedulers.
+	// 2.4. Job schedulers.
 	register(
 		svcEnabled("cis_rhel9_2_4_1_1", "2.4.1.1", "Ensure cron daemon is enabled and active", 1, "crond.service",
 			"Scheduled maintenance and security tasks silently stop running when cron is disabled."),
@@ -418,11 +418,11 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 3 — NETWORK
+// SECTION 3. NETWORK
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 3.1 — Network devices.
+	// 3.1. Network devices.
 	register(
 		svcDisabled("cis_rhel9_3_1_2", "3.1.2", "Ensure wireless interfaces are disabled", 1, "wpa_supplicant.service",
 			"Wireless interfaces on a server bypass the wired network's perimeter controls entirely."),
@@ -430,7 +430,7 @@ func init() {
 			"Bluetooth provides a short-range attack surface with no server use case."),
 	)
 
-	// 3.2 — Uncommon network protocol modules.
+	// 3.2. Uncommon network protocol modules.
 	register(
 		modDisabled("cis_rhel9_3_2_1", "3.2.1", "Ensure dccp kernel module is not available", 2, "dccp",
 			"DCCP is rarely used and its kernel implementation has received little security scrutiny."),
@@ -442,11 +442,11 @@ func init() {
 			"SCTP is unused on most servers and expands the network-reachable kernel surface."),
 	)
 
-	// 3.3 — Network kernel parameters.
+	// 3.3. Network kernel parameters.
 	register(
 		sysctlIs("cis_rhel9_3_3_1", "3.3.1", "Ensure IP forwarding is disabled", 1,
 			"net.ipv4.ip_forward", "0",
-			"A host forwarding packets can be used to pivot between network segments. Routers, NAT gateways and container hosts legitimately need this — override the expected value rather than waiving, so the setting stays visible."),
+			"A host forwarding packets can be used to pivot between network segments. Routers, NAT gateways and container hosts legitimately need this: override the expected value rather than waiving, so the setting stays visible."),
 		sysctlIs("cis_rhel9_3_3_2", "3.3.2", "Ensure packet redirect sending is disabled", 1,
 			"net.ipv4.conf.all.send_redirects", "0",
 			"Sending ICMP redirects allows a host to alter other systems' routing tables."),
@@ -481,7 +481,7 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 4 — HOST BASED FIREWALL
+// SECTION 4. HOST BASED FIREWALL
 // -----------------------------------------------------------------------------
 
 func init() {
@@ -500,21 +500,21 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 5 — ACCESS CONTROL
+// SECTION 5. ACCESS CONTROL
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 5.1 — SSH server.
+	// 5.1. SSH server.
 	register(
 		fileMode("cis_rhel9_5_1_1", "5.1.1", "Ensure permissions on /etc/ssh/sshd_config are configured", 1,
 			"/etc/ssh/sshd_config", "0600",
 			"A writable sshd_config is remote root access; a readable one discloses the exact authentication surface."),
 		sshd("cis_rhel9_5_1_4", "5.1.4", "Ensure sshd access is configured", 2, "allowusers", "unset",
-			"An explicit AllowUsers/AllowGroups allowlist limits SSH to named accounts. Expected 'unset' inverts to a finding only when your profile overrides it — set the expected value to your allowlist."),
+			"An explicit AllowUsers/AllowGroups allowlist limits SSH to named accounts. Expected 'unset' inverts to a finding only when your profile overrides it: set the expected value to your allowlist."),
 		sshd("cis_rhel9_5_1_5", "5.1.5", "Ensure sshd Banner is configured", 1, "banner", "/etc/issue.net",
 			"A pre-authentication banner is required by many legal and regulatory regimes."),
 		sshd("cis_rhel9_5_1_6", "5.1.6", "Ensure sshd Ciphers are configured", 1, "ciphers", "unset",
-			"Explicitly configured strong ciphers prevent negotiation down to weak algorithms. 'unset' means the OpenSSH default set is in use, which is strong on RHEL 9 — override with your required list if you mandate one."),
+			"Explicitly configured strong ciphers prevent negotiation down to weak algorithms. 'unset' means the OpenSSH default set is in use, which is strong on RHEL 9: override with your required list if you mandate one."),
 		sshd("cis_rhel9_5_1_7", "5.1.7", "Ensure sshd ClientAliveInterval and ClientAliveCountMax are configured", 1,
 			"clientaliveinterval", "15",
 			"Bounded idle timeouts close abandoned sessions that would otherwise remain authenticated indefinitely."),
@@ -546,7 +546,7 @@ func init() {
 			"Unless Kerberos is in use, GSSAPI adds authentication surface for no benefit."),
 	)
 
-	// 5.2 — Privilege escalation.
+	// 5.2. Privilege escalation.
 	register(
 		pkgInstalled("cis_rhel9_5_2_1", "5.2.1", "Ensure sudo is installed", 1, "sudo",
 			"sudo provides the per-command authorisation and audit trail that shared root passwords cannot."),
@@ -567,7 +567,7 @@ func init() {
 			"An unbounded sudo timestamp lets a later attacker reuse a still-valid escalation without a password."),
 	)
 
-	// 5.3 — PAM.
+	// 5.3. PAM.
 	register(
 		pkgInstalled("cis_rhel9_5_3_1_1", "5.3.1.1", "Ensure latest version of pam is installed", 1, "pam",
 			"PAM mediates every authentication path on the host."),
@@ -587,7 +587,7 @@ func init() {
 			"Fourteen characters is the current CIS floor; shorter passwords fall within practical offline cracking range."),
 	)
 
-	// 5.4 — User accounts and environment.
+	// 5.4. User accounts and environment.
 	register(
 		fileHas("cis_rhel9_5_4_1_1", "5.4.1.1", "Ensure password expiration is configured", 1,
 			"/etc/login.defs", `(?m)^\s*PASS_MAX_DAYS\s+([1-9]|[1-9][0-9]|[1-2][0-9][0-9]|3[0-5][0-9]|36[0-5])\s*$`,
@@ -611,11 +611,11 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 6 — LOGGING AND AUDITING
+// SECTION 6. LOGGING AND AUDITING
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 6.1 — auditd.
+	// 6.1. auditd.
 	register(
 		pkgInstalled("cis_rhel9_6_1_1_1", "6.1.1.1", "Ensure auditd packages are installed", 2, "audit",
 			"auditd is the kernel-level audit trail; without it there is no reliable record of privileged activity."),
@@ -629,12 +629,12 @@ func init() {
 			"Automatic deletion destroys the evidence an investigation depends on."),
 		fileHas("cis_rhel9_6_1_2_3", "6.1.2.3", "Ensure system is disabled when audit logs are full", 2,
 			"/etc/audit/auditd.conf", `(?m)^\s*(disk_full_action|admin_space_left_action)\s*=\s*(halt|single)`,
-			"Halting on a full audit disk guarantees no privileged action goes unrecorded. Deliberately disruptive — many operators waive this after weighing availability against evidentiary completeness."),
+			"Halting on a full audit disk guarantees no privileged action goes unrecorded. Deliberately disruptive: many operators waive this after weighing availability against evidentiary completeness."),
 		fileMode("cis_rhel9_6_1_3_1", "6.1.3.1", "Ensure audit log files mode is configured", 2, "/var/log/audit", "0700",
 			"Audit logs frequently contain command lines and file paths that reveal sensitive operations."),
 	)
 
-	// 6.2 — Audit rules.
+	// 6.2. Audit rules.
 	register(
 		auditRule("cis_rhel9_6_2_1_1", "6.2.1.1", "Ensure changes to system administration scope are collected", 2,
 			`(?m)-w\s+/etc/sudoers`,
@@ -653,7 +653,7 @@ func init() {
 			"Login records are routinely wiped by intruders; auditing writes to them detects that."),
 	)
 
-	// 6.3 — Logging.
+	// 6.3. Logging.
 	register(
 		pkgInstalled("cis_rhel9_6_3_1_1", "6.3.1.1", "Ensure rsyslog is installed", 1, "rsyslog",
 			"Reliable local logging, and forwarding to a remote collector, both depend on it."),
@@ -669,11 +669,11 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 7 — SYSTEM MAINTENANCE
+// SECTION 7. SYSTEM MAINTENANCE
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 7.1 — System file permissions.
+	// 7.1. System file permissions.
 	register(
 		fileMode("cis_rhel9_7_1_1", "7.1.1", "Ensure permissions on /etc/passwd are configured", 1, "/etc/passwd", "0644",
 			"A writable passwd file allows account creation and UID manipulation."),
@@ -698,7 +698,7 @@ func init() {
 			"opasswd stores previous password hashes for history enforcement and must be no more readable than shadow."),
 	)
 
-	// 7.2 — Local user and group settings.
+	// 7.2. Local user and group settings.
 	register(
 		fileLacks("cis_rhel9_7_2_1", "7.2.1", "Ensure accounts in /etc/shadow are used", 1,
 			"/etc/passwd", `(?m)^[^:]+:[^x!*:][^:]*:`,

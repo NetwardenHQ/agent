@@ -50,7 +50,7 @@ func TestParseSSOutput_NetidFirstLayout(t *testing.T) {
 		t.Errorf("postgres row mis-parsed: %+v", pg)
 	}
 
-	// IPv6 wildcard + multiple users:(...) entries — first one wins.
+	// IPv6 wildcard + multiple users:(...) entries: first one wins.
 	ngx := findSocket(t, got, protoTCP, 80)
 	if ngx.BindAddr != "::" || ngx.ProcessName != "nginx" || ngx.PID != 555 {
 		t.Errorf("nginx row mis-parsed: %+v", ngx)
@@ -70,7 +70,7 @@ func TestParseSSOutput_NetidFirstLayout(t *testing.T) {
 
 // Regression test for the silent-zero bug: `ss -tlnpH` omits Netid, so every
 // row began with "LISTEN" rather than "tcp" and the parser skipped all of
-// them — a host with exposed ports reported as having none.
+// them: a host with exposed ports reported as having none.
 func TestParseSSOutput_StateFirstLayout(t *testing.T) {
 	got := parseSSOutput(ssStateFirst, protoTCP)
 
@@ -161,7 +161,7 @@ func TestParseNetstatOutput(t *testing.T) {
 		t.Errorf("sshd row mis-parsed: %+v", ssh)
 	}
 
-	// tcp6 must normalize to "tcp" — the platform contract accepts only
+	// tcp6 must normalize to "tcp": the platform contract accepts only
 	// "tcp"/"udp", and the address family is evident from the bind address.
 	ngx := findSocket(t, got, protoTCP, 80)
 	if ngx.BindAddr != "::" || ngx.ProcessName != "nginx" {

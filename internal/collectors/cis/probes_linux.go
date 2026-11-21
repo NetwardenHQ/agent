@@ -121,7 +121,7 @@ func (p *LinuxProber) sysctl(key string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// The knob does not exist — typically the subsystem is compiled
+			// The knob does not exist, typically the subsystem is compiled
 			// out (IPv6 knobs on an IPv6-less kernel). Not a violation.
 			return "", notApplicable("sysctl %s not present on this kernel", key)
 		}
@@ -565,7 +565,7 @@ func (p *LinuxProber) auditRule(ctx context.Context, pattern string) (string, er
 // "UID 0 and not root" is not expressible as a single catalog pattern.
 //
 // Account names are returned because an operator cannot act on "1 extra
-// account" — they need to know which. Names are not secrets in the way the
+// account": they need to know which. Names are not secrets in the way the
 // password hashes in the same file are.
 func (p *LinuxProber) extraUIDZero() (string, error) {
 	content, err := p.readFile("/etc/passwd")

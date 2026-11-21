@@ -129,7 +129,7 @@ func (c *SSHConfigCollector) emitMetrics(f sshConfigFindings, ts time.Time) []me
 	c.addGauge(&out, "security_ssh_x11_forwarding", boolToFloat(f.X11Forwarding), ts)
 	c.addGauge(&out, "security_ssh_empty_passwords", boolToFloat(f.PermitEmptyPass), ts)
 
-	// Posture snapshot — emits a single labeled metric carrying string
+	// Posture snapshot: emits a single labeled metric carrying string
 	// directives, mirroring how `system_info` exposes structured attributes.
 	labels := map[string]string{
 		"port":        f.Port,

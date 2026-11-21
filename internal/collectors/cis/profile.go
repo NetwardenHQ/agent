@@ -32,7 +32,7 @@ type Profile struct {
 	EnabledChecks []string `json:"enabled_checks"`
 
 	// Overrides adjusts the expected value for specific checks. Keyed by
-	// check id. Only the expected value can be overridden — never the probe.
+	// check id. Only the expected value can be overridden, never the probe.
 	Overrides map[string]Override `json:"overrides"`
 
 	// Waivers lists check ids the operator has accepted the risk on. Waived
@@ -45,7 +45,7 @@ type Profile struct {
 // Override adjusts a single check's pass condition.
 type Override struct {
 	// Expected replaces the catalog's expected value. The operator is
-	// deliberately allowed to do this — plenty of CIS defaults are wrong for
+	// deliberately allowed to do this: plenty of CIS defaults are wrong for
 	// a given estate (a router legitimately sets net.ipv4.ip_forward=1).
 	Expected string `json:"expected"`
 }
@@ -89,7 +89,7 @@ func (p *Profile) Resolve() Plan {
 	for _, l := range p.Levels {
 		levels[l] = true
 	}
-	// No levels named means no level filter rather than "no checks" — a
+	// No levels named means no level filter rather than "no checks": a
 	// profile that enabled checks explicitly but forgot Levels should still
 	// run them.
 	levelAllowed := func(l int) bool {

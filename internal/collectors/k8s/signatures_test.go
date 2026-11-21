@@ -7,8 +7,8 @@ import (
 
 // The cluster's own ingress host names, as the inventory reports them.
 var clusterHosts = []string{
-	"moriah.app", "www.moriah.app", "admin.moriah.app", "epistles.net", "api.epistles.net",
-	"app.netwarden.com", "api.netwarden.com", "ingest.netwarden.com", "churchfoundry.com",
+	"shop.example", "www.shop.example", "admin.shop.example", "mail.example", "api.mail.example",
+	"app.netwarden.com", "api.netwarden.com", "ingest.netwarden.com", "portal.example",
 }
 
 func TestClassifyTenTwentyThree(t *testing.T) {
@@ -18,7 +18,7 @@ func TestClassifyTenTwentyThree(t *testing.T) {
 		{ClassSecretFile, ClassCrawlerClaim},   // /.ssh/authorized_keys
 		{ClassSecretFile, ClassCrawlerClaim},   // /.docker/config.json
 		{ClassSecretFile, ClassCrawlerClaim},   // /values.yaml
-		{ClassCrawlerClaim, ClassTargetedPath}, // /z9x8c7v6b5-debug-trigger-admin.moriah.app
+		{ClassCrawlerClaim, ClassTargetedPath}, // /z9x8c7v6b5-debug-trigger-admin.shop.example
 		{ClassServerAction, ClassCrawlerClaim}, // POST / with Next-Action and text/x-component
 		{ClassGraphQLProbe, ClassCrawlerClaim}, // POST /graphql answered 404
 	}
@@ -39,14 +39,14 @@ func TestClassifyTenTwentyThree(t *testing.T) {
 
 func TestClassifyNormalTraffic(t *testing.T) {
 	// Two minutes of this cluster's real traffic, addresses and ids
-	// anonymized. moriah.app serves server actions; nothing else here does.
+	// anonymized. shop.example serves server actions; nothing else here does.
 	claims := 0
 	for i, raw := range readLines(t, "normal.log") {
 		l, ok := ParseAccessLine(raw)
 		if !ok {
 			t.Fatalf("line %d not parsed", i+1)
 		}
-		for _, c := range Classify(l, clusterHosts, l.Host == "moriah.app") {
+		for _, c := range Classify(l, clusterHosts, l.Host == "shop.example") {
 			if c != ClassCrawlerClaim {
 				t.Errorf("line %d (%s %s %s %d) classed %s", i+1, l.Host, l.Method, l.Path, l.Status, c)
 				continue
@@ -101,7 +101,7 @@ func TestClassifySignatures(t *testing.T) {
 		{"POST", "/api/graphql", 404, []Class{ClassGraphQLProbe}},
 		{"POST", "/graphql", 200, nil},
 		{"GET", "/graphql", 404, nil},
-		{"GET", "/z9x8-debug.moriah.app", 404, []Class{ClassTargetedPath}},
+		{"GET", "/z9x8-debug.shop.example", 404, []Class{ClassTargetedPath}},
 		// Routes that only look like secrets.
 		{"GET", "/settings/credentials", 200, nil},
 		{"GET", "/api/accounts/x/access-token", 200, nil},

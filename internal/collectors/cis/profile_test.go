@@ -81,7 +81,7 @@ func TestProfileCannotAlterProbeTargets(t *testing.T) {
 }
 
 // A profile naming a check this build does not carry must be reported, not
-// silently ignored — otherwise an operator sees a check enabled in the UI that
+// silently ignored: otherwise an operator sees a check enabled in the UI that
 // never produces a result and has no way to find out why.
 func TestProfileReportsUnknownChecks(t *testing.T) {
 	profile := &Profile{

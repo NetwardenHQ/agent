@@ -56,10 +56,14 @@ var errBackingOff = errors.New("backing off after consecutive transmission failu
 // contract; omitempty on the optional ones matters because the server
 // distinguishes an absent field from an empty one.
 type payload struct {
-	Version   string             `json:"version"`
-	OS        string             `json:"os"`
-	Arch      string             `json:"arch"`
-	Hostname  string             `json:"hostname"`
+	Version  string `json:"version"`
+	OS       string `json:"os"`
+	Arch     string `json:"arch"`
+	Hostname string `json:"hostname"`
+	// AgentUID identifies this installation whatever the hostname says, so
+	// a renamed host stays the same host on the server. Omitted when the
+	// agent has no stored id (internal/agentid).
+	AgentUID  string             `json:"agent_uid,omitempty"`
 	TenantID  string             `json:"tenant_id"`
 	Metrics   []payloadMetric    `json:"metrics"`
 	OSInfo    map[string]string  `json:"os_info,omitempty"`
@@ -130,6 +134,7 @@ type HTTPTransmitter struct {
 	httpClient *http.Client
 	version    string
 	hostname   string
+	agentUID   string
 
 	// lastLatencyMs is the round-trip time of the last successful request,
 	// reported in the next payload. -1 until the first measurement, which
@@ -467,6 +472,11 @@ func (t *HTTPTransmitter) SetSelfUpdateState(fn func() string) {
 	t.selfUpdateState = fn
 }
 
+// SetAgentUID sets the installation id sent in each payload. Call before Send.
+func (t *HTTPTransmitter) SetAgentUID(id string) {
+	t.agentUID = id
+}
+
 // createPayload builds the request body for one batch.
 func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots []metrics.Snapshot) payload {
 	p := payload{
@@ -474,6 +484,7 @@ func (t *HTTPTransmitter) createPayload(metricList []metrics.Metric, snapshots [
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,
 		Hostname: t.hostname,
+		AgentUID: t.agentUID,
 		TenantID: t.config.TenantID,
 		Metrics:  make([]payloadMetric, len(metricList)),
 	}

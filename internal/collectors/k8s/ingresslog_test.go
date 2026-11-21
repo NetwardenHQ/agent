@@ -454,13 +454,13 @@ func TestOnlyOwnHostsAreSites(t *testing.T) {
 		return strings.Replace(probeLine(now, "203.0.113.60", path, id), `"host":"shop.example"`, `"host":"`+host+`"`, 1)
 	}
 	logs.handler["c1"] = stream(
-		line("moriah.app", "/.env", "h1"),
-		line("143.198.11.97", "/.git/config", "h2"),
+		line("shop.example", "/.env", "h1"),
+		line("198.51.100.97", "/.git/config", "h2"),
 		line("victim.example", "/.env.local", "h3"),
 		line("shop.wild.example", "/.aws/credentials", "h4"),
 	)
 	tr := newEdgeTracker(maxTrackedAddresses)
-	f := newLogFollowers(client, "ingress-nginx", tr, func() []string { return []string{"moriah.app", "*.wild.example"} }, quietLogger())
+	f := newLogFollowers(client, "ingress-nginx", tr, func() []string { return []string{"shop.example", "*.wild.example"} }, quietLogger())
 	defer f.Stop()
 	f.Reconcile([]Pod{controllerPod("c1", now.Add(-time.Hour))})
 
@@ -477,16 +477,16 @@ func TestOnlyOwnHostsAreSites(t *testing.T) {
 	if probe == nil {
 		t.Fatal("no probe")
 	}
-	if probe["hosts"] != "moriah.app,shop.wild.example" || probe["hosts_count"] != "2" || probe["requests"] != "4" {
+	if probe["hosts"] != "shop.example,shop.wild.example" || probe["hosts_count"] != "2" || probe["requests"] != "4" {
 		t.Errorf("hosts %q count %q requests %q", probe["hosts"], probe["hosts_count"], probe["requests"])
 	}
 }
 
 func TestOwnHost(t *testing.T) {
-	hosts := []string{"moriah.app", "*.wild.example"}
+	hosts := []string{"shop.example", "*.wild.example"}
 	for host, want := range map[string]bool{
-		"moriah.app": true, "MORIAH.APP": true, "moriah.app:443": true, "a.wild.example": true,
-		"wild.example": false, "a.b.wild.example": false, "evil-moriah.app": false, "143.198.11.97": false, "": false,
+		"shop.example": true, "SHOP.EXAMPLE": true, "shop.example:443": true, "a.wild.example": true,
+		"wild.example": false, "a.b.wild.example": false, "evil-shop.example": false, "198.51.100.97": false, "": false,
 	} {
 		if got := ownHost(host, hosts); got != want {
 			t.Errorf("ownHost(%q) = %v, want %v", host, got, want)

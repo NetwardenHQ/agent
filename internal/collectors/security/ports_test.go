@@ -44,7 +44,7 @@ func TestClassifySockets_DeduplicatesManagementPorts(t *testing.T) {
 	})
 
 	if management != 1 {
-		t.Errorf("management = %d, want 1 — dual-stack bind is a single exposure", management)
+		t.Errorf("management = %d, want 1: dual-stack bind is a single exposure", management)
 	}
 	if len(parts) != 1 {
 		t.Errorf("parts = %v, want one entry", parts)

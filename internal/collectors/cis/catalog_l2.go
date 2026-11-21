@@ -3,7 +3,7 @@ package cis
 // CIS RHEL 9 catalog, part two: the Level 2 rules and the remaining Level 1
 // gaps from catalog.go.
 //
-// Split by file only to keep each one readable — registration order does not
+// Split by file only to keep each one readable: registration order does not
 // matter, the registry sorts by section. Same editing rules as catalog.go
 // apply: never reuse a shipped ID, and every probe target stays a constant.
 
@@ -30,11 +30,11 @@ func sysctlPersisted(id, section, title string, level int, key, value, rationale
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 1 — SEPARATE PARTITIONS AND REMAINING SETUP
+// SECTION 1. SEPARATE PARTITIONS AND REMAINING SETUP
 // -----------------------------------------------------------------------------
 
 func init() {
-	// 1.1.2 — Separate partitions. These are the prerequisite for the mount
+	// 1.1.2. Separate partitions. These are the prerequisite for the mount
 	// option rules in catalog.go: nodev/nosuid/noexec on /tmp cannot be
 	// enforced at all if /tmp is just a directory on /.
 	register(
@@ -45,22 +45,22 @@ func init() {
 		separatePartition("cis_rhel9_1_1_2_3_1", "1.1.2.3.1", "Ensure separate partition exists for /home", 2, "/home",
 			"Isolates user data from the root filesystem so a user cannot fill it, and allows nodev/nosuid to be applied."),
 		separatePartition("cis_rhel9_1_1_2_4_1", "1.1.2.4.1", "Ensure separate partition exists for /var", 2, "/var",
-			"Variable data growth — logs, spools, caches — must not be able to fill the root filesystem and halt the system."),
+			"Variable data growth (logs, spools, caches) must not be able to fill the root filesystem and halt the system."),
 		separatePartition("cis_rhel9_1_1_2_5_1", "1.1.2.5.1", "Ensure separate partition exists for /var/tmp", 2, "/var/tmp",
 			"As /tmp: a world-writable location needs its own partition for its mount options to mean anything."),
 		separatePartition("cis_rhel9_1_1_2_6_1", "1.1.2.6.1", "Ensure separate partition exists for /var/log", 2, "/var/log",
-			"Prevents a log flood — accidental or deliberate — from filling the root filesystem and taking the host down."),
+			"Prevents a log flood (accidental or deliberate) from filling the root filesystem and taking the host down."),
 		separatePartition("cis_rhel9_1_1_2_7_1", "1.1.2.7.1", "Ensure separate partition exists for /var/log/audit", 2, "/var/log/audit",
 			"Isolating the audit trail means ordinary log growth cannot displace it, and audit's own full-disk policy governs only its own volume."),
 	)
 
-	// 1.2 — Package management.
+	// 1.2. Package management.
 	register(
 		pkgInstalled("cis_rhel9_1_2_2_1", "1.2.2.1", "Ensure updates and patches are installed", 1, "dnf-automatic",
 			"Unattended security updates close the window between a fix being published and being applied, which is where most opportunistic compromise happens. Estates using a managed patch cycle should waive this."),
 	)
 
-	// 1.3 — Filesystem integrity continued.
+	// 1.3. Filesystem integrity continued.
 	register(
 		svcEnabled("cis_rhel9_1_3_2", "1.3.2", "Ensure filesystem integrity is regularly checked", 1, "aide-check.timer",
 			"AIDE installed but never run detects nothing. The timer is what turns it into an actual control."),
@@ -69,14 +69,14 @@ func init() {
 			"AIDE's own configuration defines what is monitored; a writable config lets an intruder exclude the files they intend to modify."),
 	)
 
-	// 1.4 — Bootloader continued.
+	// 1.4. Bootloader continued.
 	register(
 		fileHas("cis_rhel9_1_4_1", "1.4.1", "Ensure bootloader password is set", 1,
 			"/boot/grub2/user.cfg", `GRUB2_PASSWORD`,
 			"Without a bootloader password, anyone with console access can edit kernel arguments to boot single-user and obtain root without credentials."),
 	)
 
-	// 1.6 — Crypto policy.
+	// 1.6. Crypto policy.
 	register(
 		Check{
 			ID: "cis_rhel9_1_6_2", Section: "1.6.2",
@@ -96,7 +96,7 @@ func init() {
 		},
 	)
 
-	// 1.7 — Banner content.
+	// 1.7. Banner content.
 	register(
 		fileLacks("cis_rhel9_1_7_1", "1.7.1", "Ensure message of the day is configured properly", 1,
 			"/etc/motd", `(?i)(\\\\v|\\\\r|\\\\m|\\\\s)`,
@@ -109,7 +109,7 @@ func init() {
 			"The network banner is visible to unauthenticated remote users, so version disclosure here has the widest reach."),
 	)
 
-	// 1.8 — GDM. Most servers have no GUI; these report not-applicable there.
+	// 1.8. GDM. Most servers have no GUI; these report not-applicable there.
 	register(
 		pkgAbsent("cis_rhel9_1_8_1", "1.8.1", "Ensure GNOME Display Manager is removed", 2, "gdm",
 			"A display manager on a server adds a large graphical stack and a local login surface with no operational purpose."),
@@ -117,7 +117,7 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 3 — PERSISTED NETWORK PARAMETERS
+// SECTION 3. PERSISTED NETWORK PARAMETERS
 // -----------------------------------------------------------------------------
 
 func init() {
@@ -142,7 +142,7 @@ func init() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 6.2 — AUDIT RULES
+// SECTION 6.2. AUDIT RULES
 // -----------------------------------------------------------------------------
 
 func init() {
@@ -194,17 +194,17 @@ func init() {
 			"Records execution of setuid and setgid binaries, the standard local privilege-escalation surface."),
 		auditRule("cis_rhel9_6_2_3_1", "6.2.3.1", "Ensure the audit configuration is immutable", 2,
 			`(?m)^\s*-e\s+2`,
-			"Mode 2 locks the rule set until reboot, so an intruder who gains root cannot silently disable auditing of their own subsequent actions. Rule changes then require a reboot — a real operational cost, and a common waiver."),
+			"Mode 2 locks the rule set until reboot, so an intruder who gains root cannot silently disable auditing of their own subsequent actions. Rule changes then require a reboot: a real operational cost, and a common waiver."),
 	)
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 5 AND 6 — REMAINING ACCESS CONTROL AND LOGGING
+// SECTION 5 AND 6. REMAINING ACCESS CONTROL AND LOGGING
 // -----------------------------------------------------------------------------
 
 func init() {
 	register(
-		// 5.1 — remaining sshd hardening.
+		// 5.1. remaining sshd hardening.
 		sshd("cis_rhel9_5_1_9", "5.1.9", "Ensure sshd GSSAPIAuthentication is disabled", 2, "kerberosauthentication", "no",
 			"Kerberos authentication in sshd is unused on most estates and adds a parsing surface reachable before authentication completes."),
 		sshd("cis_rhel9_5_1_10", "5.1.10", "Ensure sshd HostbasedAuthentication and rhosts are fully disabled", 2, "ignoreuserknownhosts", "yes",
@@ -220,7 +220,7 @@ func init() {
 		sshd("cis_rhel9_5_1_27", "5.1.27", "Ensure sshd ClientAliveCountMax is configured", 1, "clientalivecountmax", "3",
 			"With ClientAliveInterval, this bounds how long an unresponsive authenticated session stays open."),
 
-		// 5.3 — PAM continued.
+		// 5.3. PAM continued.
 		fileHas("cis_rhel9_5_3_2_4", "5.3.2.4", "Ensure pam_pwhistory module is enabled", 1,
 			"/etc/pam.d/system-auth", `pam_pwhistory\.so`,
 			"Without password history, a forced rotation is satisfied by re-using the previous password, which defeats the rotation entirely."),
@@ -237,7 +237,7 @@ func init() {
 			"/etc/security/pwquality.conf", `(?m)^\s*enforce_for_root`,
 			"By default pwquality warns but does not enforce for root, so the most privileged account is the least constrained."),
 
-		// 5.4 — accounts continued.
+		// 5.4. accounts continued.
 		fileHas("cis_rhel9_5_4_1_4", "5.4.1.4", "Ensure inactive password lock is configured", 1,
 			"/etc/default/useradd", `(?m)^\s*INACTIVE\s*=\s*(([0-9])|([1-3][0-9])|4[0-5])\s*$`,
 			"Locking accounts shortly after a password expires closes dormant accounts, which are the ones nobody notices being used."),
@@ -248,7 +248,7 @@ func init() {
 			"/etc/shells", `(?m)^(?:/usr)?/s?bin/(bash|sh|dash|zsh)`,
 			"/etc/shells should list real interactive shells; listing nologin there causes accounts intended to be non-interactive to be treated as interactive."),
 
-		// 6.3 — journald.
+		// 6.3. journald.
 		fileHas("cis_rhel9_6_3_2_1", "6.3.2.1", "Ensure journald ForwardToSyslog is configured", 2,
 			"/etc/systemd/journald.conf", `(?m)^\s*ForwardToSyslog\s*=`,
 			"Explicitly deciding whether journald forwards to rsyslog avoids either duplicate storage or a silent gap between the two log paths."),
@@ -257,12 +257,12 @@ func init() {
 			"Compression extends how far back the journal reaches on the same disk, which directly increases usable forensic history."),
 		fileHas("cis_rhel9_6_3_2_3", "6.3.2.3", "Ensure journald Storage is configured", 2,
 			"/etc/systemd/journald.conf", `(?m)^\s*Storage\s*=\s*persistent`,
-			"Volatile journal storage is lost on reboot — including the reboot an attacker triggers to clear their tracks."),
+			"Volatile journal storage is lost on reboot, including the reboot an attacker triggers to clear their tracks."),
 	)
 }
 
 // -----------------------------------------------------------------------------
-// SECTION 7 — REMAINING FILE AND ACCOUNT CHECKS
+// SECTION 7. REMAINING FILE AND ACCOUNT CHECKS
 // -----------------------------------------------------------------------------
 
 func init() {

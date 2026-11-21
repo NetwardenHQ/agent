@@ -29,7 +29,7 @@ func readLines(t testing.TB, name string) [][]byte {
 func TestParseJSONLine(t *testing.T) {
 	// Written by ingress-nginx with the JSON log format from iac (nginx -t and
 	// a real request against it), user agent with quotes and a backslash.
-	line := []byte(`{"time":"2026-10-24T00:28:59+00:00","ip":"203.0.113.10","method":"POST","host":"moriah.app","path":"/","protocol":"HTTP/1.1","status":"404","bytes":"22","request_bytes":"160","duration":"0.000","user_agent":"CCBot/2.0 \"quoted\" \\ back","content_type":"text/x-component","response_type":"text/html","next_action":"x","rsc":"1","namespace":"epistles","ingress":"api","service":"backend","upstream":"epistles-backend-3000","upstream_addr":"10.0.0.10:3000","upstream_status":"404","upstream_time":"0.000","request_id":"5bbc0f5ee601496720cea6759fd876cd"}`)
+	line := []byte(`{"time":"2026-10-24T00:28:59+00:00","ip":"203.0.113.10","method":"POST","host":"shop.example","path":"/","protocol":"HTTP/1.1","status":"404","bytes":"22","request_bytes":"160","duration":"0.000","user_agent":"CCBot/2.0 \"quoted\" \\ back","content_type":"text/x-component","response_type":"text/html","next_action":"x","rsc":"1","namespace":"mail","ingress":"api","service":"backend","upstream":"mail-backend-3000","upstream_addr":"10.0.0.10:3000","upstream_status":"404","upstream_time":"0.000","request_id":"5bbc0f5ee601496720cea6759fd876cd"}`)
 	l, ok := ParseAccessLine(line)
 	if !ok {
 		t.Fatal("not parsed")
@@ -38,7 +38,7 @@ func TestParseJSONLine(t *testing.T) {
 		Time:         time.Date(2026, 10, 24, 0, 28, 59, 0, time.UTC),
 		IP:           "203.0.113.10",
 		Method:       "POST",
-		Host:         "moriah.app",
+		Host:         "shop.example",
 		Path:         "/",
 		Protocol:     "HTTP/1.1",
 		Status:       404,
@@ -48,9 +48,9 @@ func TestParseJSONLine(t *testing.T) {
 		ResponseType: "text/html",
 		NextAction:   "x",
 		RSC:          "1",
-		Namespace:    "epistles",
+		Namespace:    "mail",
 		Ingress:      "api",
-		Upstream:     "epistles-backend-3000",
+		Upstream:     "mail-backend-3000",
 		RequestID:    "5bbc0f5ee601496720cea6759fd876cd",
 		Full:         true,
 	}
@@ -82,7 +82,7 @@ func TestParseDefaultLine(t *testing.T) {
 	if l.Path != "/verify" || l.Method != "GET" || l.Protocol != "HTTP/2.0" || l.Status != 404 || l.Bytes != 548 {
 		t.Errorf("got %+v", l)
 	}
-	if l.IP != "203.0.113.7" || l.Upstream != "moriah-moriah-web-3000" || l.RequestID != "6f0c2b1e9d8a7c6b5a4f3e2d1c0b9a88" {
+	if l.IP != "203.0.113.7" || l.Upstream != "shop-shop-web-3000" || l.RequestID != "6f0c2b1e9d8a7c6b5a4f3e2d1c0b9a88" {
 		t.Errorf("got %+v", l)
 	}
 	if l.UserAgent != "CCBot/2.0 (https://commoncrawl.org/faq/)" {
@@ -111,7 +111,7 @@ func fields(l AccessLine) []string {
 }
 
 func TestParseTimestampPrefix(t *testing.T) {
-	line := []byte(`2026-10-24T00:17:08.123456789Z {"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","host":"moriah.app","path":"/.env","protocol":"HTTP/1.1","status":"404","bytes":"22","user_agent":"curl/8.17.0","content_type":"","response_type":"text/html","next_action":"","rsc":"","request_id":"de2d09cc63ad8808cfa1f723bcd6cb25"}`)
+	line := []byte(`2026-10-24T00:17:08.123456789Z {"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","host":"shop.example","path":"/.env","protocol":"HTTP/1.1","status":"404","bytes":"22","user_agent":"curl/8.17.0","content_type":"","response_type":"text/html","next_action":"","rsc":"","request_id":"de2d09cc63ad8808cfa1f723bcd6cb25"}`)
 	l, ok := ParseAccessLine(line)
 	if !ok {
 		t.Fatal("not parsed")
@@ -126,7 +126,7 @@ func TestParseTimestampPrefix(t *testing.T) {
 
 func TestParseQueryStringNeverSurvives(t *testing.T) {
 	// $uri carries no query string, but a format using $request_uri would.
-	line := []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","host":"moriah.app","path":"/reset?token=SECRET#frag","protocol":"HTTP/1.1","status":"200","bytes":"22","user_agent":"x","content_type":"","response_type":"text/html","next_action":"","rsc":"","request_id":"de2d09cc63ad8808cfa1f723bcd6cb25"}`)
+	line := []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","host":"shop.example","path":"/reset?token=SECRET#frag","protocol":"HTTP/1.1","status":"200","bytes":"22","user_agent":"x","content_type":"","response_type":"text/html","next_action":"","rsc":"","request_id":"de2d09cc63ad8808cfa1f723bcd6cb25"}`)
 	l, ok := ParseAccessLine(line)
 	if !ok || l.Path != "/reset" {
 		t.Fatalf("ok=%v path=%q", ok, l.Path)
@@ -145,7 +145,7 @@ func TestParseRejectsGarbage(t *testing.T) {
 		"status words":    []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","path":"/","status":"ok","bytes":"1"}`),
 		"bytes words":     []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","path":"/","status":"200","bytes":"lots"}`),
 		"no address":      []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"","method":"GET","path":"/","status":"200","bytes":"1"}`),
-		"not an address":  []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"moriah.app","method":"GET","path":"/","status":"200","bytes":"1"}`),
+		"not an address":  []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"shop.example","method":"GET","path":"/","status":"200","bytes":"1"}`),
 		"relative path":   []byte(`{"time":"2026-10-24T00:17:07+00:00","ip":"203.0.113.10","method":"GET","path":"etc/passwd","status":"200","bytes":"1"}`),
 		"array":           []byte(`[1,2,3]`),
 		"nginx error log": []byte(`2026/10/24 12:57:01 [warn] 165#165: *8483384 a client request body is buffered to a temporary file`),
@@ -157,7 +157,7 @@ func TestParseRejectsGarbage(t *testing.T) {
 }
 
 func TestParseInvalidUTF8(t *testing.T) {
-	line := []byte("{\"time\":\"2026-10-24T00:17:07+00:00\",\"ip\":\"203.0.113.10\",\"method\":\"GET\",\"host\":\"moriah.app\",\"path\":\"/\xff\xfe.env\",\"protocol\":\"HTTP/1.1\",\"status\":\"404\",\"bytes\":\"1\",\"user_agent\":\"\xc3\x28\",\"content_type\":\"\",\"response_type\":\"\",\"next_action\":\"\",\"rsc\":\"\",\"request_id\":\"r\"}")
+	line := []byte("{\"time\":\"2026-10-24T00:17:07+00:00\",\"ip\":\"203.0.113.10\",\"method\":\"GET\",\"host\":\"shop.example\",\"path\":\"/\xff\xfe.env\",\"protocol\":\"HTTP/1.1\",\"status\":\"404\",\"bytes\":\"1\",\"user_agent\":\"\xc3\x28\",\"content_type\":\"\",\"response_type\":\"\",\"next_action\":\"\",\"rsc\":\"\",\"request_id\":\"r\"}")
 	l, ok := ParseAccessLine(line)
 	if !ok {
 		t.Fatal("not parsed")

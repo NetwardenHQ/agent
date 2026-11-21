@@ -78,7 +78,7 @@ func TestOnlyFlaggedAddressesLeave(t *testing.T) {
 func TestProbeEventLabels(t *testing.T) {
 	tr := newTestTracker()
 	tr.windowStart = edgeT0
-	l := access("203.0.113.9", "moriah.app", "GET", "/.env", 404, 512)
+	l := access("203.0.113.9", "shop.example", "GET", "/.env", 404, 512)
 	l.UserAgent = "CCBot/2.0 (https://commoncrawl.org/faq/)"
 	observe(tr, l)
 	for i := 0; i < 30; i++ {
@@ -86,7 +86,7 @@ func TestProbeEventLabels(t *testing.T) {
 		l.UserAgent = "Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)"
 		observe(tr, l)
 	}
-	observe(tr, access("203.0.113.9", "moriah.app", "GET", "/.env", 200, 5120))
+	observe(tr, access("203.0.113.9", "shop.example", "GET", "/.env", 200, 5120))
 	probes, _, _ := tr.Flush(edgeT0.Add(10 * time.Minute))
 	if len(probes) != 1 {
 		t.Fatalf("%d probes", len(probes))
@@ -114,7 +114,7 @@ func TestProbeEventLabels(t *testing.T) {
 	if !strings.HasPrefix(e.Labels["paths"], "/.env,/backup-00-") || strings.Count(e.Labels["paths"], ",") >= 30 {
 		t.Errorf("paths %q", e.Labels["paths"])
 	}
-	if !strings.HasPrefix(e.Labels["hosts"], "moriah.app,") {
+	if !strings.HasPrefix(e.Labels["hosts"], "shop.example,") {
 		t.Errorf("hosts %q", e.Labels["hosts"])
 	}
 	if e.DedupeKey != "probe:203.0.113.9:"+strconv.FormatInt(edgeT0.Unix(), 10) {

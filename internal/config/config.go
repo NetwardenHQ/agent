@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NetwardenHQ/agent/internal/agentid"
 	"github.com/NetwardenHQ/agent/internal/dsm"
 )
 
@@ -147,6 +148,14 @@ type Config struct {
 	// Windows, disabled elsewhere unless spool_dir is set. spool_dir: off
 	// disables it explicitly, and with it the security events.
 	SpoolDir string
+
+	// AgentIDFile holds the id of this installation, which lets the server
+	// keep one host through a rename (internal/agentid). Default: agent-id
+	// in the state directory (/var/lib/netwarden, /var/db/netwarden on
+	// FreeBSD, %ProgramData%\Netwarden on Windows, the package's data folder
+	// on Synology). Empty in a Kubernetes pod, where nothing outlives the
+	// pod, unless agent_id_file names a path on a persistent volume.
+	AgentIDFile string
 
 	// Tripwire is the ransomware tripwire: canary files that must never
 	// change (TripwireCanaries, "path" or "path@sha256:<hex>"), folders whose
@@ -574,6 +583,8 @@ func LoadConfig(filename string) (*Config, error) {
 			}
 		case "enable_fim_realtime":
 			config.FIMRealtime = isTruthy(value)
+		case "agent_id_file":
+			config.AgentIDFile = strings.TrimSpace(value)
 		case "spool_dir":
 			v := strings.TrimSpace(value)
 			if strings.EqualFold(v, "off") || strings.EqualFold(v, "none") || strings.EqualFold(v, "disabled") {
@@ -790,6 +801,15 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.TripwireStatePath == "" {
 		config.TripwireStatePath = filepath.Join(filepath.Dir(filename), "tripwire.json")
 	}
+	if config.AgentIDFile == "" {
+		config.AgentIDFile = agentid.Path(agentid.Env{
+			GOOS:        runtime.GOOS,
+			ProgramData: os.Getenv("ProgramData"),
+			ConfigFile:  filename,
+			DSM:         dsm.Is(),
+			Kubernetes:  os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		})
+	}
 	// DSM runs the agent as the package user, which cannot create
 	// /var/lib/netwarden. Its state goes in the package's data folder, where
 	// the config file is (the spool, and state.json beside it, and the FIM
@@ -949,6 +969,15 @@ log_level: info                           # debug|info|warn|error
 # enable_fim_realtime: true           # real-time layer over the hourly walk (default off on macOS and FreeBSD)
 # fim_manifest_path: /var/lib/netwarden/fim-manifest   # FreeBSD: /var/db/netwarden/fim-manifest
 # fim_roots: /etc/myapp,/opt/myapp/bin                 # paths added to the default ruleset
+
+# File holding the id of this installation. The agent generates the id on its
+# first start and sends it with every report, so the server keeps one host
+# when the machine is renamed or the agent is reinstalled. Default: agent-id
+# in /var/lib/netwarden (/var/db/netwarden on FreeBSD,
+# %ProgramData%\Netwarden on Windows, beside this file on Synology). In a
+# Kubernetes pod there is no default, because nothing there outlives the pod;
+# set it to a path on a persistent volume to have one.
+# agent_id_file: /var/lib/netwarden/agent-id
 
 # Spool directory for events and exposure files written by local producers,
 # such as an OPNsense UI plugin (format: docs/spool.md), and for the agent's

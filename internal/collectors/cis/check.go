@@ -4,7 +4,7 @@
 // # Trust model
 //
 // The catalog of checks is COMPILED INTO THE AGENT. The server selects which
-// checks run, by id, and may override the expected value — it never supplies a
+// checks run, by id, and may override the expected value; it never supplies a
 // file path, sysctl key, command, or regex. That asymmetry is the whole
 // security design: a compromised control plane can turn checks on and off and
 // make them report wrongly, but it cannot make an agent read an arbitrary file
@@ -42,13 +42,13 @@ const (
 	// StatusFail means the host was inspected successfully and does not match.
 	StatusFail Status = "fail"
 
-	// StatusError means the check could not be evaluated — a file the probe
+	// StatusError means the check could not be evaluated: a file the probe
 	// needs is unreadable, a required tool is missing. Deliberately distinct
 	// from fail: "we could not tell" must never render as "you are compliant",
 	// and must not render as a violation either.
 	StatusError Status = "error"
 
-	// StatusNotApplicable means the check does not apply to this host — an
+	// StatusNotApplicable means the check does not apply to this host: an
 	// rpm check on a Debian box, a firewalld check where firewalld isn't the
 	// active backend.
 	StatusNotApplicable Status = "not_applicable"
@@ -64,26 +64,26 @@ const (
 type Op string
 
 const (
-	// OpEquals — observed == expected, case-insensitive, whitespace-trimmed.
+	// OpEquals: observed == expected, case-insensitive, whitespace-trimmed.
 	OpEquals Op = "eq"
 
-	// OpNotEquals — observed != expected.
+	// OpNotEquals: observed != expected.
 	OpNotEquals Op = "ne"
 
-	// OpContains — observed contains expected as a substring.
+	// OpContains: observed contains expected as a substring.
 	OpContains Op = "contains"
 
-	// OpNotContains — observed does not contain expected.
+	// OpNotContains: observed does not contain expected.
 	OpNotContains Op = "not_contains"
 
-	// OpModeAtMost — observed file mode grants no more than expected.
+	// OpModeAtMost: observed file mode grants no more than expected.
 	// "0644" passes when the file is 0644, 0640, or 0600, and fails at 0666.
 	// A plain equality test here would produce false failures on hosts that
 	// are stricter than the benchmark requires, which trains operators to
 	// ignore the list.
 	OpModeAtMost Op = "mode_at_most"
 
-	// OpIntAtLeast / OpIntAtMost — numeric bounds, for the many CIS rules
+	// OpIntAtLeast / OpIntAtMost: numeric bounds, for the many CIS rules
 	// phrased as "N or more" / "N or fewer".
 	OpIntAtLeast Op = "int_at_least"
 	OpIntAtMost  Op = "int_at_most"
@@ -126,7 +126,7 @@ const (
 )
 
 // Probe describes what to inspect. Every field is populated from the compiled
-// catalog — none of it is ever read from the server-supplied profile.
+// catalog: none of it is ever read from the server-supplied profile.
 type Probe struct {
 	Kind ProbeKind
 
@@ -181,7 +181,7 @@ type Result struct {
 	Observed string `json:"observed,omitempty"`
 
 	// Detail carries the reason a check errored, or extra context on a
-	// failure. Never contains file contents beyond the matched value — a CIS
+	// failure. Never contains file contents beyond the matched value: a CIS
 	// report travels to the platform and must not become an exfiltration path
 	// for the files it inspects.
 	Detail string `json:"detail,omitempty"`
@@ -191,7 +191,7 @@ type Result struct {
 // knows what this agent build can actually run.
 //
 // The profile editor in the UI needs to list selectable checks, and the
-// catalog is compiled into the agent — so the agent is the only source of
+// catalog is compiled into the agent, so the agent is the only source of
 // truth for it. Reporting it with each result set keeps the UI correct across
 // mixed-version fleets and is self-healing: an agent upgrade that adds checks
 // makes them selectable without any separate sync step.
@@ -259,7 +259,7 @@ func Lookup(id string) (Check, bool) {
 
 // Catalog returns every compiled check, ordered by section. This is what the
 // agent reports to the platform so the UI can offer exactly the checks this
-// agent version can actually run — a profile referencing an unknown id would
+// agent version can actually run: a profile referencing an unknown id would
 // otherwise fail silently.
 func Catalog() []Check {
 	registryMu.RLock()
@@ -348,7 +348,7 @@ func Evaluate(ctx context.Context, ev Evaluator, c Check, expected string) Resul
 			return res
 		}
 		// Could not determine state. Reported as error, never as pass or
-		// fail — a check the agent could not run is not evidence either way.
+		// fail: a check the agent could not run is not evidence either way.
 		res.Status = StatusError
 		res.Detail = err.Error()
 		return res

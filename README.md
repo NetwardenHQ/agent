@@ -13,7 +13,7 @@ The Netwarden agent is a small Go program that collects system, container,
 database, VM, Kubernetes and security-posture data and sends it to the
 Netwarden platform.
 
-[![Version](https://img.shields.io/badge/version-3.6.2-blue)](https://github.com/NetwardenHQ/agent/releases)
+[![Version](https://img.shields.io/badge/version-3.7.0-blue)](https://github.com/NetwardenHQ/agent/releases)
 [![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8)](https://golang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Code Signed](https://img.shields.io/badge/windows-code%20signed-blue?logo=windows)](https://github.com/NetwardenHQ/agent/releases)
@@ -273,6 +273,9 @@ log_level: info                               # debug, info, warn, error
 # fim_manifest_path: /var/lib/netwarden/fim-manifest
 # fim_roots: /etc/myapp,/opt/myapp/bin
 
+# ---- Host identity ----
+# agent_id_file: /var/lib/netwarden/agent-id  # see "Host identity" below
+
 # ---- Spool for local producers ----
 # spool_dir: /var/lib/netwarden/spool         # "off" disables it
 # spool_volume: /var/lib/netwarden/spool      # in a pod only; see docs/spool.md
@@ -353,6 +356,37 @@ verifies its SHA-256, writes the credentials to
 `/var/log/netwarden/netwarden.log`, rotates daily or at 1 MB with 7 kept, and
 the agent reopens it on SIGHUP. Removing the package stops the agent and
 deletes the config only if it is still the unedited sample.
+
+## Host Identity
+
+On its first start the agent generates a random id and stores it in a file of
+its own. It sends that id as `agent_uid` with every report, and the server
+uses it to recognise the host. A machine that is renamed, or whose agent is
+reinstalled with a new `netwarden.conf`, stays the same host with its history,
+alerts and dashboards. The hostname is only what the host is called.
+
+| Platform | File |
+|---|---|
+| Linux, macOS | `/var/lib/netwarden/agent-id` |
+| FreeBSD, OPNsense | `/var/db/netwarden/agent-id` |
+| Windows | `%ProgramData%\Netwarden\agent-id` |
+| Synology DSM | `agent-id` beside `netwarden.conf` in the package's data folder |
+| Kubernetes | none by default |
+
+`agent_id_file` sets another path. The file holds one line, is readable by
+root only, and is not touched by the install scripts or by package upgrades.
+
+The id is random, not derived from the machine: cloned machines share a
+machine id and hardware UUID, and two machines must never share this one. When
+a machine is cloned with the agent installed, delete the file on the clone
+before its first start so it generates its own. Two machines that report the
+same id are one host to the server.
+
+If the file cannot be read or written, the agent logs a warning, sends no id
+and keeps working; the server then identifies the host by its hostname. That
+is also the case in a Kubernetes pod, where no local file outlives the pod and
+the hostname comes from the Deployment. To move a host to a new machine and
+keep its history, copy the file.
 
 ## Device Identity and Spool
 
@@ -744,6 +778,7 @@ agent/
 │   │   ├── extras.go           # device_identity and spool snapshots per post
 │   │   ├── snapshot_ack.go     # snapshots held until the platform acknowledges them
 │   │   └── state.go            # state.json for local producers
+│   ├── agentid/                # the installation id (agent-id file)
 │   │
 │   ├── collectors/
 │   │   ├── cpu/ memory/ disk/ network/ system/

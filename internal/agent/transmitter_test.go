@@ -208,3 +208,19 @@ func TestSnapshotJSONFieldNames(t *testing.T) {
 		}
 	}
 }
+
+func TestCreatePayload_SendsTheAgentUID(t *testing.T) {
+	tr := newTestTransmitter(t)
+	m := wire(t, tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil))
+	if _, present := m["agent_uid"]; present {
+		t.Error("agent_uid must be omitted when the agent has no stored id; " +
+			"the server then identifies the host by hostname, as it did before the field")
+	}
+
+	const id = "0b8f6c1e-5d0a-4a52-9a44-3f1c2e7d9a10"
+	tr.SetAgentUID(id)
+	m = wire(t, tr.createPayload([]metrics.Metric{{Name: "cpu_usage_percent", Value: 1}}, nil))
+	if got := string(m["agent_uid"]); got != `"`+id+`"` {
+		t.Fatalf("agent_uid = %s, want %q", got, id)
+	}
+}

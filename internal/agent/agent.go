@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NetwardenHQ/agent/internal/agentid"
 	"github.com/NetwardenHQ/agent/internal/cache"
 	"github.com/NetwardenHQ/agent/internal/collectors/cis"
 	"github.com/NetwardenHQ/agent/internal/collectors/container"
@@ -141,6 +142,22 @@ type Agent struct {
 	consecutiveFailures int           // transmission failures since the last success
 }
 
+// loadAgentUID returns the installation id, or "" when there is none to send.
+// Without one the agent works as before and the server identifies the host
+// by its hostname.
+func loadAgentUID(cfg *config.Config, logger *slog.Logger) string {
+	if cfg.AgentIDFile == "" {
+		return ""
+	}
+	id, err := agentid.Load(cfg.AgentIDFile)
+	if err != nil {
+		logger.Warn("agent id unavailable; the server identifies this host by its hostname, and a rename will show as a new host",
+			"path", cfg.AgentIDFile, "error", err)
+		return ""
+	}
+	return id
+}
+
 // MetricTransmitter sends one batch of metrics, plus any snapshots for the
 // cycle, to the server.
 type MetricTransmitter interface {
@@ -195,6 +212,7 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*Agent, error
 		}, logger.With("component", "selfupdate"))
 		httpTx.SetUpdateHintHandler(updater.HandleHint)
 		httpTx.SetSelfUpdateState(updater.State)
+		httpTx.SetAgentUID(loadAgentUID(cfg, logger))
 	}
 
 	a := &Agent{
