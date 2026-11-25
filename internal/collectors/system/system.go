@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/host"
@@ -29,6 +30,9 @@ type UpdateCounts struct {
 	SecurityUnknown bool
 	// CheckedAt is when the check that produced these counts succeeded.
 	CheckedAt time.Time
+	// Vulnerable names the packages behind Security where the audit says
+	// which they are (FreeBSD and OPNsense: pkg audit). Empty elsewhere.
+	Vulnerable []VulnerablePackage
 }
 
 // UpdatesCacheKey is the cache key under which the agent stores UpdateCounts.
@@ -42,6 +46,23 @@ type Collector struct {
 	hostname string
 	logger   *slog.Logger
 	builder  metrics.MetricBuilder
+
+	mu         sync.Mutex
+	vulnerable []VulnerablePackage // from the last successful security check
+}
+
+func (c *Collector) setVulnerable(p []VulnerablePackage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vulnerable = p
+}
+
+// VulnerablePackages names the packages behind the last security count, where
+// the platform's audit says which (FreeBSD and OPNsense); nil elsewhere.
+func (c *Collector) VulnerablePackages() []VulnerablePackage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]VulnerablePackage(nil), c.vulnerable...)
 }
 
 // NewCollector creates a new system metrics collector.
@@ -179,6 +200,15 @@ func (c *Collector) collectUpdateInfoFromCache(metrics *[]metrics.Metric) (*Upda
 	c.addGauge(metrics, "system_updates_available_count", float64(counts.Available))
 	if !counts.SecurityUnknown {
 		c.addGauge(metrics, "system_security_updates_count", float64(counts.Security))
+		// One series per vulnerable package, so the platform can say which.
+		for _, v := range counts.Vulnerable {
+			m, err := c.builder.GaugeWithLabels("system_vulnerable_package", 1, vulnerablePackageLabels(v))
+			if err != nil {
+				c.logger.Warn("failed to build vulnerable package metric", "package", v.Name, "error", err)
+				continue
+			}
+			*metrics = append(*metrics, m)
+		}
 	}
 	return &counts, nil
 }

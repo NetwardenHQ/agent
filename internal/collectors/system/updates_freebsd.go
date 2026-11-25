@@ -37,18 +37,45 @@ func (c *Collector) GetAvailableUpdates(ctx context.Context) (int, error) {
 // vulnerable packages, not available security updates: a vulnerable package
 // may have no fixed version yet. (The method name is the cross-platform
 // interface's.) A missing database is an error, not zero: "no data" must not
-// read as "no problems".
+// read as "no problems". Which packages they are is kept for
+// VulnerablePackages.
 func (c *Collector) GetSecurityUpdates(ctx context.Context) (int, error) {
-	out, err := runPkg(ctx, "audit", "-q")
-	if err == nil {
-		return countLines(out), nil
+	pkgs, err := auditPackages(ctx)
+	if err != nil {
+		return 0, err
 	}
-	// pkg audit exits 1 when it found vulnerable packages; that is the result.
+	c.setVulnerable(pkgs)
+	return len(pkgs), nil
+}
+
+// auditPackages runs pkg audit, reading its JSON report (package, version,
+// advisory, CVEs, link) and falling back to the plain name-version list when
+// this pkg cannot write JSON.
+func auditPackages(ctx context.Context) ([]VulnerablePackage, error) {
+	if out, err := auditOutput(ctx, "audit", "--raw=json-compact"); err == nil {
+		if pkgs, perr := parsePkgAuditJSON(out); perr == nil {
+			return pkgs, nil
+		}
+	}
+	out, err := auditOutput(ctx, "audit", "-q")
+	if err != nil {
+		return nil, err
+	}
+	return parsePkgAuditQuiet(out), nil
+}
+
+// auditOutput runs one pkg audit form. pkg audit exits 1 when it found
+// vulnerable packages; that is a result, not a failure.
+func auditOutput(ctx context.Context, args ...string) ([]byte, error) {
+	out, err := runPkg(ctx, args...)
+	if err == nil {
+		return out, nil
+	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 && len(bytes.TrimSpace(out)) > 0 {
-		return countLines(out), nil
+		return out, nil
 	}
-	return 0, fmt.Errorf("pkg audit: %w", err)
+	return nil, fmt.Errorf("pkg audit: %w", err)
 }
 
 // runPkg runs pkg(8) and returns its stdout. pkg exits 0 for `version` even

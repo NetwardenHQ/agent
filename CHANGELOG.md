@@ -5,6 +5,33 @@ All notable changes to the Netwarden Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.0] - 2026-11-25
+
+### Added
+- Windows inventory for vulnerability matching, in the `installed_packages` snapshot every six
+  hours like the Linux package inventory:
+  - the Windows build with its update revision (`10.0.<build>.<UBR>`, from
+    `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`), the edition and the version, which the
+    platform matches against Microsoft's security updates, naming the update that fixes each CVE;
+  - the installed updates (`Win32_QuickFixEngineering`);
+  - the installed programs, from both registry views of the machine-wide Uninstall key and from
+    each signed-in user's own (programs installed for one user only: Zoom by default, and Chrome,
+    Git or VS Code when chosen), without system components. The platform matches common programs
+    against their CVEs.
+
+  The inventory is sent only for Windows 10-based systems (Windows 10 and 11, Server 2016 and
+  later) whose update revision can be read: a guessed revision would make a patched host look like
+  one missing every update. Turned off with `enable_security_packages: false`, like the Linux
+  inventory.
+- FreeBSD and OPNsense: the packages `pkg audit` finds vulnerable are reported by name, with their
+  version, the advisory's description, its CVEs and the VuXML link (`system_vulnerable_package`,
+  one series per package, read from `pkg audit --raw=json-compact` with `pkg audit -q` as the
+  fallback). Until now only their count was sent, so the platform could not say which they were.
+- Alpine Linux: the installed packages are read from the apk database, so the platform matches
+  them against Alpine's security database.
+- SUSE Linux Enterprise Server and openSUSE Leap: the installed packages are read with rpm, so the
+  platform matches them against SUSE's advisories.
+
 ## [3.7.0] - 2026-11-21
 
 ### Added

@@ -5,6 +5,7 @@ package security
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -149,6 +150,7 @@ const (
 	pkgFamilyUnknown pkgFamily = iota
 	pkgFamilyDebian
 	pkgFamilyRHEL
+	pkgFamilyAlpine
 )
 
 // classifyDistro inspects /etc/os-release ID + ID_LIKE values and returns
@@ -164,8 +166,13 @@ func classifyDistro(d distroInfo) pkgFamily {
 		"rhel": true, "centos": true, "fedora": true, "rocky": true,
 		"almalinux": true, "ol": true, "oracle": true, "amzn": true,
 		"amazonlinux": true, "scientific": true,
+		// SUSE: rpm as well; the platform matches SLES and openSUSE Leap.
+		"sles": true, "opensuse-leap": true, "suse": true,
 	}
 	for _, c := range candidates {
+		if lower(c) == "alpine" {
+			return pkgFamilyAlpine
+		}
 		// ID_LIKE may be a space-separated list.
 		for _, tok := range splitSpaces(c) {
 			tok = lower(tok)
@@ -262,4 +269,39 @@ func (c *PackagesCollector) clearPending() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pending = nil
+}
+
+// parseApkInstalled reads Alpine's package database (/lib/apk/db/installed):
+// one record per package, blank-line separated, with P: name, V: version and
+// A: architecture lines. A record without a name or version is skipped.
+func parseApkInstalled(db string) []installedPackage {
+	var out []installedPackage
+	var cur installedPackage
+	flush := func() {
+		if cur.Name != "" && cur.Version != "" {
+			cur.Source = "apk"
+			cur.Ecosystem = EcosystemAPK
+			out = append(out, cur)
+		}
+		cur = installedPackage{}
+	}
+	for _, line := range strings.Split(db, "\n") {
+		if line == "" {
+			flush()
+			continue
+		}
+		if len(line) < 2 || line[1] != ':' {
+			continue
+		}
+		switch line[0] {
+		case 'P':
+			cur.Name = line[2:]
+		case 'V':
+			cur.Version = line[2:]
+		case 'A':
+			cur.Arch = line[2:]
+		}
+	}
+	flush()
+	return out
 }

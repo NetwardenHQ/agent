@@ -762,11 +762,16 @@ func (a *Agent) performUpdateCheck(ctx context.Context) {
 		securityUnknown = true
 	}
 
+	var vulnerable []system.VulnerablePackage
+	if !securityUnknown {
+		vulnerable = systemCollector.VulnerablePackages()
+	}
 	cache.Set(system.UpdatesCacheKey(a.hostname), system.UpdateCounts{
 		Available:       updateCount,
 		Security:        securityCount,
 		SecurityUnknown: securityUnknown,
 		CheckedAt:       time.Now(),
+		Vulnerable:      vulnerable,
 	}, updateCheckInterval)
 
 	a.logger.Info("background update check completed",

@@ -65,6 +65,11 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 		if err != nil {
 			c.logger.Warn("rpm query failed", "error", err)
 		}
+	case pkgFamilyAlpine:
+		packages, err = collectAlpinePackages()
+		if err != nil {
+			c.logger.Warn("reading the apk database failed", "error", err)
+		}
 	default:
 		c.unsupportedOnce.Do(func() {
 			c.logger.Info("package collector: unsupported distro",
@@ -110,6 +115,8 @@ func (c *PackagesCollector) Collect(ctx context.Context) ([]metrics.Metric, erro
 		source = "dpkg"
 	case pkgFamilyRHEL:
 		source = "rpm"
+	case pkgFamilyAlpine:
+		source = "apk"
 	}
 
 	// Distro identifier metric. The CVE matcher uses these labels to pick
@@ -327,4 +334,14 @@ func parseRPMOutput(output string) []installedPackage {
 	}
 
 	return pkgs
+}
+
+// collectAlpinePackages reads Alpine's installed-package database directly:
+// no apk process, and the file is plain text.
+func collectAlpinePackages() ([]installedPackage, error) {
+	data, err := os.ReadFile("/lib/apk/db/installed")
+	if err != nil {
+		return nil, fmt.Errorf("read apk database: %w", err)
+	}
+	return parseApkInstalled(string(data)), nil
 }
